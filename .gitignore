@@ -1,0 +1,18 @@
+# Секретные ключи и переменные окружения (Security-by-Design)
+.env
+*.env
+
+# Виртуальное окружение
+venv/
+.venv/
+ENV/
+
+# Кэш Python и байт-код
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Локальные диагностические тесты и кэш
+test_socks.py
+.pytest_cache/
+*.log
