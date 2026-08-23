@@ -7,7 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 
-from config import BOT_TOKEN
+import config
 from handlers import router
 from middlewares import ThrottlingMiddleware
 
@@ -21,16 +21,16 @@ logger = logging.getLogger("WeatherBotMain")
 
 
 async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -> None:
-    """Запускает бота с автоповтором при временных сбоях прокси-туннеля."""
+    """Запускает бота с автоповтором при временных сбоях сети."""
     for attempt in range(1, max_retries + 1):
         try:
             logger.info(f"🔄 Попытка подключения к Telegram API ({attempt}/{max_retries})...")
             await bot.delete_webhook(drop_pending_updates=True)
-            logger.info("🚀 УСПЕШНО! Бот слушает команды. Ожидание ICAO-запросов...")
+            logger.info("🚀 УСПЕШНО! Бот слушает команды. Ожидание погодных запросов...")
             await dp.start_polling(bot)
             break
         except Exception as error:
-            logger.warning(f"⚠️ Сбой связи через туннель: {error}")
+            logger.warning(f"⚠️ Сбой связи с сервером: {error}")
             if attempt < max_retries:
                 logger.info("⏳ Пауза 3 секунды перед повторным подключением...")
                 await asyncio.sleep(3.0)
@@ -40,18 +40,21 @@ async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -
 
 async def main() -> None:
     # 1. Проверка токена
-    if not BOT_TOKEN:
-        logger.critical("❌ КРИТИЧЕСКАЯ ОШИБКА: BOT_TOKEN не обнаружен в .env!")
+    if not config.BOT_TOKEN:
+        logger.critical("❌ КРИТИЧЕСКАЯ ОШИБКА: BOT_TOKEN не обнаружен!")
         return
 
-    # 2. Инициализация SOCKS5-сессии
-    proxy_url = "socks5://127.0.0.1:10808"
-    session = AiohttpSession(proxy=proxy_url)
-    logger.info(f"🌐 Сетевая сессия инициализирована через: {proxy_url}")
+    # 2. Инициализация сессии (с прокси для ПК или напрямую для Render)
+    if config.PROXY_URL:
+        session = AiohttpSession(proxy=config.PROXY_URL)
+        logger.info(f"🌐 Сетевая сессия инициализирована через прокси: {config.PROXY_URL}")
+    else:
+        session = None
+        logger.info("🌐 Прямое сетевое подключение к Telegram API (Production Cloud).")
 
     # 3. Инициализация Bot и Dispatcher
     bot = Bot(
-        token=BOT_TOKEN,
+        token=config.BOT_TOKEN,
         session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
@@ -76,4 +79,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("👋 Бот остановлен пользователем.")
+        logger.info("👋 Бот остановлен.")
