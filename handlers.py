@@ -23,7 +23,7 @@ from weather_synthesizer import (
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Главное постоянное меню с кнопками
+# Главное постоянное меню Telegram
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🔍 Сканировать маркет"), KeyboardButton(text="📖 Справка / Помощь")]
@@ -31,13 +31,13 @@ main_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-POLYMARKET_API = "https://gamma-api.polymarket.com/events"
+POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/events"
 
 
 def _extract_airport_coords(
     airport_data: Dict[str, Any],
 ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """Извлекает географические координаты и часовой пояс из данных аэропорта."""
+    """Извлекает координаты и таймзону аэропорта из базы данных."""
     if not airport_data:
         return None, None, None
     lat = airport_data.get("lat") if airport_data.get("lat") is not None else airport_data.get("latitude")
@@ -46,35 +46,57 @@ def _extract_airport_coords(
     return lat, lon, tz
 
 
-def _extract_slug(url_or_text: str) -> str:
-    """Извлекает идентификатор маркета (slug) из ссылок Polymarket, Preddy TMA или чистого текста."""
-    url_or_text = url_or_text.strip()
-    # Поиск slug в ссылках Polymarket (/event/slug-name) или Preddy TMA (startapp=slug-name)
-    event_match = re.search(r"(?:event/|startapp=)([a-zA-Z0-9_-]+)", url_or_text)
-    if event_match:
-        return event_match.group(1)
+def _parse_market_identifier(url_or_text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Универсальный парсер: извлекает ID или SLUG из любых типов ссылок (Preddy Web, TMA, Polymarket).
+    Возвращает пару: (тип_параметра, значение).
+    """
+    text = url_or_text.strip()
 
-    # Очистка строки, если передан прямой slug без протокола https://
-    clean_slug = re.sub(r"[^a-zA-Z0-9_-]", "", url_or_text)
-    return clean_slug
+    # 1. Формат Preddy Web: preddy.trade/event/.../<id> (например: 883962)
+    preddy_id_match = re.search(r"preddy\.trade/event/[^/]+/(\d+)", text)
+    if preddy_id_match:
+        return "id", preddy_id_match.group(1)
+
+    # 2. Формат Preddy Telegram Mini App: startapp=<slug_или_id>
+    tma_match = re.search(r"startapp=([a-zA-Z0-9_-]+)", text)
+    if tma_match:
+        val = tma_match.group(1)
+        return ("id" if val.isdigit() else "slug"), val
+
+    # 3. Формат Polymarket Event: polymarket.com/event/<slug>
+    poly_match = re.search(r"polymarket\.com/event/([a-zA-Z0-9_-]+)", text)
+    if poly_match:
+        return "slug", poly_match.group(1)
+
+    # 4. Чистый ID или Slug, переданный напрямую текстом
+    clean_val = text.split("?")[0].rstrip("/").split("/")[-1]
+    if clean_val.isdigit():
+        return "id", clean_val
+    elif clean_val:
+        return "slug", clean_val
+
+    return None, None
 
 
-async def _fetch_polymarket_orderbook(slug: str) -> Optional[Dict[str, Any]]:
-    """Бесплатно забирает котировки стакана через официальный открытый Gamma API."""
-    url = f"{POLYMARKET_API}?slug={slug}"
+async def _fetch_polymarket_orderbook(param_type: str, param_val: str) -> Optional[Dict[str, Any]]:
+    """Бесплатно и безопасно забирает стакан через официальный шлюз Polymarket Gamma API."""
+    url = f"{POLYMARKET_GAMMA_API}?{param_type}={param_val}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=6.0)) as response:
                 if response.status != 200:
                     return None
                 data = await response.json()
                 if isinstance(data, list) and len(data) > 0:
                     return data[0]
+                elif isinstance(data, dict) and "markets" in data:
+                    return data
                 return None
     except Exception as error:
-        logger.error(f"Ошибка при обращении к Polymarket Gamma API ({slug}): {error}")
+        logger.error(f"Сбой при запросе к Polymarket API ({param_type}={param_val}): {error}")
         return None
 
 
@@ -85,7 +107,7 @@ async def _fetch_polymarket_orderbook(slug: str) -> Optional[Dict[str, Any]]:
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     welcome_text = (
-        "👋 <b>Weather Alpha Bot активен!</b>\n\n"
+        "👋 <b>Weather & Alpha Bot активен!</b>\n\n"
         "🔹 <b>Анализ погоды:</b> отправь 4-значный ICAO-код аэропорта.\n"
         "• Например: <code>UHHH</code> (Хабаровск), <code>KJFK</code> (Нью-Йорк).\n\n"
         "🔹 <b>Сканер маркетов Preddy / Polymarket:</b>\n"
@@ -100,10 +122,10 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     help_text = (
         "📖 <b>Справка по работе с ботом:</b>\n\n"
-        "1. <b>Метеопакеты (ICAO):</b>\n"
-        "   Введи 4 буквы кода аэропорта (например: <code>UHHH</code>) — бот пришлет сводку моделей (ECMWF, GFS, ICON, GEM) и прикрепит JSON-файл для анализатора.\n\n"
+        "1. <b>Метеосводки (ICAO):</b>\n"
+        "   Введи 4 буквы кода аэропорта (например: <code>UHHH</code>) — бот пришлет сводку моделей и прикрепит JSON-пакет.\n\n"
         "2. <b>Сканер стаканов (/scan):</b>\n"
-        "   Введи <code>/scan https://polymarket.com/event/...</code> или ссылку из <b>Preddy TMA</b> — бот мгновенно выведет актуальные цены исходов и потенциал выплат."
+        "   Введи <code>/scan &lt;ссылка&gt;</code> с Preddy или Polymarket — бот выведет актуальные цены исходов и чистый ROI."
     )
     await message.answer(help_text, parse_mode="HTML", reply_markup=main_keyboard)
 
@@ -111,10 +133,9 @@ async def cmd_help(message: Message):
 @router.message(F.text == "🔍 Сканировать маркет")
 async def btn_scan_hint(message: Message):
     await message.answer(
-        "📥 <b>Как просканировать маркет:</b>\n\n"
-        "Отправь команду со ссылкой на событие в формате:\n"
-        "<code>/scan https://polymarket.com/event/highest-temperature-in-chicago-on-august-23</code>\n\n"
-        "<i>Поддерживаются ссылки с Polymarket и Preddy.</i>",
+        "📥 <b>Отправь команду со ссылкой на событие:</b>\n\n"
+        "<code>/scan https://preddy.trade/event/highest-temperature/883962</code>\n\n"
+        "<i>Поддерживаются ссылки Preddy Web, Preddy TMA и Polymarket.</i>",
         parse_mode="HTML",
     )
 
@@ -124,38 +145,39 @@ async def btn_scan_hint(message: Message):
 # -------------------------------------------------------------
 
 @router.message(Command("scan"))
+@router.edited_message(Command("scan"))
 async def cmd_scan_market(message: Message):
-    args = message.text.split(maxsplit=1)
+    args = (message.text or "").split(maxsplit=1)
     if len(args) < 2:
         await message.answer(
             "⚠️ <b>Укажи ссылку после команды:</b>\n"
-            "<code>/scan https://polymarket.com/event/...</code>",
+            "<code>/scan https://preddy.trade/event/highest-temperature/883962</code>",
             parse_mode="HTML",
         )
         return
 
     raw_input = args[1]
-    slug = _extract_slug(raw_input)
+    param_type, param_val = _parse_market_identifier(raw_input)
 
-    if not slug:
-        await message.answer("❌ Не удалось распознать маркет. Проверь ссылку.", parse_mode="HTML")
+    if not param_type or not param_val:
+        await message.answer("❌ Не удалось распознать ID или slug маркета. Проверь ссылку.", parse_mode="HTML")
         return
 
     status_msg = await message.answer(
-        "⚡ <i>Считываю стакан и актуальные котировки...</i>",
+        f"⚡ <i>Считываю стакан маркета ({param_type.upper()}: {param_val})...</i>",
         parse_mode="HTML",
     )
 
-    event_data = await _fetch_polymarket_orderbook(slug)
+    event_data = await _fetch_polymarket_orderbook(param_type, param_val)
 
     if not event_data:
         await status_msg.edit_text(
-            "❌ <b>Маркет не найден</b> или Polymarket API временно недоступен. Проверь корректность ссылки.",
+            "❌ <b>Маркет не найден</b> или API временно недоступен. Проверь ссылку.",
             parse_mode="HTML",
         )
         return
 
-    title = event_data.get("title", "Погодный маркет Polymarket")
+    title = event_data.get("title", "Погодный маркет")
     markets = event_data.get("markets", [])
 
     if not markets:
@@ -164,7 +186,7 @@ async def cmd_scan_market(message: Message):
 
     report_lines = [
         f"📊 <b>{title}</b>\n",
-        "<b>Котировки исходов (Стакан):</b>"
+        "<b>Текущие котировки исходов (Стакан):</b>"
     ]
 
     for item in markets:
@@ -187,7 +209,7 @@ async def cmd_scan_market(message: Message):
         else:
             report_lines.append(f"• <b>{question}</b>: <code>0¢</code> (Нет ликвидности)")
 
-    report_lines.append("\n💡 <i>Сверь эти котировки с METAR и правилом Worst-Case ROI перед входом.</i>")
+    report_lines.append("\n💡 <i>Сверь эти исходы с правилом Worst-Case ROI (≥30%) и сводкой METAR.</i>")
 
     await status_msg.edit_text("\n".join(report_lines), parse_mode="HTML")
 
@@ -200,10 +222,10 @@ async def cmd_scan_market(message: Message):
 async def process_weather_request(message: Message):
     user_query = message.text.strip().upper()
 
-    # Валидация входных данных (Strict 4-letter ICAO format)
+    # Строгая валидация 4-буквенного ICAO кода
     if len(user_query) != 4 or not user_query.isalpha():
         await message.answer(
-            "⚠️ Пожалуйста, введите корректный <b>4-значный ICAO-код</b> аэропорта (например: <code>UHHH</code>, <code>KJFK</code>) "
+            "⚠️ Введите корректный <b>4-значный ICAO-код</b> аэропорта (например: <code>UHHH</code>, <code>KJFK</code>) "
             "или используйте команду <code>/scan &lt;ссылка&gt;</code>.",
             parse_mode="HTML",
         )
@@ -215,7 +237,7 @@ async def process_weather_request(message: Message):
     )
 
     try:
-        # 1. Резолвинг аэропорта в отдельном потоке (DevSecOps: защита Event Loop)
+        # 1. Резолвинг аэропорта в отдельном потоке (защита Event Loop)
         airport_data = await asyncio.to_thread(resolve_airport, user_query)
         if not airport_data:
             await status_msg.edit_text(
@@ -277,7 +299,7 @@ async def process_weather_request(message: Message):
             airport_data, raw_forecast_payload, synth_result, noaa_payload
         )
 
-        # In-Memory сериализация JSON без сохранения на диск (Zero-Disk Footprint)
+        # In-Memory сериализация JSON без создания временных файлов на диске
         json_bytes = json.dumps(package_dict, ensure_ascii=False, indent=2).encode("utf-8")
         filename = f"weather_package_{user_query}_{target_date_local}.json"
         document_file = BufferedInputFile(file=json_bytes, filename=filename)
