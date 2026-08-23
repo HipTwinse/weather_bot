@@ -7,6 +7,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand
 from aiohttp import web
 
 import config
@@ -20,6 +21,20 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("WeatherBotMain")
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    """Регистрирует интерактивное всплывающее меню команд при вводе '/' в Telegram."""
+    commands = [
+        BotCommand(command="start", description="🚀 Главное меню и статус бота"),
+        BotCommand(command="scan", description="🔍 Сканировать маркет (Preddy / Polymarket)"),
+        BotCommand(command="help", description="📖 Справка по ICAO и маркетам"),
+    ]
+    try:
+        await bot.set_my_commands(commands)
+        logger.info("📋 Интерактивное меню команд успешно зарегистрировано в Telegram.")
+    except Exception as error:
+        logger.warning(f"⚠️ Не удалось зарегистрировать меню команд: {error}")
 
 
 async def run_health_check_server() -> None:
@@ -47,6 +62,10 @@ async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -
         try:
             logger.info(f"🔄 Попытка подключения к Telegram API ({attempt}/{max_retries})...")
             await bot.delete_webhook(drop_pending_updates=True)
+            
+            # Регистрация меню команд перед стартом поллинга
+            await setup_bot_commands(bot)
+
             logger.info("🚀 УСПЕШНО! Бот слушает команды. Ожидание погодных запросов...")
             await dp.start_polling(bot)
             break
@@ -68,7 +87,7 @@ async def main() -> None:
     # 2. Запуск фонового веб-сервера для Render
     await run_health_check_server()
 
-    # 3. Инициализация сетевой сессии
+    # 3. Инициализация сетевой сессии (Direct Cloud или через прокси)
     if config.PROXY_URL:
         session = AiohttpSession(proxy=config.PROXY_URL)
         logger.info(f"🌐 Сетевая сессия инициализирована через прокси: {config.PROXY_URL}")
