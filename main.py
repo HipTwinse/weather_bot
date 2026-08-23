@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import os
 import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiohttp import web
 
 import config
 from handlers import router
@@ -18,6 +20,25 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("WeatherBotMain")
+
+
+async def run_health_check_server() -> None:
+    """Запускает легковесный веб-сервер для удовлетворения проверок портов Render (Health Check)."""
+    async def handle_ping(request: web.Request) -> web.Response:
+        return web.Response(text="OK: Weather Bot is running 24/7", status=200)
+
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/healthz", handle_ping)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    # Считываем порт из окружения Render (по умолчанию 10000 или 8080)
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"🌐 Встроенный Health-Check сервер успешно запущен на порту {port}.")
 
 
 async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -> None:
@@ -44,7 +65,10 @@ async def main() -> None:
         logger.critical("❌ КРИТИЧЕСКАЯ ОШИБКА: BOT_TOKEN не обнаружен!")
         return
 
-    # 2. Инициализация сессии (с прокси для ПК или напрямую для Render)
+    # 2. Запуск фонового веб-сервера для Render
+    await run_health_check_server()
+
+    # 3. Инициализация сетевой сессии
     if config.PROXY_URL:
         session = AiohttpSession(proxy=config.PROXY_URL)
         logger.info(f"🌐 Сетевая сессия инициализирована через прокси: {config.PROXY_URL}")
@@ -52,7 +76,7 @@ async def main() -> None:
         session = None
         logger.info("🌐 Прямое сетевое подключение к Telegram API (Production Cloud).")
 
-    # 3. Инициализация Bot и Dispatcher
+    # 4. Инициализация Bot и Dispatcher
     bot = Bot(
         token=config.BOT_TOKEN,
         session=session,
@@ -60,14 +84,14 @@ async def main() -> None:
     )
     dp = Dispatcher()
 
-    # 4. Подключение Middleware и Router
+    # 5. Подключение Middleware и Router
     dp.message.middleware(ThrottlingMiddleware())
     logger.info("🛡️ ThrottlingMiddleware (Rate Limiting) успешно подключен.")
 
     dp.include_router(router)
     logger.info("🔀 Основной Router из handlers.py зарегистрирован.")
 
-    # 5. Запуск с защитой от сбоев
+    # 6. Запуск бота
     try:
         await start_bot_with_retry(bot, dp)
     finally:
