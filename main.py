@@ -14,7 +14,7 @@ import config
 from handlers import router
 from middlewares import ThrottlingMiddleware
 
-# Настройка системного логирования
+# Настройка системного логирования в консоль
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
@@ -27,6 +27,7 @@ async def setup_bot_commands(bot: Bot) -> None:
     """Регистрирует интерактивное всплывающее меню команд при вводе '/' в Telegram."""
     commands = [
         BotCommand(command="start", description="🚀 Главное меню и статус бота"),
+        BotCommand(command="cities", description="🌍 Быстрый выбор избранных городов"),
         BotCommand(command="scan", description="🔍 Сканировать маркет (Preddy / Polymarket)"),
         BotCommand(command="help", description="📖 Справка по ICAO и маркетам"),
     ]
@@ -38,7 +39,7 @@ async def setup_bot_commands(bot: Bot) -> None:
 
 
 async def run_health_check_server() -> None:
-    """Запускает легковесный веб-сервер для удовлетворения проверок портов Render (Health Check)."""
+    """Запускает легковесный веб-сервер для прохождения проверок портов Render (Health Check)."""
     async def handle_ping(request: web.Request) -> web.Response:
         return web.Response(text="OK: Weather Bot is running 24/7", status=200)
 
@@ -49,7 +50,7 @@ async def run_health_check_server() -> None:
     runner = web.AppRunner(app)
     await runner.setup()
 
-    # Считываем порт из окружения Render (по умолчанию 10000 или 8080)
+    # Считываем порт из системного окружения Render (по умолчанию 10000)
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
@@ -79,7 +80,7 @@ async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -
 
 
 async def main() -> None:
-    # 1. Проверка токена
+    # 1. Проверка наличия токена
     if not config.BOT_TOKEN:
         logger.critical("❌ КРИТИЧЕСКАЯ ОШИБКА: BOT_TOKEN не обнаружен!")
         return
@@ -87,7 +88,7 @@ async def main() -> None:
     # 2. Запуск фонового веб-сервера для Render
     await run_health_check_server()
 
-    # 3. Инициализация сетевой сессии (Direct Cloud или через прокси)
+    # 3. Инициализация сетевой сессии (Прямое подключение в облаке или локальный прокси)
     if config.PROXY_URL:
         session = AiohttpSession(proxy=config.PROXY_URL)
         logger.info(f"🌐 Сетевая сессия инициализирована через прокси: {config.PROXY_URL}")
