@@ -9,6 +9,8 @@ import zoneinfo
 import aiohttp
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -30,6 +32,12 @@ from weather_synthesizer import (
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+
+# Состояние ожидания ссылки на маркет (FSM)
+class MarketScanStates(StatesGroup):
+    waiting_for_link = State()
+
 
 # Главное постоянное меню Telegram
 main_keyboard = ReplyKeyboardMarkup(
@@ -138,6 +146,69 @@ async def _fetch_polymarket_orderbook(param_type: str, param_val: str) -> Option
         return None
 
 
+async def _execute_scan_pipeline(raw_input: str, target_message: Message):
+    """Единый пайплайн сбора и расчета стакана маркета."""
+    param_type, param_val = _parse_market_identifier(raw_input)
+
+    if not param_type or not param_val:
+        await target_message.answer(
+            "❌ <b>Не удалось распознать ссылку.</b>\n"
+            "Убедись, что отправляешь корректную ссылку с Preddy или Polymarket.",
+            parse_mode="HTML",
+        )
+        return
+
+    status_msg = await target_message.answer(
+        f"⚡ <i>Считываю стакан маркета ({param_type.upper()}: {param_val})...</i>",
+        parse_mode="HTML",
+    )
+
+    event_data = await _fetch_polymarket_orderbook(param_type, param_val)
+
+    if not event_data:
+        await status_msg.edit_text(
+            "❌ <b>Маркет не найден</b> или API временно недоступен. Проверь ссылку.",
+            parse_mode="HTML",
+        )
+        return
+
+    title = event_data.get("title", "Погодный маркет")
+    markets = event_data.get("markets", [])
+
+    if not markets:
+        await status_msg.edit_text("⚠️ В этом событии нет активных котировок.", parse_mode="HTML")
+        return
+
+    report_lines = [
+        f"📊 <b>{title}</b>\n",
+        "<b>Текущие котировки исходов (Стакан):</b>"
+    ]
+
+    for item in markets:
+        question = item.get("groupItemTitle") or item.get("question", "Исход")
+        prices_str = item.get("outcomePrices", '["0", "0"]')
+
+        try:
+            prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
+            yes_price = float(prices[0]) if len(prices) > 0 else 0.0
+        except Exception:
+            yes_price = 0.0
+
+        if yes_price > 0.0:
+            shares_per_dollar = 1.0 / yes_price
+            roi = (shares_per_dollar - 1.0) * 100
+            price_cents = round(yes_price * 100, 1)
+            report_lines.append(
+                f"• <b>{question}</b>: <code>{price_cents}¢</code> (${yes_price:.2f}) | Потенциал: <b>+{roi:.0f}%</b>"
+            )
+        else:
+            report_lines.append(f"• <b>{question}</b>: <code>0¢</code> (Нет ликвидности)")
+
+    report_lines.append("\n💡 <i>Сверь эти исходы с правилом Worst-Case ROI (≥30%) и сводкой METAR.</i>")
+
+    await status_msg.edit_text("\n".join(report_lines), parse_mode="HTML")
+
+
 async def _execute_weather_pipeline(user_query: str, target_message: Message):
     """Единый пайплайн сбора погодных моделей и NOAA для текстового ввода и инлайн-кнопок."""
     status_msg = await target_message.answer(
@@ -235,35 +306,37 @@ async def _execute_weather_pipeline(user_query: str, target_message: Message):
 # -------------------------------------------------------------
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     welcome_text = (
         "👋 <b>Weather & Alpha Bot активен!</b>\n\n"
         "🔹 <b>Анализ погоды:</b> нажми <b>«🌍 Избранные города»</b> или отправь любой ICAO-код (например, <code>KJFK</code>).\n\n"
         "🔹 <b>Сканер маркетов Preddy / Polymarket:</b>\n"
-        "• Отправь команду: <code>/scan &lt;ссылка&gt;</code>\n"
-        "• Или нажми кнопку <b>«🔍 Сканировать маркет»</b> внизу."
+        "• Нажми кнопку <b>«🔍 Сканировать маркет»</b> и отправь ссылку."
     )
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=main_keyboard)
 
 
 @router.message(Command("help"))
 @router.message(F.text == "📖 Справка / Помощь")
-async def cmd_help(message: Message):
+async def cmd_help(message: Message, state: FSMContext):
+    await state.clear()
     help_text = (
         "📖 <b>Справка по работе с ботом:</b>\n\n"
-        "1. <b>Быстрый выбор городов:</b>\n"
+        "1. <b>Сканирование стаканов:</b>\n"
+        "   Нажми <b>«🔍 Сканировать маркет»</b> и пришли ссылку следующим сообщением.\n\n"
+        "2. <b>Быстрый выбор городов:</b>\n"
         "   Нажми кнопку <b>«🌍 Избранные города»</b> и выбери нужный аэропорт.\n\n"
-        "2. <b>Метеосводки по коду:</b>\n"
-        "   Введи любой 4-буквенный ICAO-код вручную — бот пришлет сводку и JSON-пакет.\n\n"
-        "3. <b>Сканер стаканов (/scan):</b>\n"
-        "   Введи <code>/scan &lt;ссылка&gt;</code> — бот выведет стакан цен и чистый ROI."
+        "3. <b>Метеосводки по коду:</b>\n"
+        "   Введи любой 4-буквенный ICAO-код вручную."
     )
     await message.answer(help_text, parse_mode="HTML", reply_markup=main_keyboard)
 
 
 @router.message(F.text == "🌍 Избранные города")
 @router.message(Command("cities"))
-async def cmd_cities_menu(message: Message):
+async def cmd_cities_menu(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "🌍 <b>Выбери город для моментального метеопакета:</b>",
         parse_mode="HTML",
@@ -271,103 +344,74 @@ async def cmd_cities_menu(message: Message):
     )
 
 
-@router.message(F.text == "🔍 Сканировать маркет")
-async def btn_scan_hint(message: Message):
-    await message.answer(
-        "📥 <b>Отправь команду со ссылкой на событие:</b>\n\n"
-        "<code>/scan https://preddy.trade/event/highest-temperature/883962</code>\n\n"
-        "<i>Поддерживаются ссылки Preddy Web, Preddy TMA и Polymarket.</i>",
-        parse_mode="HTML",
-    )
-
-
-# -------------------------------------------------------------
-# БЛОК 2: Обработка нажатий на инлайн-кнопки городов
-# -------------------------------------------------------------
-
 @router.callback_query(F.data.startswith("icao:"))
-async def process_city_callback(callback: CallbackQuery):
+async def process_city_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     icao_code = callback.data.split(":")[1]
     await callback.answer(f"Сбор данных для {icao_code}...")
     await _execute_weather_pipeline(icao_code, callback.message)
 
 
 # -------------------------------------------------------------
-# БЛОК 3: Сканирование Polymarket и Preddy (/scan)
+# БЛОК 2: Интерактивный запуск сканирования и FSM
 # -------------------------------------------------------------
 
-@router.message(Command("scan"))
-@router.edited_message(Command("scan"))
-async def cmd_scan_market(message: Message):
-    args = (message.text or "").split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer(
-            "⚠️ <b>Укажи ссылку после команды:</b>\n"
-            "<code>/scan https://preddy.trade/event/highest-temperature/883962</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    raw_input = args[1]
-    param_type, param_val = _parse_market_identifier(raw_input)
-
-    if not param_type or not param_val:
-        await message.answer("❌ Не удалось распознать ID или slug маркета. Проверь ссылку.", parse_mode="HTML")
-        return
-
-    status_msg = await message.answer(
-        f"⚡ <i>Считываю стакан маркета ({param_type.upper()}: {param_val})...</i>",
+@router.message(F.text == "🔍 Сканировать маркет")
+async def btn_scan_trigger(message: Message, state: FSMContext):
+    await state.set_state(MarketScanStates.waiting_for_link)
+    await message.answer(
+        "📥 <b>Режим сканирования активирован!</b>\n\n"
+        "Отправь ссылку на погодный маркет из <b>Preddy</b> или <b>Polymarket</b> следующим сообщением 👇",
         parse_mode="HTML",
     )
 
-    event_data = await _fetch_polymarket_orderbook(param_type, param_val)
 
-    if not event_data:
-        await status_msg.edit_text(
-            "❌ <b>Маркет не найден</b> или API временно недоступен. Проверь ссылку.",
+@router.message(Command("scan"))
+@router.edited_message(Command("scan"))
+async def cmd_scan_market(message: Message, state: FSMContext):
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await state.set_state(MarketScanStates.waiting_for_link)
+        await message.answer(
+            "📥 <b>Режим сканирования активирован!</b>\n\n"
+            "Отправь ссылку на маркет следующим сообщением 👇",
             parse_mode="HTML",
         )
         return
 
-    title = event_data.get("title", "Погодный маркет")
-    markets = event_data.get("markets", [])
+    await state.clear()
+    await _execute_scan_pipeline(args[1], message)
 
-    if not markets:
-        await status_msg.edit_text("⚠️ В этом событии нет активных котировок.", parse_mode="HTML")
+
+# Обработка сообщения, когда бот ждет ссылку в состоянии FSM
+@router.message(MarketScanStates.waiting_for_link, F.text)
+async def process_market_link_input(message: Message, state: FSMContext):
+    user_text = message.text.strip()
+
+    # Сброс режима ожидания, если пользователь выбрал другое действие из меню
+    if user_text == "🌍 Избранные города":
+        await state.clear()
+        await cmd_cities_menu(message, state)
+        return
+    if user_text in ["📖 Справка / Помощь", "/help"]:
+        await state.clear()
+        await cmd_help(message, state)
+        return
+    if user_text.startswith("/start"):
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    if user_text == "🔍 Сканировать маркет":
+        await message.answer("Жду ссылку на маркет. Просто вставь её сюда 👇", parse_mode="HTML")
         return
 
-    report_lines = [
-        f"📊 <b>{title}</b>\n",
-        "<b>Текущие котировки исходов (Стакан):</b>"
-    ]
-
-    for item in markets:
-        question = item.get("groupItemTitle") or item.get("question", "Исход")
-        prices_str = item.get("outcomePrices", '["0", "0"]')
-
-        try:
-            prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
-            yes_price = float(prices[0]) if len(prices) > 0 else 0.0
-        except Exception:
-            yes_price = 0.0
-
-        if yes_price > 0.0:
-            shares_per_dollar = 1.0 / yes_price
-            roi = (shares_per_dollar - 1.0) * 100
-            price_cents = round(yes_price * 100, 1)
-            report_lines.append(
-                f"• <b>{question}</b>: <code>{price_cents}¢</code> (${yes_price:.2f}) | Потенциал: <b>+{roi:.0f}%</b>"
-            )
-        else:
-            report_lines.append(f"• <b>{question}</b>: <code>0¢</code> (Нет ликвидности)")
-
-    report_lines.append("\n💡 <i>Сверь эти исходы с правилом Worst-Case ROI (≥30%) и сводкой METAR.</i>")
-
-    await status_msg.edit_text("\n".join(report_lines), parse_mode="HTML")
+    # Завершаем режим ожидания и запускаем анализ стакана
+    await state.clear()
+    await _execute_scan_pipeline(user_text, message)
 
 
 # -------------------------------------------------------------
-# БЛОК 4: Ручной ввод 4-значного ICAO-кода
+# БЛОК 3: Ручной ввод 4-значного ICAO-кода
 # -------------------------------------------------------------
 
 @router.message(F.text)
@@ -376,8 +420,8 @@ async def process_weather_request(message: Message):
 
     if len(user_query) != 4 or not user_query.isalpha():
         await message.answer(
-            "⚠️ Введите <b>4-значный ICAO-код</b> (например: <code>KJFK</code>) "
-            "или выберите город в меню <b>«🌍 Избранные города»</b>.",
+            "⚠️ Введите <b>4-значный ICAO-код</b> (например: <code>KJFK</code>), "
+            "выберите город в <b>«🌍 Избранные города»</b> или нажмите <b>«🔍 Сканировать маркет»</b>.",
             parse_mode="HTML",
         )
         return
