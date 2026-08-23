@@ -174,100 +174,79 @@ async def _fetch_polymarket_orderbook(param_type: str, param_val: str) -> Option
         return None
 
 
+async def _collect_weather_data(user_query: str) -> Tuple[bool, Optional[str], Optional[BufferedInputFile], Optional[str]]:
+    """Внутренний модуль сбора метеоданных: формирует текст сводки и RAW JSON файл."""
+    airport_data = await asyncio.to_thread(resolve_airport, user_query)
+    if not airport_data:
+        return False, None, None, f"❌ Аэропорт с кодом <code>{user_query}</code> не найден в базе данных."
+
+    lat, lon, tz_name = _extract_airport_coords(airport_data)
+    if lat is None or lon is None or not tz_name:
+        return False, None, None, f"⚠️ Неполные метаданные для аэропорта <code>{user_query}</code>."
+
+    try:
+        local_tz = zoneinfo.ZoneInfo(tz_name)
+        target_date_local = datetime.now(local_tz).strftime("%Y-%m-%d")
+    except Exception as e:
+        logger.error(f"Недопустимый часовой пояс '{tz_name}' для {user_query}: {e}")
+        return False, None, None, f"⚠️ Недопустимый часовой пояс <code>{tz_name}</code>."
+
+    async def _get_openmeteo():
+        return await asyncio.to_thread(fetch_openmeteo_forecast, lat, lon, tz_name, target_date_local)
+
+    async def _get_noaa():
+        return await asyncio.to_thread(get_noaa_package, user_query)
+
+    raw_forecast_payload, noaa_payload = await asyncio.gather(_get_openmeteo(), _get_noaa(), return_exceptions=True)
+
+    if isinstance(raw_forecast_payload, Exception) or not isinstance(raw_forecast_payload, dict):
+        raw_forecast_payload = {}
+    if isinstance(noaa_payload, Exception) or not isinstance(noaa_payload, dict):
+        noaa_payload = {}
+
+    synth_result = (
+        await asyncio.to_thread(synthesize_forecast, raw_forecast_payload)
+        if raw_forecast_payload
+        else {"success": False, "error": "Нет данных"}
+    )
+
+    summary_text = build_summary_caption(airport_data, synth_result, noaa_payload, target_date_local)
+    package_dict = build_raw_data_package_dict(airport_data, raw_forecast_payload, synth_result, noaa_payload)
+
+    json_bytes = json.dumps(package_dict, ensure_ascii=False, indent=2).encode("utf-8")
+    filename = f"weather_package_{user_query}_{target_date_local}.json"
+    document_file = BufferedInputFile(file=json_bytes, filename=filename)
+
+    return True, summary_text, document_file, None
+
+
 async def _execute_weather_pipeline(user_query: str, target_message: Message):
-    """Единый пайплайн сбора погодных моделей и NOAA для текстового ввода и инлайн-кнопок."""
+    """Пайплайн для прямого запроса погоды по ICAO (кнопка в меню или ввод текста)."""
     status_msg = await target_message.answer(
         f"🔍 <i>Сбор данных и генерация RAW Data Package для {user_query}...</i>",
         parse_mode="HTML",
     )
 
     try:
-        # 1. Резолвинг аэропорта в отдельном потоке (защита Event Loop)
-        airport_data = await asyncio.to_thread(resolve_airport, user_query)
-        if not airport_data:
-            await status_msg.edit_text(
-                f"❌ <b>Ошибка:</b> Аэропорт с ICAO-кодом <code>{user_query}</code> не найден в базе данных.",
-                parse_mode="HTML",
-            )
+        success, summary_text, document_file, err_msg = await _collect_weather_data(user_query)
+        if not success:
+            await status_msg.edit_text(err_msg, parse_mode="HTML")
             return
 
-        lat, lon, tz_name = _extract_airport_coords(airport_data)
-        if lat is None or lon is None or not tz_name:
-            await status_msg.edit_text(
-                f"⚠️ <b>Ошибка:</b> Неполные метаданные для аэропорта <code>{user_query}</code>.",
-                parse_mode="HTML",
-            )
-            return
-
-        try:
-            local_tz = zoneinfo.ZoneInfo(tz_name)
-            target_date_local = datetime.now(local_tz).strftime("%Y-%m-%d")
-        except Exception as e:
-            logger.error(f"Недопустимый часовой пояс '{tz_name}' для {user_query}: {e}")
-            await status_msg.edit_text(
-                f"⚠️ <b>Ошибка:</b> Недопустимый часовой пояс <code>{tz_name}</code>.",
-                parse_mode="HTML",
-            )
-            return
-
-        # 2. Параллельный сбор Open-Meteo и NOAA
-        async def _get_openmeteo():
-            return await asyncio.to_thread(
-                fetch_openmeteo_forecast, lat, lon, tz_name, target_date_local
-            )
-
-        async def _get_noaa():
-            return await asyncio.to_thread(get_noaa_package, user_query)
-
-        raw_forecast_payload, noaa_payload = await asyncio.gather(
-            _get_openmeteo(), _get_noaa(), return_exceptions=True
-        )
-
-        if isinstance(raw_forecast_payload, Exception) or not isinstance(raw_forecast_payload, dict):
-            raw_forecast_payload = {}
-        if isinstance(noaa_payload, Exception) or not isinstance(noaa_payload, dict):
-            noaa_payload = {}
-
-        # 3. Синтез прогноза
-        synth_result = (
-            await asyncio.to_thread(synthesize_forecast, raw_forecast_payload)
-            if raw_forecast_payload
-            else {"success": False, "error": "Нет данных"}
-        )
-
-        # 4. Формирование Summary текста и RAW JSON пакета
-        summary_text = build_summary_caption(
-            airport_data, synth_result, noaa_payload, target_date_local
-        )
-
-        package_dict = build_raw_data_package_dict(
-            airport_data, raw_forecast_payload, synth_result, noaa_payload
-        )
-
-        # In-Memory сериализация JSON без создания временных файлов на диске
-        json_bytes = json.dumps(package_dict, ensure_ascii=False, indent=2).encode("utf-8")
-        filename = f"weather_package_{user_query}_{target_date_local}.json"
-        document_file = BufferedInputFile(file=json_bytes, filename=filename)
-
-        # 5. Отправка сообщений пользователю
         await status_msg.delete()
         await target_message.answer(summary_text, parse_mode="HTML")
         await target_message.answer_document(
             document=document_file,
-            caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{filename}</code>",
+            caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{document_file.filename}</code>",
             parse_mode="HTML",
         )
-
     except Exception as e:
         logger.error(f"Ошибка при обработке запроса '{user_query}': {e}", exc_info=True)
-        await status_msg.edit_text(
-            "❌ <b>Произошла ошибка при обработке запроса.</b>",
-            parse_mode="HTML",
-        )
+        await status_msg.edit_text("❌ <b>Произошла ошибка при обработке запроса.</b>", parse_mode="HTML")
 
 
 async def _execute_scan_pipeline(raw_input: str, target_message: Message):
-    """Единый пайплайн сбора котировок стакана с АВТОМАТИЧЕСКИМ метеоанализом города."""
+    """Единый пайплайн: объединяет стакан и метеосводку в ОДИН цельный дашборд."""
     param_type, param_val = _parse_market_identifier(raw_input)
 
     if not param_type or not param_val:
@@ -279,7 +258,7 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
         return
 
     status_msg = await target_message.answer(
-        f"⚡ <i>Считываю стакан маркета ({param_type.upper()}: {param_val})...</i>",
+        f"⚡ <i>Считываю котировки маркета ({param_type.upper()}: {param_val})...</i>",
         parse_mode="HTML",
     )
 
@@ -326,25 +305,37 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
         else:
             report_lines.append(f"• <b>{question}</b>: <code>0¢</code> (Нет ликвидности)")
 
-    await status_msg.edit_text("\n".join(report_lines), parse_mode="HTML")
+    orderbook_block = "\n".join(report_lines)
 
-    # Автоопределение города из контекста заголовка, слага и описания
+    # Автоопределение города по названию/ссылке
     search_context = f"{title} {slug} {description} {raw_input}"
     detected_icao = _detect_city_icao(search_context)
 
     if detected_icao:
-        await target_message.answer(
-            f"🎯 <b>Автоопределение:</b> найден город <code>{detected_icao}</code>. "
-            f"Запускаю синхронизацию метеомоделей...",
+        await status_msg.edit_text(
+            f"⚡ <i>Котировки получены! Считываю метеомодели и METAR для {detected_icao}...</i>",
             parse_mode="HTML",
         )
-        await _execute_weather_pipeline(detected_icao, target_message)
-    else:
-        await target_message.answer(
-            "🌍 <b>Город не распознан автоматически.</b> Выбери его из списка ниже:",
-            parse_mode="HTML",
-            reply_markup=cities_inline_keyboard,
-        )
+        success, summary_text, document_file, _ = await _collect_weather_data(detected_icao)
+
+        if success and summary_text:
+            # Склеиваем стакан и метеосводку в одно сообщение
+            unified_report = f"{orderbook_block}\n\n{'━' * 22}\n\n{summary_text}"
+            await status_msg.edit_text(unified_report, parse_mode="HTML")
+            await target_message.answer_document(
+                document=document_file,
+                caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{document_file.filename}</code>",
+                parse_mode="HTML",
+            )
+            return
+
+    # Если город не определен автоматически — показываем стакан и кнопки городов
+    await status_msg.edit_text(orderbook_block, parse_mode="HTML")
+    await target_message.answer(
+        "🌍 <b>Город не распознан автоматически.</b> Выбери его из списка ниже:",
+        parse_mode="HTML",
+        reply_markup=cities_inline_keyboard,
+    )
 
 
 # -------------------------------------------------------------
@@ -369,8 +360,9 @@ async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
     help_text = (
         "📖 <b>Справка по работе с ботом:</b>\n\n"
-        "1. <b>Сканирование стаканов и авто-метео:</b>\n"
-        "   Нажми <b>«🔍 Сканировать маркет»</b> и пришли ссылку на маркет. Бот автоматически определит город и выдаст полный метеопакет!\n\n"
+        "1. <b>Сканирование стаканов и метеодашборд:</b>\n"
+        "   Нажми <b>«🔍 Сканировать маркет»</b> и пришли ссылку на маркет. "
+        "Бот сформирует единый отчет со стаканом цен, прогнозом 4 моделей и сводкой NOAA METAR в одном сообщении!\n\n"
         "2. <b>Быстрый выбор городов:</b>\n"
         "   Нажми кнопку <b>«🌍 Избранные города»</b> и выбери нужный аэропорт.\n\n"
         "3. <b>Метеосводки по коду:</b>\n"
@@ -434,7 +426,7 @@ async def cmd_scan_market(message: Message, state: FSMContext):
 async def process_market_link_input(message: Message, state: FSMContext):
     user_text = message.text.strip()
 
-    # Сброс режима ожидания при нажатии кнопок меню
+    # Сброс режима ожидания при нажатии системных кнопок
     if user_text == "🌍 Избранные города":
         await state.clear()
         await cmd_cities_menu(message, state)
