@@ -20,6 +20,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
+from timezonefinder import TimezoneFinder
 
 from airport_resolver import resolve_airport
 from noaa_service import get_noaa_package
@@ -32,6 +33,9 @@ from weather_synthesizer import (
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+# Офлайн-движок поиска часовых поясов по координатам
+tf = TimezoneFinder()
 
 
 # Состояние ожидания ссылки на маркет (FSM)
@@ -117,6 +121,21 @@ def _detect_city_icao(text_context: str) -> Optional[str]:
         for kw in keywords:
             if re.search(rf"\b{re.escape(kw)}\b", normalized):
                 return icao
+    return None
+
+
+def _parse_coordinates(text: str) -> Optional[Tuple[float, float]]:
+    """Распознает координаты: '55.75, 37.61' или '55.75 37.61' с валидацией диапазонов."""
+    pattern = r"^(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)$"
+    match = re.match(pattern, text.strip())
+    if match:
+        try:
+            lat = float(match.group(1))
+            lon = float(match.group(2))
+            if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                return lat, lon
+        except ValueError:
+            return None
     return None
 
 
@@ -218,6 +237,76 @@ async def _collect_weather_data(user_query: str) -> Tuple[bool, Optional[str], O
     document_file = BufferedInputFile(file=json_bytes, filename=filename)
 
     return True, summary_text, document_file, None
+
+
+async def _execute_coordinates_pipeline(lat: float, lon: float, target_message: Message):
+    """Пайплайн сбора метеоданных по географическим координатам (Широта, Долгота)."""
+    status_msg = await target_message.answer(
+        f"🧭 <i>Определяю часовой пояс и собираю метеомодели для [{lat:.4f}, {lon:.4f}]...</i>",
+        parse_mode="HTML",
+    )
+
+    try:
+        tz_name = await asyncio.to_thread(tf.timezone_at, lng=lon, lat=lat) or "UTC"
+        local_tz = zoneinfo.ZoneInfo(tz_name)
+        target_date_local = datetime.now(local_tz).strftime("%Y-%m-%d")
+
+        custom_location_data = {
+            "icao": "GEO",
+            "name": f"Координаты [{lat:.4f}, {lon:.4f}]",
+            "city": f"Точка {lat:.3f}, {lon:.3f}",
+            "country": "GEO",
+            "latitude": lat,
+            "longitude": lon,
+            "timezone": tz_name,
+        }
+
+        raw_forecast_payload = await asyncio.to_thread(
+            fetch_openmeteo_forecast, lat, lon, tz_name, target_date_local
+        )
+
+        if not isinstance(raw_forecast_payload, dict):
+            raw_forecast_payload = {}
+
+        synth_result = (
+            await asyncio.to_thread(synthesize_forecast, raw_forecast_payload)
+            if raw_forecast_payload
+            else {"success": False, "error": "Нет данных"}
+        )
+
+        noaa_payload = {
+            "metar": {
+                "available": True,
+                "raw": f"GEO {lat:.4f}/{lon:.4f} (Анализ по сетке численных моделей)",
+                "temp_c": None,
+                "dewpoint_c": None,
+                "wind_speed_kts": None,
+            },
+            "taf": {"available": False, "raw": "TAF доступен только для официальных станций ICAO"},
+        }
+
+        summary_text = build_summary_caption(
+            custom_location_data, synth_result, noaa_payload, target_date_local
+        )
+
+        package_dict = build_raw_data_package_dict(
+            custom_location_data, raw_forecast_payload, synth_result, noaa_payload
+        )
+
+        json_bytes = json.dumps(package_dict, ensure_ascii=False, indent=2).encode("utf-8")
+        clean_filename = f"weather_package_coords_{abs(lat):.2f}_{abs(lon):.2f}_{target_date_local}.json"
+        document_file = BufferedInputFile(file=json_bytes, filename=clean_filename)
+
+        await status_msg.delete()
+        await target_message.answer(summary_text, parse_mode="HTML")
+        await target_message.answer_document(
+            document=document_file,
+            caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{clean_filename}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при обработке координат ({lat}, {lon}): {e}", exc_info=True)
+        await status_msg.edit_text("❌ <b>Произошла ошибка при обработке координат.</b>", parse_mode="HTML")
 
 
 async def _execute_weather_pipeline(user_query: str, target_message: Message):
@@ -347,9 +436,12 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     welcome_text = (
         "👋 <b>Weather & Alpha Bot активен!</b>\n\n"
-        "🔹 <b>Анализ погоды:</b> нажми <b>«🌍 Избранные города»</b> или отправь любой ICAO-код (например, <code>KJFK</code>).\n\n"
+        "🔹 <b>Анализ погоды:</b>\n"
+        "• Отправь 4-значный ICAO-код (например, <code>KJFK</code>)\n"
+        "• Или отправь координаты (например: <code>48.35, 11.78</code>)\n"
+        "• Или нажми <b>«🌍 Избранные города»</b>\n\n"
         "🔹 <b>Сканер маркетов:</b>\n"
-        "• Нажми кнопку <b>«🔍 Сканировать маркет»</b> и отправь ссылку."
+        "• Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку."
     )
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=main_keyboard)
 
@@ -360,13 +452,12 @@ async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
     help_text = (
         "📖 <b>Справка по работе с ботом:</b>\n\n"
-        "1. <b>Сканирование стаканов и метеодашборд:</b>\n"
-        "   Нажми <b>«🔍 Сканировать маркет»</b> и пришли ссылку на маркет. "
-        "Бот сформирует единый отчет со стаканом цен, прогнозом 4 моделей и сводкой NOAA METAR в одном сообщении!\n\n"
-        "2. <b>Быстрый выбор городов:</b>\n"
-        "   Нажми кнопку <b>«🌍 Избранные города»</b> и выбери нужный аэропорт.\n\n"
+        "1. <b>Сканирование стаканов:</b>\n"
+        "   Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку на событие.\n\n"
+        "2. <b>Поиск по координатам:</b>\n"
+        "   Отправь широту и долготу через запятую (например: <code>55.75, 37.61</code>).\n\n"
         "3. <b>Метеосводки по коду:</b>\n"
-        "   Введи любой 4-буквенный ICAO-код вручную."
+        "   Введи 4-буквенный ICAO-код вручную или выбери в <b>«🌍 Избранные города»</b>."
     )
     await message.answer(help_text, parse_mode="HTML", reply_markup=main_keyboard)
 
@@ -448,19 +539,31 @@ async def process_market_link_input(message: Message, state: FSMContext):
 
 
 # -------------------------------------------------------------
-# БЛОК 3: Ручной ввод 4-значного ICAO-кода
+# БЛОК 3: Обработка ICAO-кодов и Координат
 # -------------------------------------------------------------
 
 @router.message(F.text)
 async def process_weather_request(message: Message):
-    user_query = message.text.strip().upper()
+    user_text = message.text.strip()
 
-    if len(user_query) != 4 or not user_query.isalpha():
-        await message.answer(
-            "⚠️ Введите <b>4-значный ICAO-код</b> (например: <code>KJFK</code>), "
-            "выберите город в <b>«🌍 Избранные города»</b> или нажмите <b>«🔍 Сканировать маркет»</b>.",
-            parse_mode="HTML",
-        )
+    # 1. Проверка ввода координат (например: 48.35, 11.78 или 48.35 11.78)
+    coords = _parse_coordinates(user_text)
+    if coords:
+        lat, lon = coords
+        await _execute_coordinates_pipeline(lat, lon, message)
         return
 
-    await _execute_weather_pipeline(user_query, message)
+    # 2. Проверка 4-значного ICAO-кода
+    user_query = user_text.upper()
+    if len(user_query) == 4 and user_query.isalpha():
+        await _execute_weather_pipeline(user_query, message)
+        return
+
+    # 3. Подсказка при некорректном формате
+    await message.answer(
+        "⚠️ <b>Формат не распознан.</b>\n\n"
+        "• Отправь <b>4-значный ICAO-код</b> (например: <code>KJFK</code>)\n"
+        "• Отправь <b>координаты</b> (например: <code>55.75, 37.61</code>)\n"
+        "• Или нажми <b>«🔍 Сканировать маркет»</b> для анализа ссылки.",
+        parse_mode="HTML",
+    )

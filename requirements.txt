@@ -5,3 +5,4 @@ airportsdata==20260803
 tzdata==2026.3
 pytest==9.1.1
 aiohttp-socks>=0.8.4
+timezonefinder>=6.5.0
