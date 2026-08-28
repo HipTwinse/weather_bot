@@ -3,7 +3,7 @@ from datetime import datetime
 import json
 import logging
 import re
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import zoneinfo
 
 import aiohttp
@@ -143,9 +143,16 @@ MONTH_NAMES = {
 }
 
 POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/events"
-POLYGON_PUBLIC_RPC = "https://polygon-rpc.com"
 
-# Адреса контрактов токенов USDC в сети Polygon (6 decimals)
+# Резервные публичные RPC-узлы Polygon (Zero-Cost & Redundancy)
+POLYGON_RPC_NODES: List[str] = [
+    "https://polygon-rpc.com",
+    "https://rpc.ankr.com/polygon",
+    "https://1rpc.io/matic",
+    "https://polygon.llamarpc.com",
+]
+
+# Адреса смарт-контрактов токенов USDC в Polygon
 USDC_CONTRACT_BRIDGED = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 USDC_CONTRACT_NATIVE = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
 
@@ -253,19 +260,19 @@ def _parse_market_identifier(url_or_text: str) -> Tuple[Optional[str], Optional[
     return None, None
 
 
-async def _fetch_wallet_usdc_balance(wallet_address: str) -> float:
+async def _fetch_wallet_usdc_balance(wallet_address: Optional[str]) -> float:
     """
-    Бесплатно считывает баланс USDC (Bridged + Native) в сети Polygon через JSON-RPC.
+    Бесплатно считывает баланс USDC (Bridged + Native) в сети Polygon с перебором резервных RPC.
     Security-by-Design: используется только публичный адрес, приватные ключи не требуются.
     """
     if not wallet_address or not wallet_address.startswith("0x"):
         return 0.0
 
     clean_addr = wallet_address.lower().replace("0x", "").zfill(64)
-    # balanceOf(address) signature hash is 0x70a08231
+    # balanceOf(address) sha3 selector: 0x70a08231
     call_data = f"0x70a08231{clean_addr}"
 
-    async def get_token_balance(session: aiohttp.ClientSession, contract: str) -> float:
+    async def query_rpc(session: aiohttp.ClientSession, rpc_url: str, contract: str) -> Optional[float]:
         payload = {
             "jsonrpc": "2.0",
             "method": "eth_call",
@@ -273,27 +280,31 @@ async def _fetch_wallet_usdc_balance(wallet_address: str) -> float:
             "id": 1,
         }
         try:
-            async with session.post(POLYGON_PUBLIC_RPC, json=payload, timeout=aiohttp.ClientTimeout(total=4.0)) as resp:
+            async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    hex_result = data.get("result", "0x0")
-                    if hex_result and hex_result != "0x":
-                        raw_balance = int(hex_result, 16)
+                    hex_val = data.get("result", "")
+                    if hex_val and hex_val != "0x":
+                        raw_balance = int(hex_val, 16)
                         return raw_balance / 1e6
-        except Exception as err:
-            logger.warning(f"Сбой чтения баланса токена {contract}: {err}")
-        return 0.0
+        except Exception:
+            return None
+        return None
 
     try:
         async with aiohttp.ClientSession() as session:
-            b1, b2 = await asyncio.gather(
-                get_token_balance(session, USDC_CONTRACT_BRIDGED),
-                get_token_balance(session, USDC_CONTRACT_NATIVE),
-            )
-            return round(b1 + b2, 2)
+            for rpc in POLYGON_RPC_NODES:
+                b1, b2 = await asyncio.gather(
+                    query_rpc(session, rpc, USDC_CONTRACT_BRIDGED),
+                    query_rpc(session, rpc, USDC_CONTRACT_NATIVE),
+                )
+                if b1 is not None or b2 is not None:
+                    total_bal = (b1 or 0.0) + (b2 or 0.0)
+                    return round(total_bal, 2)
     except Exception as e:
-        logger.error(f"Ошибка RPC-запроса баланса Polygon для {wallet_address}: {e}")
-        return 0.0
+        logger.error(f"Ошибка RPC при запросе баланса для {wallet_address}: {e}")
+
+    return 0.0
 
 
 async def _fetch_polymarket_orderbook(param_type: str, param_val: str) -> Optional[Dict[str, Any]]:
@@ -475,7 +486,7 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
         parse_mode="HTML",
     )
 
-    # Параллельно забираем стакан и баланс кошелька
+    # Запрашиваем стакан и баланс кошелька
     event_data, user_balance = await asyncio.gather(
         _fetch_polymarket_orderbook(param_type, param_val),
         _fetch_wallet_usdc_balance(getattr(config, "WALLET_ADDRESS", None)),
@@ -497,14 +508,17 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
         await status_msg.edit_text("⚠️ В этом событии нет активных котировок.", parse_mode="HTML")
         return
 
-    # Динамический мани-менеджмент: 5% базовый вход от баланса
-    risk_pct = 0.05
-    bet_size = max(round(user_balance * risk_pct, 2), 1.0) if user_balance > 0 else 5.0
+    # Динамический мани-менеджмент: если баланс определен — 5% риск, если 0.00 — базовый расчет $10.00
+    if user_balance > 0.0:
+        bet_size = max(round(user_balance * 0.05, 2), 1.0)
+        balance_header = f"💼 <b>Баланс Preddy:</b> <code>${user_balance:.2f} USDC</code>\n🎯 <b>Мани-менеджмент (5% риск):</b> <code>${bet_size:.2f}</code> на сделку"
+    else:
+        bet_size = 10.0
+        balance_header = f"💼 <b>Баланс кошелька:</b> <code>$0.00 USDC</code> <i>(Средства в позициях Preddy)</i>\n🎯 <b>Базовый сайзинг (MM Model):</b> <code>${bet_size:.2f}</code> на вход"
 
     report_lines = [
         f"📊 <b>{title}</b>\n",
-        f"💼 <b>Баланс Preddy:</b> <code>${user_balance:.2f} USDC</code>",
-        f"🎯 <b>Мани-менеджмент (5% риск):</b> <code>${bet_size:.2f}</code> на вход\n",
+        f"{balance_header}\n",
         "<b>Текущие котировки исходов (Стакан):</b>"
     ]
 
