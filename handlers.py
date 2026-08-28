@@ -62,7 +62,7 @@ class MarketScanStates(StatesGroup):
     waiting_for_link = State()
 
 
-# Главное меню Telegram
+# Главное постоянное меню Telegram
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
@@ -125,6 +125,22 @@ CITY_KEYWORD_MAP = {
     "KLAX": ["los angeles", "лос-анджелес", "klax", "lax"],
 }
 
+# Словарь месяцев для парсинга дат из заголовков маркетов
+MONTH_NAMES = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
 POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/events"
 
 
@@ -170,8 +186,32 @@ def _detect_city_icao(text_context: str) -> Optional[str]:
     return None
 
 
+def _detect_market_target_date(text_context: str) -> Optional[str]:
+    """Извлекает дату маркета из названия или слага (например, 'August 29' -> '2026-08-29')."""
+    normalized = text_context.lower()
+    
+    # 1. Формат "August 29" или "Aug 29"
+    pattern = r"\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec)\s+(\d{1,2})\b"
+    match = re.search(pattern, normalized)
+    if match:
+        month_str = match.group(1)
+        day_str = match.group(2)
+        month_num = MONTH_NAMES.get(month_str)
+        if month_num:
+            day_num = int(day_str)
+            current_year = datetime.now().year
+            return f"{current_year}-{month_num:02d}-{day_num:02d}"
+
+    # 2. Формат ISO YYYY-MM-DD в ссылке/слаге
+    iso_match = re.search(r"\b(202\d-\d{2}-\d{2})\b", normalized)
+    if iso_match:
+        return iso_match.group(1)
+
+    return None
+
+
 def _parse_coordinates(text: str) -> Optional[Tuple[float, float]]:
-    """Распознает координаты: '55.75, 37.61' или '55.75 37.61' с валидацией диапазонов."""
+    """Распознает координаты: '55.75, 37.61' с валидацией диапазонов."""
     pattern = r"^(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)$"
     match = re.match(pattern, text.strip())
     if match:
@@ -231,8 +271,8 @@ async def _fetch_polymarket_orderbook(param_type: str, param_val: str) -> Option
         return None
 
 
-async def _collect_weather_data(user_query: str) -> Tuple[bool, Optional[str], Optional[BufferedInputFile], Optional[str]]:
-    """Внутренний модуль сбора метеоданных: формирует текст сводки и RAW JSON файл."""
+async def _collect_weather_data(user_query: str, explicit_date: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[BufferedInputFile], Optional[str]]:
+    """Внутренний модуль сбора метеоданных: формирует текст сводки и RAW JSON файл с учетом даты маркета."""
     airport_data = await asyncio.to_thread(resolve_airport, user_query)
     if not airport_data:
         return False, None, None, f"❌ Аэропорт с кодом <code>{user_query}</code> не найден в базе данных."
@@ -243,7 +283,7 @@ async def _collect_weather_data(user_query: str) -> Tuple[bool, Optional[str], O
 
     try:
         local_tz = zoneinfo.ZoneInfo(tz_name)
-        target_date_local = datetime.now(local_tz).strftime("%Y-%m-%d")
+        target_date_local = explicit_date if explicit_date else datetime.now(local_tz).strftime("%Y-%m-%d")
     except Exception as e:
         logger.error(f"Недопустимый часовой пояс '{tz_name}' для {user_query}: {e}")
         return False, None, None, f"⚠️ Недопустимый часовой пояс <code>{tz_name}</code>."
@@ -373,7 +413,7 @@ async def _execute_weather_pipeline(user_query: str, target_message: Message):
 
 
 async def _execute_scan_pipeline(raw_input: str, target_message: Message):
-    """Единый пайплайн: объединяет стакан и метеосводку в ОДИН цельный дашборд."""
+    """Единый пайплайн: считывает стакан, вычисляет точную дату маркета и подгружает соответствующий прогноз."""
     param_type, param_val = _parse_market_identifier(raw_input)
 
     if not param_type or not param_val:
@@ -434,15 +474,18 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
 
     orderbook_block = "\n".join(report_lines)
 
+    # Автоопределение города и целевой даты маркета
     search_context = f"{title} {slug} {description} {raw_input}"
     detected_icao = _detect_city_icao(search_context)
+    detected_date = _detect_market_target_date(search_context)
 
     if detected_icao:
+        date_label = f" на {detected_date}" if detected_date else ""
         await status_msg.edit_text(
-            f"⚡ <i>Котировки получены! Считываю метеомодели и METAR для {detected_icao}...</i>",
+            f"⚡ <i>Котировки получены! Считываю метеомодели для {detected_icao}{date_label}...</i>",
             parse_mode="HTML",
         )
-        success, summary_text, document_file, _ = await _collect_weather_data(detected_icao)
+        success, summary_text, document_file, _ = await _collect_weather_data(detected_icao, explicit_date=detected_date)
 
         if success and summary_text:
             unified_report = f"{orderbook_block}\n\n{'━' * 22}\n\n{summary_text}"
@@ -464,7 +507,6 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
 
 # -------------------------------------------------------------
 # БЛОК 1: Приоритетные системные команды и кнопки меню
-# (Срабатывают с 1-го нажатия в ЛЮБОМ состоянии бота)
 # -------------------------------------------------------------
 
 @router.message(CommandStart(), StateFilter("*"))
