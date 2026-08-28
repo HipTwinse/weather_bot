@@ -3,7 +3,7 @@ from datetime import datetime
 import json
 import logging
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 import zoneinfo
 
 import aiohttp
@@ -37,20 +37,42 @@ router = Router()
 # Офлайн-движок поиска часовых поясов по координатам
 tf = TimezoneFinder()
 
+# Глобальное хранилище активных городов для радара (по умолчанию включены топ-города)
+active_radar_cities: Set[str] = {"EGLC", "LFPB", "EDDM"}
+
+# База отслеживаемых городов для радара
+ALL_RADAR_CITIES = {
+    "EGLC": "🇬🇧 Лондон (EGLC)",
+    "LFPB": "🇫🇷 Париж (LFPB)",
+    "EDDM": "🇩🇪 Мюнхен (EDDM)",
+    "KJFK": "🇺🇸 Нью-Йорк (KJFK)",
+    "RJTT": "🇯🇵 Токио (RJTT)",
+    "RKSI": "🇰🇷 Сеул (RKSI)",
+    "ZSPD": "🇨🇳 Шанхай (ZSPD)",
+    "LEMD": "🇪🇸 Мадрид (LEMD)",
+    "LIMC": "🇮🇹 Милан (LIMC)",
+    "LTAC": "🇹🇷 Анкара (LTAC)",
+    "NZWN": "🇳🇿 Веллингтон (NZWN)",
+    "UHHH": "🇷🇺 Хабаровск (UHHH)",
+}
+
 
 # Состояние ожидания ссылки на маркет (FSM)
 class MarketScanStates(StatesGroup):
     waiting_for_link = State()
 
 
-# Главное постоянное меню Telegram
+# Главное меню Telegram
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
             KeyboardButton(text="🔍 Сканировать маркет"),
             KeyboardButton(text="🌍 Избранные города"),
         ],
-        [KeyboardButton(text="📖 Справка / Помощь")],
+        [
+            KeyboardButton(text="⚙️ Радар аномалий"),
+            KeyboardButton(text="📖 Справка / Помощь"),
+        ],
     ],
     resize_keyboard=True,
 )
@@ -106,6 +128,26 @@ CITY_KEYWORD_MAP = {
 POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/events"
 
 
+def get_radar_keyboard() -> InlineKeyboardMarkup:
+    """Динамически строит кнопки включения/выключения городов для радара."""
+    buttons = []
+    row = []
+    for icao, name in ALL_RADAR_CITIES.items():
+        is_active = icao in active_radar_cities
+        status_icon = "🟢 ВКЛ" if is_active else "🔴 ВЫКЛ"
+        btn = InlineKeyboardButton(
+            text=f"{status_icon} {name}",
+            callback_data=f"toggle_radar:{icao}",
+        )
+        row.append(btn)
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def _extract_airport_coords(
     airport_data: Dict[str, Any],
 ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
@@ -144,29 +186,21 @@ def _parse_coordinates(text: str) -> Optional[Tuple[float, float]]:
 
 
 def _parse_market_identifier(url_or_text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Универсальный парсер: извлекает ID или SLUG из ссылок Preddy Web, Preddy TMA и Polymarket.
-    Возвращает пару: (тип_параметра, значение).
-    """
+    """Извлекает ID или SLUG из ссылок Preddy Web, Preddy TMA и Polymarket."""
     text = url_or_text.strip()
-
-    # 1. Формат Preddy Web: preddy.trade/event/.../<id>
     preddy_id_match = re.search(r"preddy\.trade/event/[^/]+/(\d+)", text)
     if preddy_id_match:
         return "id", preddy_id_match.group(1)
 
-    # 2. Формат Preddy Telegram Mini App: startapp=<slug_или_id>
     tma_match = re.search(r"startapp=([a-zA-Z0-9_-]+)", text)
     if tma_match:
         val = tma_match.group(1)
         return ("id" if val.isdigit() else "slug"), val
 
-    # 3. Формат Polymarket Event: polymarket.com/event/<slug>
     poly_match = re.search(r"polymarket\.com/event/([a-zA-Z0-9_-]+)", text)
     if poly_match:
         return "slug", poly_match.group(1)
 
-    # 4. Чистый ID или Slug
     clean_val = text.split("?")[0].rstrip("/").split("/")[-1]
     if clean_val.isdigit():
         return "id", clean_val
@@ -412,7 +446,6 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
         success, summary_text, document_file, _ = await _collect_weather_data(detected_icao)
 
         if success and summary_text:
-            # Склеиваем стакан и метеосводку в одно сообщение
             unified_report = f"{orderbook_block}\n\n{'━' * 22}\n\n{summary_text}"
             await status_msg.edit_text(unified_report, parse_mode="HTML")
             await target_message.answer_document(
@@ -445,7 +478,9 @@ async def cmd_start(message: Message, state: FSMContext):
         "• Или отправь координаты (например: <code>48.52, 135.18</code>)\n"
         "• Или нажми <b>«🌍 Избранные города»</b>\n\n"
         "🔹 <b>Сканер маркетов:</b>\n"
-        "• Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку."
+        "• Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку.\n\n"
+        "🔹 <b>Управление радаром:</b>\n"
+        "• Нажми <b>«⚙️ Радар аномалий»</b> для выбора отслеживаемых городов."
     )
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=main_keyboard)
 
@@ -458,10 +493,10 @@ async def cmd_help(message: Message, state: FSMContext):
         "📖 <b>Справка по работе с ботом:</b>\n\n"
         "1. <b>Сканирование стаканов:</b>\n"
         "   Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку на событие.\n\n"
-        "2. <b>Поиск по координатам:</b>\n"
-        "   Отправь широту и долготу через запятую (например: <code>48.52, 135.18</code>).\n\n"
-        "3. <b>Метеосводки по коду:</b>\n"
-        "   Введи 4-буквенный ICAO-код вручную или выбери в <b>«🌍 Избранные города»</b>."
+        "2. <b>Радар аномалий:</b>\n"
+        "   Нажми <b>«⚙️ Радар аномалий»</b> и переключай города тумблерами ВКЛ/ВЫКЛ.\n\n"
+        "3. <b>Метеосводки по коду или координатам:</b>\n"
+        "   Введи 4-буквенный ICAO-код или отправь координаты (например: <code>55.75, 37.61</code>)."
     )
     await message.answer(help_text, parse_mode="HTML", reply_markup=main_keyboard)
 
@@ -486,7 +521,44 @@ async def process_city_callback(callback: CallbackQuery, state: FSMContext):
 
 
 # -------------------------------------------------------------
-# БЛОК 2: Интерактивный запуск сканирования и FSM
+# БЛОК 2: Пульт управления Радаром аномалий (ВКЛ / ВЫКЛ)
+# -------------------------------------------------------------
+
+@router.message(F.text == "⚙️ Радар аномалий")
+@router.message(Command("radar"))
+async def cmd_radar_settings(message: Message, state: FSMContext):
+    await state.clear()
+    active_count = len(active_radar_cities)
+    text = (
+        f"⚙️ <b>Панель управления Радаром аномалий</b>\n\n"
+        f"📡 Сейчас активно городов: <b>{active_count} из {len(ALL_RADAR_CITIES)}</b>\n\n"
+        "Нажимай на кнопки ниже, чтобы включать (🟢) или выключать (🔴) фоновое отслеживание стаканов и METAR:"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_radar_keyboard())
+
+
+@router.callback_query(F.data.startswith("toggle_radar:"))
+async def process_toggle_radar(callback: CallbackQuery):
+    icao_code = callback.data.split(":")[1]
+    
+    if icao_code in active_radar_cities:
+        active_radar_cities.remove(icao_code)
+        await callback.answer(f"🔴 {icao_code} отключен от радара")
+    else:
+        active_radar_cities.add(icao_code)
+        await callback.answer(f"🟢 {icao_code} включен в радар")
+        
+    active_count = len(active_radar_cities)
+    text = (
+        f"⚙️ <b>Панель управления Радаром аномалий</b>\n\n"
+        f"📡 Сейчас активно городов: <b>{active_count} из {len(ALL_RADAR_CITIES)}</b>\n\n"
+        "Нажимай на кнопки ниже, чтобы включать (🟢) или выключать (🔴) фоновое отслеживание стаканов и METAR:"
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_radar_keyboard())
+
+
+# -------------------------------------------------------------
+# БЛОК 3: Интерактивный запуск сканирования и FSM
 # -------------------------------------------------------------
 
 @router.message(F.text == "🔍 Сканировать маркет")
@@ -516,15 +588,17 @@ async def cmd_scan_market(message: Message, state: FSMContext):
     await _execute_scan_pipeline(args[1], message)
 
 
-# Обработка сообщения, когда бот ждет ссылку в состоянии FSM
 @router.message(MarketScanStates.waiting_for_link, F.text)
 async def process_market_link_input(message: Message, state: FSMContext):
     user_text = message.text.strip()
 
-    # Сброс режима ожидания при нажатии системных кнопок
     if user_text == "🌍 Избранные города":
         await state.clear()
         await cmd_cities_menu(message, state)
+        return
+    if user_text == "⚙️ Радар аномалий":
+        await state.clear()
+        await cmd_radar_settings(message, state)
         return
     if user_text in ["📖 Справка / Помощь", "/help"]:
         await state.clear()
@@ -543,27 +617,24 @@ async def process_market_link_input(message: Message, state: FSMContext):
 
 
 # -------------------------------------------------------------
-# БЛОК 3: Обработка ICAO-кодов и Координат
+# БЛОК 4: Обработка ICAO-кодов и Координат
 # -------------------------------------------------------------
 
 @router.message(F.text)
 async def process_weather_request(message: Message):
     user_text = message.text.strip()
 
-    # 1. Проверка ввода координат (например: 48.52, 135.18)
     coords = _parse_coordinates(user_text)
     if coords:
         lat, lon = coords
         await _execute_coordinates_pipeline(lat, lon, message)
         return
 
-    # 2. Проверка 4-значного ICAO-кода
     user_query = user_text.upper()
     if len(user_query) == 4 and user_query.isalpha():
         await _execute_weather_pipeline(user_query, message)
         return
 
-    # 3. Подсказка при некорректном формате
     await message.answer(
         "⚠️ <b>Формат не распознан.</b>\n\n"
         "• Отправь <b>4-значный ICAO-код</b> (например: <code>KJFK</code> или <code>UHHH</code>)\n"
