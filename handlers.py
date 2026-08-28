@@ -58,9 +58,10 @@ ALL_RADAR_CITIES = {
 }
 
 
-# Состояние ожидания ссылки на маркет (FSM)
+# Состояния сканирования маркета (FSM)
 class MarketScanStates(StatesGroup):
     waiting_for_link = State()
+    waiting_for_balance = State()
 
 
 # Главное постоянное меню Telegram
@@ -107,6 +108,20 @@ cities_inline_keyboard = InlineKeyboardMarkup(
     ]
 )
 
+# Быстрые кнопки для выбора баланса
+balance_quick_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text="$50", callback_data="set_bal:50"),
+            InlineKeyboardButton(text="$100", callback_data="set_bal:100"),
+            InlineKeyboardButton(text="$250", callback_data="set_bal:250"),
+        ],
+        [
+            InlineKeyboardButton(text="Пропустить (Базовый $100)", callback_data="set_bal:100"),
+        ],
+    ]
+)
+
 # Словарь сопоставления ключевых слов маркета с ICAO-кодами городов
 CITY_KEYWORD_MAP = {
     "UHHH": ["khabarovsk", "хабаровск", "uhhh", "новый"],
@@ -143,18 +158,6 @@ MONTH_NAMES = {
 }
 
 POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/events"
-
-# Резервные публичные RPC-узлы Polygon (Zero-Cost & Redundancy)
-POLYGON_RPC_NODES: List[str] = [
-    "https://polygon-rpc.com",
-    "https://rpc.ankr.com/polygon",
-    "https://1rpc.io/matic",
-    "https://polygon.llamarpc.com",
-]
-
-# Адреса смарт-контрактов токенов USDC в Polygon
-USDC_CONTRACT_BRIDGED = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
-USDC_CONTRACT_NATIVE = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
 
 
 def get_radar_keyboard() -> InlineKeyboardMarkup:
@@ -258,53 +261,6 @@ def _parse_market_identifier(url_or_text: str) -> Tuple[Optional[str], Optional[
         return "slug", clean_val
 
     return None, None
-
-
-async def _fetch_wallet_usdc_balance(wallet_address: Optional[str]) -> float:
-    """
-    Бесплатно считывает баланс USDC (Bridged + Native) в сети Polygon с перебором резервных RPC.
-    Security-by-Design: используется только публичный адрес, приватные ключи не требуются.
-    """
-    if not wallet_address or not wallet_address.startswith("0x"):
-        return 0.0
-
-    clean_addr = wallet_address.lower().replace("0x", "").zfill(64)
-    # balanceOf(address) sha3 selector: 0x70a08231
-    call_data = f"0x70a08231{clean_addr}"
-
-    async def query_rpc(session: aiohttp.ClientSession, rpc_url: str, contract: str) -> Optional[float]:
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [{"to": contract, "data": call_data}, "latest"],
-            "id": 1,
-        }
-        try:
-            async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    hex_val = data.get("result", "")
-                    if hex_val and hex_val != "0x":
-                        raw_balance = int(hex_val, 16)
-                        return raw_balance / 1e6
-        except Exception:
-            return None
-        return None
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            for rpc in POLYGON_RPC_NODES:
-                b1, b2 = await asyncio.gather(
-                    query_rpc(session, rpc, USDC_CONTRACT_BRIDGED),
-                    query_rpc(session, rpc, USDC_CONTRACT_NATIVE),
-                )
-                if b1 is not None or b2 is not None:
-                    total_bal = (b1 or 0.0) + (b2 or 0.0)
-                    return round(total_bal, 2)
-    except Exception as e:
-        logger.error(f"Ошибка RPC при запросе баланса для {wallet_address}: {e}")
-
-    return 0.0
 
 
 async def _fetch_polymarket_orderbook(param_type: str, param_val: str) -> Optional[Dict[str, Any]]:
@@ -469,56 +425,24 @@ async def _execute_weather_pipeline(user_query: str, target_message: Message):
         await status_msg.edit_text("❌ <b>Произошла ошибка при обработке запроса.</b>", parse_mode="HTML")
 
 
-async def _execute_scan_pipeline(raw_input: str, target_message: Message):
-    """Единый пайплайн: считывает баланс, стакан с автосайзингом и метеомодели под дату маркета."""
-    param_type, param_val = _parse_market_identifier(raw_input)
-
-    if not param_type or not param_val:
-        await target_message.answer(
-            "❌ <b>Не удалось распознать ссылку.</b>\n"
-            "Убедись, что отправляешь корректную ссылку с Preddy или Polymarket.",
-            parse_mode="HTML",
-        )
-        return
-
-    status_msg = await target_message.answer(
-        f"⚡ <i>Считываю баланс Preddy и котировки маркета ({param_type.upper()}: {param_val})...</i>",
-        parse_mode="HTML",
-    )
-
-    # Запрашиваем стакан и баланс кошелька
-    event_data, user_balance = await asyncio.gather(
-        _fetch_polymarket_orderbook(param_type, param_val),
-        _fetch_wallet_usdc_balance(getattr(config, "WALLET_ADDRESS", None)),
-    )
-
-    if not event_data:
-        await status_msg.edit_text(
-            "❌ <b>Маркет не найден</b> или API временно недоступен. Проверь ссылку.",
-            parse_mode="HTML",
-        )
-        return
-
+async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: float, raw_input: str, target_message: Message):
+    """Генерирует финальный отчет со стаканом, мани-менеджментом и метеосводкой."""
     title = event_data.get("title", "Погодный маркет")
     slug = event_data.get("slug", "")
     description = event_data.get("description", "")
     markets = event_data.get("markets", [])
 
     if not markets:
-        await status_msg.edit_text("⚠️ В этом событии нет активных котировок.", parse_mode="HTML")
+        await target_message.answer("⚠️ В этом событии нет активных котировок.", parse_mode="HTML")
         return
 
-    # Динамический мани-менеджмент: если баланс определен — 5% риск, если 0.00 — базовый расчет $10.00
-    if user_balance > 0.0:
-        bet_size = max(round(user_balance * 0.05, 2), 1.0)
-        balance_header = f"💼 <b>Баланс Preddy:</b> <code>${user_balance:.2f} USDC</code>\n🎯 <b>Мани-менеджмент (5% риск):</b> <code>${bet_size:.2f}</code> на сделку"
-    else:
-        bet_size = 10.0
-        balance_header = f"💼 <b>Баланс кошелька:</b> <code>$0.00 USDC</code> <i>(Средства в позициях Preddy)</i>\n🎯 <b>Базовый сайзинг (MM Model):</b> <code>${bet_size:.2f}</code> на вход"
-
+    # Мани-менеджмент: 5% риска от введенного депозита
+    bet_size = max(round(user_balance * 0.05, 2), 1.0)
+    
     report_lines = [
         f"📊 <b>{title}</b>\n",
-        f"{balance_header}\n",
+        f"💼 <b>Твой депозит:</b> <code>${user_balance:.2f}</code>",
+        f"🎯 <b>Мани-менеджмент (5% риск):</b> <code>${bet_size:.2f}</code> на вход\n",
         "<b>Текущие котировки исходов (Стакан):</b>"
     ]
 
@@ -548,15 +472,14 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
 
     orderbook_block = "\n".join(report_lines)
 
-    # Автоопределение города и даты
     search_context = f"{title} {slug} {description} {raw_input}"
     detected_icao = _detect_city_icao(search_context)
     detected_date = _detect_market_target_date(search_context)
 
     if detected_icao:
         date_label = f" на {detected_date}" if detected_date else ""
-        await status_msg.edit_text(
-            f"⚡ <i>Котировки получены! Считываю метеомодели для {detected_icao}{date_label}...</i>",
+        status_msg = await target_message.answer(
+            f"⚡ <i>Считываю метеомодели и прогноз для {detected_icao}{date_label}...</i>",
             parse_mode="HTML",
         )
         success, summary_text, document_file, _ = await _collect_weather_data(detected_icao, explicit_date=detected_date)
@@ -571,7 +494,7 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
             )
             return
 
-    await status_msg.edit_text(orderbook_block, parse_mode="HTML")
+    await target_message.answer(orderbook_block, parse_mode="HTML")
     await target_message.answer(
         "🌍 <b>Город не распознан автоматически.</b> Выбери его из списка ниже:",
         parse_mode="HTML",
@@ -593,7 +516,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "• Или отправь координаты (например: <code>48.52, 135.18</code>)\n"
         "• Или нажми <b>«🌍 Избранные города»</b>\n\n"
         "🔹 <b>Сканер маркетов:</b>\n"
-        "• Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку.\n\n"
+        "• Нажми <b>«🔍 Сканировать маркет»</b>, отправь ссылку и баланс.\n\n"
         "🔹 <b>Управление радаром:</b>\n"
         "• Нажми <b>«⚙️ Радар аномалий»</b> для выбора отслеживаемых городов."
     )
@@ -607,7 +530,7 @@ async def cmd_help(message: Message, state: FSMContext):
     help_text = (
         "📖 <b>Справка по работе с ботом:</b>\n\n"
         "1. <b>Сканирование стаканов:</b>\n"
-        "   Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку на событие.\n\n"
+        "   Нажми <b>«🔍 Сканировать маркет»</b>, отправь ссылку, а затем укажи свой баланс.\n\n"
         "2. <b>Радар аномалий:</b>\n"
         "   Нажми <b>«⚙️ Радар аномалий»</b> и переключай города тумблерами ВКЛ/ВЫКЛ.\n\n"
         "3. <b>Метеосводки по коду или координатам:</b>\n"
@@ -662,13 +585,45 @@ async def cmd_scan_market(message: Message, state: FSMContext):
         )
         return
 
+    param_type, param_val = _parse_market_identifier(args[1])
+    if not param_type or not param_val:
+        await message.answer("❌ <b>Не удалось распознать ссылку.</b>", parse_mode="HTML")
+        return
+
+    event_data = await _fetch_polymarket_orderbook(param_type, param_val)
+    if not event_data:
+        await message.answer("❌ <b>Маркет не найден.</b> Проверь ссылку.", parse_mode="HTML")
+        return
+
+    await state.update_data(event_data=event_data, raw_link=args[1])
+    await state.set_state(MarketScanStates.waiting_for_balance)
+    await message.answer(
+        f"📊 <b>Маркет найден:</b> {event_data.get('title', 'Событие')}\n\n"
+        "💰 <b>Введи твой текущий баланс на Preddy ($)</b> сообщением или нажми кнопку ниже:",
+        parse_mode="HTML",
+        reply_markup=balance_quick_keyboard,
+    )
+
+
+# -------------------------------------------------------------
+# БЛОК 2: Инлайн-колбэки (Кнопки городов, Радара и Баланса)
+# -------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("set_bal:"))
+async def process_quick_balance(callback: CallbackQuery, state: FSMContext):
+    balance_val = float(callback.data.split(":")[1])
+    data = await state.get_data()
+    event_data = data.get("event_data")
+    raw_link = data.get("raw_link", "")
+
     await state.clear()
-    await _execute_scan_pipeline(args[1], message)
+    await callback.message.delete()
 
+    if event_data:
+        await _render_final_scan_report(event_data, balance_val, raw_link, callback.message)
+    else:
+        await callback.message.answer("⚠️ Сессия истекла. Нажми <b>«🔍 Сканировать маркет»</b> заново.", parse_mode="HTML")
 
-# -------------------------------------------------------------
-# БЛОК 2: Инлайн-колбэки (Кнопки городов и Радара)
-# -------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("icao:"))
 async def process_city_callback(callback: CallbackQuery, state: FSMContext):
@@ -699,14 +654,62 @@ async def process_toggle_radar(callback: CallbackQuery):
 
 
 # -------------------------------------------------------------
-# БЛОК 3: Обработка ссылки в FSM-режиме ожидания
+# БЛОК 3: Обработка FSM: 1) Ссылка -> 2) Ручной ввод Баланса
 # -------------------------------------------------------------
 
 @router.message(MarketScanStates.waiting_for_link, F.text)
 async def process_market_link_input(message: Message, state: FSMContext):
     user_text = message.text.strip()
+    param_type, param_val = _parse_market_identifier(user_text)
+
+    if not param_type or not param_val:
+        await message.answer(
+            "❌ <b>Не удалось распознать ссылку.</b>\n"
+            "Убедись, что отправляешь корректную ссылку с Preddy или Polymarket.",
+            parse_mode="HTML",
+        )
+        return
+
+    status_msg = await message.answer("⚡ <i>Считываю маркет...</i>", parse_mode="HTML")
+    event_data = await _fetch_polymarket_orderbook(param_type, param_val)
+
+    if not event_data:
+        await status_msg.edit_text("❌ <b>Маркет не найден.</b> Проверь ссылку.", parse_mode="HTML")
+        return
+
+    await state.update_data(event_data=event_data, raw_link=user_text)
+    await state.set_state(MarketScanStates.waiting_for_balance)
+
+    await status_msg.delete()
+    await message.answer(
+        f"📊 <b>Маркет найден:</b> {event_data.get('title', 'Событие')}\n\n"
+        "💰 <b>Введи твой текущий баланс на Preddy ($)</b> сообщением (например, <code>50</code> или <code>120.5</code>) или выбери кнопку:",
+        parse_mode="HTML",
+        reply_markup=balance_quick_keyboard,
+    )
+
+
+@router.message(MarketScanStates.waiting_for_balance, F.text)
+async def process_manual_balance_input(message: Message, state: FSMContext):
+    user_text = message.text.strip().replace("$", "").replace(",", ".")
+    
+    try:
+        user_balance = float(user_text)
+        if user_balance <= 0:
+            user_balance = 50.0
+    except ValueError:
+        user_balance = 50.0
+
+    data = await state.get_data()
+    event_data = data.get("event_data")
+    raw_link = data.get("raw_link", "")
+
     await state.clear()
-    await _execute_scan_pipeline(user_text, message)
+
+    if event_data:
+        await _render_final_scan_report(event_data, user_balance, raw_link, message)
+    else:
+        await message.answer("⚠️ Сессия истекла. Нажми <b>«🔍 Сканировать маркет»</b> заново.", parse_mode="HTML")
 
 
 # -------------------------------------------------------------
