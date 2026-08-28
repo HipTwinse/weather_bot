@@ -12,7 +12,7 @@ if ENV_PATH.exists():
 else:
     load_dotenv()
 
-# Чтение и валидация токена бота
+# Чтение и валидация токена бота (Security-by-Design)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 if not BOT_TOKEN or BOT_TOKEN == "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz_EXAMPLE":
@@ -25,6 +25,10 @@ try:
     RATE_LIMIT_SECONDS = float(os.getenv("RATE_LIMIT_SECONDS", "3.0"))
 except ValueError:
     RATE_LIMIT_SECONDS = 3.0
+
+# Чтение ID администратора для уведомлений Радара аномалий
+admin_id_raw = os.getenv("ADMIN_CHAT_ID", "").strip()
+ADMIN_CHAT_ID = int(admin_id_raw) if admin_id_raw.isdigit() else None
 
 # Прокси (если переменная не задана в облаке — бот подключится напрямую)
 PROXY_URL = os.getenv("TELEGRAM_PROXY", "").strip() or None
