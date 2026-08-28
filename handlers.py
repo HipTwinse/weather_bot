@@ -55,7 +55,7 @@ main_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# Интерактивная клавиатура с избранными торговыми городами
+# Интерактивная клавиатура с избранными торговыми городами (+ Хабаровск)
 cities_inline_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [
@@ -78,11 +78,15 @@ cities_inline_keyboard = InlineKeyboardMarkup(
             InlineKeyboardButton(text="🇹🇷 Анкара (LTAC)", callback_data="icao:LTAC"),
             InlineKeyboardButton(text="🇳🇿 Веллингтон (NZWN)", callback_data="icao:NZWN"),
         ],
+        [
+            InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="icao:UHHH"),
+        ],
     ]
 )
 
 # Словарь сопоставления ключевых слов маркета с ICAO-кодами городов
 CITY_KEYWORD_MAP = {
+    "UHHH": ["khabarovsk", "хабаровск", "uhhh", "новый"],
     "EGLC": ["london", "лондон", "eglc", "city airport", "heathrow", "gatwick"],
     "LFPB": ["paris", "париж", "lfpb", "le bourget", "charles de gaulle", "orly"],
     "RJTT": ["tokyo", "токио", "rjtt", "haneda", "narita"],
@@ -437,8 +441,8 @@ async def cmd_start(message: Message, state: FSMContext):
     welcome_text = (
         "👋 <b>Weather & Alpha Bot активен!</b>\n\n"
         "🔹 <b>Анализ погоды:</b>\n"
-        "• Отправь 4-значный ICAO-код (например, <code>KJFK</code>)\n"
-        "• Или отправь координаты (например: <code>48.35, 11.78</code>)\n"
+        "• Отправь 4-значный ICAO-код (например, <code>KJFK</code> или <code>UHHH</code>)\n"
+        "• Или отправь координаты (например: <code>48.52, 135.18</code>)\n"
         "• Или нажми <b>«🌍 Избранные города»</b>\n\n"
         "🔹 <b>Сканер маркетов:</b>\n"
         "• Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку."
@@ -455,7 +459,7 @@ async def cmd_help(message: Message, state: FSMContext):
         "1. <b>Сканирование стаканов:</b>\n"
         "   Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку на событие.\n\n"
         "2. <b>Поиск по координатам:</b>\n"
-        "   Отправь широту и долготу через запятую (например: <code>55.75, 37.61</code>).\n\n"
+        "   Отправь широту и долготу через запятую (например: <code>48.52, 135.18</code>).\n\n"
         "3. <b>Метеосводки по коду:</b>\n"
         "   Введи 4-буквенный ICAO-код вручную или выбери в <b>«🌍 Избранные города»</b>."
     )
@@ -546,7 +550,7 @@ async def process_market_link_input(message: Message, state: FSMContext):
 async def process_weather_request(message: Message):
     user_text = message.text.strip()
 
-    # 1. Проверка ввода координат (например: 48.35, 11.78 или 48.35 11.78)
+    # 1. Проверка ввода координат (например: 48.52, 135.18)
     coords = _parse_coordinates(user_text)
     if coords:
         lat, lon = coords
@@ -562,8 +566,8 @@ async def process_weather_request(message: Message):
     # 3. Подсказка при некорректном формате
     await message.answer(
         "⚠️ <b>Формат не распознан.</b>\n\n"
-        "• Отправь <b>4-значный ICAO-код</b> (например: <code>KJFK</code>)\n"
-        "• Отправь <b>координаты</b> (например: <code>55.75, 37.61</code>)\n"
+        "• Отправь <b>4-значный ICAO-код</b> (например: <code>KJFK</code> или <code>UHHH</code>)\n"
+        "• Отправь <b>координаты</b> (например: <code>48.52, 135.18</code>)\n"
         "• Или нажми <b>«🔍 Сканировать маркет»</b> для анализа ссылки.",
         parse_mode="HTML",
     )
