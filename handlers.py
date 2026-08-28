@@ -64,7 +64,7 @@ class MarketScanStates(StatesGroup):
     waiting_for_balance = State()
 
 
-# Главное постоянное меню Telegram
+# Главное меню Telegram
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
@@ -108,16 +108,18 @@ cities_inline_keyboard = InlineKeyboardMarkup(
     ]
 )
 
-# Быстрые кнопки для выбора баланса
+# Быстрые кнопки для ввода баланса
 balance_quick_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [
-            InlineKeyboardButton(text="$50", callback_data="set_bal:50"),
-            InlineKeyboardButton(text="$100", callback_data="set_bal:100"),
-            InlineKeyboardButton(text="$250", callback_data="set_bal:250"),
+            InlineKeyboardButton(text="$20 (Tier 1)", callback_data="set_bal:20"),
+            InlineKeyboardButton(text="$40 (Tier 2)", callback_data="set_bal:40"),
+            InlineKeyboardButton(text="$80 (Tier 3)", callback_data="set_bal:80"),
         ],
         [
-            InlineKeyboardButton(text="Пропустить (Базовый $100)", callback_data="set_bal:100"),
+            InlineKeyboardButton(text="$150 (Tier 4)", callback_data="set_bal:150"),
+            InlineKeyboardButton(text="$500 (Tier 5)", callback_data="set_bal:500"),
+            InlineKeyboardButton(text="$1,500 (Tier 6)", callback_data="set_bal:1500"),
         ],
     ]
 )
@@ -141,7 +143,7 @@ CITY_KEYWORD_MAP = {
     "KLAX": ["los angeles", "лос-анджелес", "klax", "lax"],
 }
 
-# Словарь месяцев для парсинга дат из заголовков маркетов
+# Словарь месяцев для парсинга дат
 MONTH_NAMES = {
     "january": 1, "jan": 1,
     "february": 2, "feb": 2,
@@ -158,6 +160,25 @@ MONTH_NAMES = {
 }
 
 POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/events"
+
+
+def calculate_tier_sizing(balance: float) -> Tuple[str, float, str]:
+    """
+    Рассчитывает сайзинг строго по Прогрессивной сетке ставок (Roadmap to $3,000).
+    Возвращает: (Название Tier, Сумма на точечный вход, Диапазон на коридор).
+    """
+    if balance < 25.0:
+        return "Tier 1 ($5 – $25)", 1.00, "$2.00 – $3.00 ($1.00 на исход)"
+    elif balance < 50.0:
+        return "Tier 2 ($25 – $50)", 2.50, "$3.00 – $5.00"
+    elif balance < 100.0:
+        return "Tier 3 ($50 – $100)", 5.00, "$6.00 – $10.00"
+    elif balance < 300.0:
+        return "Tier 4 ($100 – $300)", 10.00, "$12.00 – $25.00"
+    elif balance < 1000.0:
+        return "Tier 5 ($300 – $1,000)", 30.00, "$35.00 – $80.00"
+    else:
+        return "Tier 6 ($1,000 – $3,000)", 100.00, "$100.00 – $250.00"
 
 
 def get_radar_keyboard() -> InlineKeyboardMarkup:
@@ -426,7 +447,7 @@ async def _execute_weather_pipeline(user_query: str, target_message: Message):
 
 
 async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: float, raw_input: str, target_message: Message):
-    """Генерирует финальный отчет со стаканом, мани-менеджментом и метеосводкой."""
+    """Генерирует финальный отчет со стаканом, расчетом по сетке Roadmap и метеосводкой."""
     title = event_data.get("title", "Погодный маркет")
     slug = event_data.get("slug", "")
     description = event_data.get("description", "")
@@ -436,13 +457,13 @@ async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: fl
         await target_message.answer("⚠️ В этом событии нет активных котировок.", parse_mode="HTML")
         return
 
-    # Мани-менеджмент: 5% риска от введенного депозита
-    bet_size = max(round(user_balance * 0.05, 2), 1.0)
+    tier_name, bet_size, corridor_info = calculate_tier_sizing(user_balance)
     
     report_lines = [
         f"📊 <b>{title}</b>\n",
-        f"💼 <b>Твой депозит:</b> <code>${user_balance:.2f}</code>",
-        f"🎯 <b>Мани-менеджмент (5% риск):</b> <code>${bet_size:.2f}</code> на вход\n",
+        f"💼 <b>Твой депозит:</b> <code>${user_balance:.2f}</code> ({tier_name})",
+        f"🎯 <b>Точечный вход:</b> <code>${bet_size:.2f}</code>",
+        f"🛡️ <b>Коридор:</b> <code>{corridor_info}</code>\n",
         "<b>Текущие котировки исходов (Стакан):</b>"
     ]
 
@@ -530,7 +551,7 @@ async def cmd_help(message: Message, state: FSMContext):
     help_text = (
         "📖 <b>Справка по работе с ботом:</b>\n\n"
         "1. <b>Сканирование стаканов:</b>\n"
-        "   Нажми <b>«🔍 Сканировать маркет»</b>, отправь ссылку, а затем укажи свой баланс.\n\n"
+        "   Нажми <b>«🔍 Сканировать маркет»</b>, отправь ссылку, а затем укажи баланс.\n\n"
         "2. <b>Радар аномалий:</b>\n"
         "   Нажми <b>«⚙️ Радар аномалий»</b> и переключай города тумблерами ВКЛ/ВЫКЛ.\n\n"
         "3. <b>Метеосводки по коду или координатам:</b>\n"
@@ -670,7 +691,7 @@ async def process_market_link_input(message: Message, state: FSMContext):
         )
         return
 
-    status_msg = await message.answer("⚡ <i>Считываю маркет...</i>", parse_mode="HTML")
+    status_msg = await message.answer("⚡ <i>Считываю котировки маркета...</i>", parse_mode="HTML")
     event_data = await _fetch_polymarket_orderbook(param_type, param_val)
 
     if not event_data:
@@ -683,7 +704,7 @@ async def process_market_link_input(message: Message, state: FSMContext):
     await status_msg.delete()
     await message.answer(
         f"📊 <b>Маркет найден:</b> {event_data.get('title', 'Событие')}\n\n"
-        "💰 <b>Введи твой текущий баланс на Preddy ($)</b> сообщением (например, <code>50</code> или <code>120.5</code>) или выбери кнопку:",
+        "💰 <b>Введи твой текущий баланс на Preddy ($)</b> сообщением (например, <code>25</code> или <code>150</code>) или выбери кнопку:",
         parse_mode="HTML",
         reply_markup=balance_quick_keyboard,
     )
@@ -696,9 +717,9 @@ async def process_manual_balance_input(message: Message, state: FSMContext):
     try:
         user_balance = float(user_text)
         if user_balance <= 0:
-            user_balance = 50.0
+            user_balance = 25.0
     except ValueError:
-        user_balance = 50.0
+        user_balance = 25.0
 
     data = await state.get_data()
     event_data = data.get("event_data")
