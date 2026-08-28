@@ -22,6 +22,7 @@ from aiogram.types import (
 )
 from timezonefinder import TimezoneFinder
 
+import config
 from airport_resolver import resolve_airport
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
@@ -38,7 +39,7 @@ router = Router()
 tf = TimezoneFinder()
 
 # Глобальное хранилище активных городов для радара
-active_radar_cities: Set[str] = {"EGLC", "LFPB", "EDDM"}
+active_radar_cities: Set[str] = {"EGLC", "LFPB", "EDDM", "KJFK", "RKSI"}
 
 # База отслеживаемых городов для радара
 ALL_RADAR_CITIES = {
@@ -142,6 +143,11 @@ MONTH_NAMES = {
 }
 
 POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/events"
+POLYGON_PUBLIC_RPC = "https://polygon-rpc.com"
+
+# Адреса контрактов токенов USDC в сети Polygon (6 decimals)
+USDC_CONTRACT_BRIDGED = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+USDC_CONTRACT_NATIVE = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
 
 
 def get_radar_keyboard() -> InlineKeyboardMarkup:
@@ -189,8 +195,6 @@ def _detect_city_icao(text_context: str) -> Optional[str]:
 def _detect_market_target_date(text_context: str) -> Optional[str]:
     """Извлекает дату маркета из названия или слага (например, 'August 29' -> '2026-08-29')."""
     normalized = text_context.lower()
-    
-    # 1. Формат "August 29" или "Aug 29"
     pattern = r"\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec)\s+(\d{1,2})\b"
     match = re.search(pattern, normalized)
     if match:
@@ -202,7 +206,6 @@ def _detect_market_target_date(text_context: str) -> Optional[str]:
             current_year = datetime.now().year
             return f"{current_year}-{month_num:02d}-{day_num:02d}"
 
-    # 2. Формат ISO YYYY-MM-DD в ссылке/слаге
     iso_match = re.search(r"\b(202\d-\d{2}-\d{2})\b", normalized)
     if iso_match:
         return iso_match.group(1)
@@ -248,6 +251,49 @@ def _parse_market_identifier(url_or_text: str) -> Tuple[Optional[str], Optional[
         return "slug", clean_val
 
     return None, None
+
+
+async def _fetch_wallet_usdc_balance(wallet_address: str) -> float:
+    """
+    Бесплатно считывает баланс USDC (Bridged + Native) в сети Polygon через JSON-RPC.
+    Security-by-Design: используется только публичный адрес, приватные ключи не требуются.
+    """
+    if not wallet_address or not wallet_address.startswith("0x"):
+        return 0.0
+
+    clean_addr = wallet_address.lower().replace("0x", "").zfill(64)
+    # balanceOf(address) signature hash is 0x70a08231
+    call_data = f"0x70a08231{clean_addr}"
+
+    async def get_token_balance(session: aiohttp.ClientSession, contract: str) -> float:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": contract, "data": call_data}, "latest"],
+            "id": 1,
+        }
+        try:
+            async with session.post(POLYGON_PUBLIC_RPC, json=payload, timeout=aiohttp.ClientTimeout(total=4.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    hex_result = data.get("result", "0x0")
+                    if hex_result and hex_result != "0x":
+                        raw_balance = int(hex_result, 16)
+                        return raw_balance / 1e6
+        except Exception as err:
+            logger.warning(f"Сбой чтения баланса токена {contract}: {err}")
+        return 0.0
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            b1, b2 = await asyncio.gather(
+                get_token_balance(session, USDC_CONTRACT_BRIDGED),
+                get_token_balance(session, USDC_CONTRACT_NATIVE),
+            )
+            return round(b1 + b2, 2)
+    except Exception as e:
+        logger.error(f"Ошибка RPC-запроса баланса Polygon для {wallet_address}: {e}")
+        return 0.0
 
 
 async def _fetch_polymarket_orderbook(param_type: str, param_val: str) -> Optional[Dict[str, Any]]:
@@ -413,7 +459,7 @@ async def _execute_weather_pipeline(user_query: str, target_message: Message):
 
 
 async def _execute_scan_pipeline(raw_input: str, target_message: Message):
-    """Единый пайплайн: считывает стакан, вычисляет точную дату маркета и подгружает соответствующий прогноз."""
+    """Единый пайплайн: считывает баланс, стакан с автосайзингом и метеомодели под дату маркета."""
     param_type, param_val = _parse_market_identifier(raw_input)
 
     if not param_type or not param_val:
@@ -425,11 +471,15 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
         return
 
     status_msg = await target_message.answer(
-        f"⚡ <i>Считываю котировки маркета ({param_type.upper()}: {param_val})...</i>",
+        f"⚡ <i>Считываю баланс Preddy и котировки маркета ({param_type.upper()}: {param_val})...</i>",
         parse_mode="HTML",
     )
 
-    event_data = await _fetch_polymarket_orderbook(param_type, param_val)
+    # Параллельно забираем стакан и баланс кошелька
+    event_data, user_balance = await asyncio.gather(
+        _fetch_polymarket_orderbook(param_type, param_val),
+        _fetch_wallet_usdc_balance(getattr(config, "WALLET_ADDRESS", None)),
+    )
 
     if not event_data:
         await status_msg.edit_text(
@@ -447,8 +497,14 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
         await status_msg.edit_text("⚠️ В этом событии нет активных котировок.", parse_mode="HTML")
         return
 
+    # Динамический мани-менеджмент: 5% базовый вход от баланса
+    risk_pct = 0.05
+    bet_size = max(round(user_balance * risk_pct, 2), 1.0) if user_balance > 0 else 5.0
+
     report_lines = [
         f"📊 <b>{title}</b>\n",
+        f"💼 <b>Баланс Preddy:</b> <code>${user_balance:.2f} USDC</code>",
+        f"🎯 <b>Мани-менеджмент (5% риск):</b> <code>${bet_size:.2f}</code> на вход\n",
         "<b>Текущие котировки исходов (Стакан):</b>"
     ]
 
@@ -463,18 +519,22 @@ async def _execute_scan_pipeline(raw_input: str, target_message: Message):
             yes_price = 0.0
 
         if yes_price > 0.0:
-            shares_per_dollar = 1.0 / yes_price
-            roi = (shares_per_dollar - 1.0) * 100
+            shares_count = int(bet_size / yes_price)
+            potential_payout = shares_count * 1.0
+            net_profit = potential_payout - bet_size
+            roi = ((1.0 / yes_price) - 1.0) * 100
             price_cents = round(yes_price * 100, 1)
+
             report_lines.append(
-                f"• <b>{question}</b>: <code>{price_cents}¢</code> (${yes_price:.2f}) | Потенциал: <b>+{roi:.0f}%</b>"
+                f"• <b>{question}</b>: <code>{price_cents}¢</code> (${yes_price:.2f})\n"
+                f"  └ <i>Вход (${bet_size:.2f}):</i> <b>{shares_count} shares</b> | Профит: <b>+${net_profit:.2f} (+{roi:.0f}%)</b>"
             )
         else:
             report_lines.append(f"• <b>{question}</b>: <code>0¢</code> (Нет ликвидности)")
 
     orderbook_block = "\n".join(report_lines)
 
-    # Автоопределение города и целевой даты маркета
+    # Автоопределение города и даты
     search_context = f"{title} {slug} {description} {raw_input}"
     detected_icao = _detect_city_icao(search_context)
     detected_date = _detect_market_target_date(search_context)
