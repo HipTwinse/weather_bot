@@ -2,6 +2,9 @@
 .env
 *.env
 
+# Локальная база данных SQLite
+positions.db
+
 # Виртуальное окружение
 venv/
 .venv/

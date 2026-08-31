@@ -32,9 +32,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("WeatherBotMain")
 
-# Кэш для защиты от спама (ключ: ICAO или ICAO_alert_type -> timestamp)
+# Кэш кулдауна алертов (ключ -> timestamp)
 last_alert_sent: Dict[str, float] = {}
 previous_wind_dirs: Dict[str, int] = {}
+
+# Память дневного максимума: ключ 'ICAO_YYYY-MM-DD' -> max_temp_float
+daily_max_records: Dict[str, float] = {}
 
 
 async def setup_bot_commands(bot: Bot) -> None:
@@ -72,8 +75,9 @@ async def run_health_check_server() -> None:
 async def background_radar_worker(bot: Bot) -> None:
     """
     Фоновый радар-страж:
-    1. Проверяет активные сделки пользователей (Front Crash, Wind Shift, Solar Peak).
-    2. Сканирует включенные города на предмет общих аномалий прогрева.
+    1. Отслеживает дневные рекорды (Highest Temp).
+    2. Защищает открытые позиции пользователей.
+    3. Выдает понятные практические инструкции «ЧТО ДЕЛАТЬ».
     """
     logger.info("📡 Фоновый Радар Аномалий и Страж Позиций запущен.")
     admin_id = getattr(config, "ADMIN_CHAT_ID", None)
@@ -86,7 +90,7 @@ async def background_radar_worker(bot: Bot) -> None:
             current_timestamp = asyncio.get_event_loop().time()
             active_positions = await asyncio.to_thread(get_all_active_positions)
 
-            # Собираем список всех станций для опроса (города из радара + города из открытых сделок)
+            # Формируем список станций: города радара + города из открытых сделок
             target_icaos = set(active_radar_cities)
             for pos in active_positions:
                 target_icaos.add(pos["icao"])
@@ -114,11 +118,21 @@ async def background_radar_worker(bot: Bot) -> None:
                 except Exception:
                     local_dt = datetime.now()
 
+                local_date_str = local_dt.strftime("%Y-%m-%d")
                 local_hour = local_dt.hour
                 local_time_str = local_dt.strftime("%H:%M")
 
+                # Обновляем зафиксированный рекорд дня
+                record_key = f"{icao}_{local_date_str}"
+                if temp_c is not None:
+                    current_record = daily_max_records.get(record_key, -999.0)
+                    if temp_c > current_record:
+                        daily_max_records[record_key] = float(temp_c)
+
+                day_peak_record = daily_max_records.get(record_key, temp_c)
+
                 # -------------------------------------------------------------
-                # ФИЧА 1: ⚡ Front Crash Alert (Резкие порывы ветра и грозовые ячейки)
+                # ФИЧА 1: ⚡ Front Crash Alert (Шквалы и Грозовой фронт)
                 # -------------------------------------------------------------
                 has_storm = any(sig in raw_metar for sig in ["TS", "CB", "SQ", "+RA", "GR"])
                 has_strong_gusts = "G" in raw_metar and any(int(g) >= 25 for g in re.findall(r"G(\d{2})KT", raw_metar))
@@ -130,14 +144,14 @@ async def background_radar_worker(bot: Bot) -> None:
                         crash_msg = (
                             f"⚡ <b>FRONT CRASH ALERT | РЕЗКИЙ СЛОМ ПОГОДЫ</b>\n\n"
                             f"📍 <b>Локация:</b> {city_name}\n"
-                            f"🌡️ <b>Температура:</b> <code>{temp_c}°C</code>\n"
-                            f"⚠️ <b>Опасность:</b> Зафиксирован грозовой фронт или порывы > 25 kt. "
-                            f"Возможен резкий обвал температуры!\n\n"
+                            f"🌡️ <b>Температура сейчас:</b> <code>{temp_c}°C</code> (Пик дня: <code>{day_peak_record}°C</code>)\n"
+                            f"⚠️ <b>Физика:</b> Подошел холодный фронт / порывы ветра > 25 kt. Прогрев заблокирован, температура падает!\n\n"
                             f"📝 <code>{raw_metar}</code>\n\n"
-                            f"🛑 <b>Рекомендация:</b> Проверь позиции и рассмотри досрочный <b>CASHOUT</b>."
+                            f"🎯 <b>ЧТО ДЕЛАТЬ:</b>\n"
+                            f"• Если твоя сделка на высокие температуры — <b>жми CASHOUT прямо сейчас</b>, пока котировки не упали.\n"
+                            f"• Новые сделки на повышение в этом городе <b>не открывать</b>."
                         )
 
-                        # Оповещаем владельцев сделок по этому городу
                         for pos in active_positions:
                             if pos["icao"] == icao:
                                 try:
@@ -151,13 +165,12 @@ async def background_radar_worker(bot: Bot) -> None:
                                 pass
 
                 # -------------------------------------------------------------
-                # ФИЧА 2: 💨 Wind Shift Detector (Разворот на морской бриз)
+                # ФИЧА 2: 💨 Wind Shift Detector (Морской бриз)
                 # -------------------------------------------------------------
                 if isinstance(wind_dir, int):
                     prev_dir = previous_wind_dirs.get(icao)
                     previous_wind_dirs[icao] = wind_dir
 
-                    # Для Нью-Йорка (KJFK): разворот с суши (240-310) на холодный океан (110-190)
                     if icao == "KJFK" and prev_dir is not None:
                         is_onshore = (110 <= wind_dir <= 190) and (wind_speed >= 8)
                         was_offshore = 220 <= prev_dir <= 310
@@ -168,9 +181,10 @@ async def background_radar_worker(bot: Bot) -> None:
                                 shift_msg = (
                                     f"💨 <b>WIND SHIFT DETECTOR | МОРСКОЙ БРИЗ (JFK)</b>\n\n"
                                     f"📍 <b>Локация:</b> {city_name}\n"
-                                    f"🌊 Ветер сменился на океанический бриз (<code>{wind_dir}° / {wind_speed} kt</code>). "
-                                    f"Прогрев датчика заблокирован!\n\n"
-                                    f"📝 <code>{raw_metar}</code>"
+                                    f"🌊 <b>Физика:</b> Ветер развернулся на холодный океан (<code>{wind_dir}° / {wind_speed} kt</code>). Прогрев остановлен.\n\n"
+                                    f"🎯 <b>ЧТО ДЕЛАТЬ:</b>\n"
+                                    f"• Пик температуры зафиксирован на отметке <code>{day_peak_record}°C</code>.\n"
+                                    f"• Не докупай верхние исходы — они уже не сыграют."
                                 )
                                 for pos in active_positions:
                                     if pos["icao"] == icao:
@@ -180,7 +194,7 @@ async def background_radar_worker(bot: Bot) -> None:
                                             pass
 
                 # -------------------------------------------------------------
-                # ФИЧА 3: ☀️ Solar Peak Window (Закрытие окна солнечного прогрева)
+                # ФИЧА 3: ☀️ Solar Peak Window (Закрытие окна инсоляции)
                 # -------------------------------------------------------------
                 if local_hour >= 17 and temp_c is not None:
                     solar_key = f"{icao}_solar_peak"
@@ -190,10 +204,13 @@ async def background_radar_worker(bot: Bot) -> None:
                             if pos["icao"] == icao:
                                 solar_msg = (
                                     f"☀️ <b>SOLAR PEAK WINDOW | ОКНО ПРОГРЕВА ЗАКРЫТО</b>\n\n"
-                                    f"📍 <b>Локация:</b> {city_name} (Местное время: <code>{local_time_str}</code>)\n"
-                                    f"🌡️ <b>Текущий факт:</b> <code>{temp_c}°C</code> | Твои исходы: <code>{pos['outcomes']}</code>\n"
-                                    f"📉 Инсоляция пошла на спад. Дальнейший рост маловероятен. "
-                                    f"Рекомендуется зафиксировать результат."
+                                    f"📍 <b>Локация:</b> {city_name} (Время: <code>{local_time_str} LT</code>)\n"
+                                    f"🏆 <b>Фактический рекорд дня:</b> <code>{day_peak_record}°C</code>\n"
+                                    f"🌡️ <i>Текущая вечерняя температура: {temp_c}°C</i>\n"
+                                    f"📌 <b>Твои купленные исходы:</b> <code>{pos['outcomes']}</code>\n\n"
+                                    f"🎯 <b>ЧТО ДЕЛАТЬ:</b>\n"
+                                    f"• Если твой исход совпадает с <code>{int(round(day_peak_record))}°C</code> — <b>поздравляю, позиция в плюсе, держи до расчета</b>.\n"
+                                    f"• Если рекорд дня не дотянул до твоих исходов — солнце село, роста больше не будет. Можно закрывать терминал."
                                 )
                                 try:
                                     await bot.send_message(chat_id=pos["user_id"], text=solar_msg, parse_mode="HTML")
@@ -201,7 +218,7 @@ async def background_radar_worker(bot: Bot) -> None:
                                     pass
 
                 # -------------------------------------------------------------
-                # ФИЧА 4: Базовый радар чистого неба (Общие сигналы для админа)
+                # ФИЧА 4: Базовый радар чистого неба (Сигналы для админа)
                 # -------------------------------------------------------------
                 if temp_c is not None and ("CAVOK" in raw_metar or "NCD" in raw_metar or "CLR" in raw_metar):
                     general_key = f"{icao}_cavok"
@@ -211,8 +228,9 @@ async def background_radar_worker(bot: Bot) -> None:
                             f"🚨 <b>РАДАР АНОМАЛИЙ | АКТИВНЫЙ ПРОГРЕВ</b>\n\n"
                             f"📍 <b>Локация:</b> {city_name}\n"
                             f"🌡️ <b>Факт METAR:</b> <code>{temp_c}°C</code> (Время: {local_time_str} LT)\n"
-                            f"☀️ <b>Условия:</b> Чистое небо (CAVOK), активная инсоляция.\n\n"
-                            f"📝 <code>{raw_metar}</code>"
+                            f"☀️ <b>Условия:</b> Чистое небо (CAVOK), идет активный набор градусов.\n\n"
+                            f"🎯 <b>ЧТО ДЕЛАТЬ:</b>\n"
+                            f"• Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку на {city_name} для поиска выгодной точки входа!"
                         )
                         if admin_id and (icao in active_radar_cities):
                             try:
@@ -231,11 +249,10 @@ async def background_radar_worker(bot: Bot) -> None:
 async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -> None:
     for attempt in range(1, max_retries + 1):
         try:
-            logger.info(f"🔄 Попытка подключения к Telegram API ({attempt}/{max_retries})...")
+            logger.info(f"🔄 Подключение к Telegram API ({attempt}/{max_retries})...")
             await bot.delete_webhook(drop_pending_updates=True)
             await setup_bot_commands(bot)
 
-            # Запуск фонового воркера Радара
             radar_task = asyncio.create_task(background_radar_worker(bot))
 
             logger.info("🚀 УСПЕШНО! Бот слушает команды.")
@@ -256,14 +273,11 @@ async def main() -> None:
         logger.critical("❌ КРИТИЧЕСКАЯ ОШИБКА: BOT_TOKEN не обнаружен!")
         return
 
-    # 1. Инициализация базы данных SQLite
     init_db()
     logger.info("🗄️ База данных SQLite (positions.db) инициализирована.")
 
-    # 2. Запуск Health-Check сервера Render
     await run_health_check_server()
 
-    # 3. Сессия и бот
     session = AiohttpSession(proxy=config.PROXY_URL) if config.PROXY_URL else None
     bot = Bot(
         token=config.BOT_TOKEN,
@@ -279,7 +293,7 @@ async def main() -> None:
         await start_bot_with_retry(bot, dp)
     finally:
         await bot.session.close()
-        logger.info("🛑 Сессия бота корректно закрыта.")
+        logger.info("🛑 Сессия бота закрыта.")
 
 
 if __name__ == "__main__":
