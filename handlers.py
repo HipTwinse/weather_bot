@@ -24,6 +24,7 @@ from timezonefinder import TimezoneFinder
 
 import config
 from airport_resolver import resolve_airport
+from database import add_position, delete_position, get_user_positions
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
 from weather_synthesizer import (
@@ -58,10 +59,15 @@ ALL_RADAR_CITIES = {
 }
 
 
-# Состояния сканирования маркета (FSM)
+# Состояния сканирования маркета и добавления позиций (FSM)
 class MarketScanStates(StatesGroup):
     waiting_for_link = State()
     waiting_for_balance = State()
+
+
+class AddPositionStates(StatesGroup):
+    waiting_for_city = State()
+    waiting_for_outcomes = State()
 
 
 # Главное меню Telegram
@@ -69,10 +75,13 @@ main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
             KeyboardButton(text="🔍 Сканировать маркет"),
-            KeyboardButton(text="🌍 Избранные города"),
+            KeyboardButton(text="📌 Мои позиции"),
         ],
         [
             KeyboardButton(text="⚙️ Радар аномалий"),
+            KeyboardButton(text="🌍 Избранные города"),
+        ],
+        [
             KeyboardButton(text="📖 Справка / Помощь"),
         ],
     ],
@@ -108,6 +117,28 @@ cities_inline_keyboard = InlineKeyboardMarkup(
     ]
 )
 
+# Клавиатура выбора города для добавления позиции
+position_city_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🇬🇧 Лондон (EGLC)", callback_data="pos_city:EGLC"),
+            InlineKeyboardButton(text="🇫🇷 Париж (LFPB)", callback_data="pos_city:LFPB"),
+        ],
+        [
+            InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="pos_city:EDDM"),
+            InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="pos_city:KJFK"),
+        ],
+        [
+            InlineKeyboardButton(text="🇮🇹 Милан (LIMC)", callback_data="pos_city:LIMC"),
+            InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="pos_city:LEMD"),
+        ],
+        [
+            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="pos_city:RKSI"),
+            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="pos_city:RJTT"),
+        ],
+    ]
+)
+
 # Быстрые кнопки для ввода баланса
 balance_quick_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
@@ -124,7 +155,6 @@ balance_quick_keyboard = InlineKeyboardMarkup(
     ]
 )
 
-# Словарь сопоставления ключевых слов маркета с ICAO-кодами городов
 CITY_KEYWORD_MAP = {
     "UHHH": ["khabarovsk", "хабаровск", "uhhh", "новый"],
     "EGLC": ["london", "лондон", "eglc", "city airport", "heathrow", "gatwick"],
@@ -143,7 +173,6 @@ CITY_KEYWORD_MAP = {
     "KLAX": ["los angeles", "лос-анджелес", "klax", "lax"],
 }
 
-# Словарь месяцев для парсинга дат
 MONTH_NAMES = {
     "january": 1, "jan": 1,
     "february": 2, "feb": 2,
@@ -163,10 +192,7 @@ POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/events"
 
 
 def calculate_tier_sizing(balance: float) -> Tuple[str, float, str]:
-    """
-    Рассчитывает сайзинг строго по Прогрессивной сетке ставок (Roadmap to $3,000).
-    Возвращает: (Название Tier, Сумма на точечный вход, Диапазон на коридор).
-    """
+    """Рассчитывает сайзинг строго по Прогрессивной сетке ставок (Roadmap to $3,000)."""
     if balance < 25.0:
         return "Tier 1 ($5 – $25)", 1.00, "$2.00 – $3.00 ($1.00 на исход)"
     elif balance < 50.0:
@@ -201,10 +227,7 @@ def get_radar_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def _extract_airport_coords(
-    airport_data: Dict[str, Any],
-) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """Извлекает координаты и таймзону аэропорта из базы данных."""
+def _extract_airport_coords(airport_data: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     if not airport_data:
         return None, None, None
     lat = airport_data.get("lat") if airport_data.get("lat") is not None else airport_data.get("latitude")
@@ -214,7 +237,6 @@ def _extract_airport_coords(
 
 
 def _detect_city_icao(text_context: str) -> Optional[str]:
-    """Автоматически находит ICAO-код города в названии, описании или ссылке события."""
     normalized = text_context.lower()
     for icao, keywords in CITY_KEYWORD_MAP.items():
         for kw in keywords:
@@ -224,7 +246,6 @@ def _detect_city_icao(text_context: str) -> Optional[str]:
 
 
 def _detect_market_target_date(text_context: str) -> Optional[str]:
-    """Извлекает дату маркета из названия или слага (например, 'August 29' -> '2026-08-29')."""
     normalized = text_context.lower()
     pattern = r"\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec)\s+(\d{1,2})\b"
     match = re.search(pattern, normalized)
@@ -245,7 +266,6 @@ def _detect_market_target_date(text_context: str) -> Optional[str]:
 
 
 def _parse_coordinates(text: str) -> Optional[Tuple[float, float]]:
-    """Распознает координаты: '55.75, 37.61' с валидацией диапазонов."""
     pattern = r"^(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)$"
     match = re.match(pattern, text.strip())
     if match:
@@ -260,7 +280,6 @@ def _parse_coordinates(text: str) -> Optional[Tuple[float, float]]:
 
 
 def _parse_market_identifier(url_or_text: str) -> Tuple[Optional[str], Optional[str]]:
-    """Извлекает ID или SLUG из ссылок Preddy Web, Preddy TMA и Polymarket."""
     text = url_or_text.strip()
     preddy_id_match = re.search(r"preddy\.trade/event/[^/]+/(\d+)", text)
     if preddy_id_match:
@@ -285,7 +304,6 @@ def _parse_market_identifier(url_or_text: str) -> Tuple[Optional[str], Optional[
 
 
 async def _fetch_polymarket_orderbook(param_type: str, param_val: str) -> Optional[Dict[str, Any]]:
-    """Бесплатно и безопасно забирает стакан через официальный шлюз Polymarket Gamma API."""
     url = f"{POLYMARKET_GAMMA_API}?{param_type}={param_val}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -301,12 +319,11 @@ async def _fetch_polymarket_orderbook(param_type: str, param_val: str) -> Option
                     return data
                 return None
     except Exception as error:
-        logger.error(f"Сбой при запросе к Polymarket API ({param_type}={param_val}): {error}")
+        logger.error(f"Сбой при запросе к Polymarket API: {error}")
         return None
 
 
 async def _collect_weather_data(user_query: str, explicit_date: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[BufferedInputFile], Optional[str]]:
-    """Внутренний модуль сбора метеоданных: формирует текст сводки и RAW JSON файл с учетом даты маркета."""
     airport_data = await asyncio.to_thread(resolve_airport, user_query)
     if not airport_data:
         return False, None, None, f"❌ Аэропорт с кодом <code>{user_query}</code> не найден в базе данных."
@@ -351,103 +368,7 @@ async def _collect_weather_data(user_query: str, explicit_date: Optional[str] = 
     return True, summary_text, document_file, None
 
 
-async def _execute_coordinates_pipeline(lat: float, lon: float, target_message: Message):
-    """Пайплайн сбора метеоданных по географическим координатам (Широта, Долгота)."""
-    status_msg = await target_message.answer(
-        f"🧭 <i>Определяю часовой пояс и собираю метеомодели для [{lat:.4f}, {lon:.4f}]...</i>",
-        parse_mode="HTML",
-    )
-
-    try:
-        tz_name = await asyncio.to_thread(tf.timezone_at, lng=lon, lat=lat) or "UTC"
-        local_tz = zoneinfo.ZoneInfo(tz_name)
-        target_date_local = datetime.now(local_tz).strftime("%Y-%m-%d")
-
-        custom_location_data = {
-            "icao": "GEO",
-            "name": f"Координаты [{lat:.4f}, {lon:.4f}]",
-            "city": f"Точка {lat:.3f}, {lon:.3f}",
-            "country": "GEO",
-            "latitude": lat,
-            "longitude": lon,
-            "timezone": tz_name,
-        }
-
-        raw_forecast_payload = await asyncio.to_thread(
-            fetch_openmeteo_forecast, lat, lon, tz_name, target_date_local
-        )
-
-        if not isinstance(raw_forecast_payload, dict):
-            raw_forecast_payload = {}
-
-        synth_result = (
-            await asyncio.to_thread(synthesize_forecast, raw_forecast_payload)
-            if raw_forecast_payload
-            else {"success": False, "error": "Нет данных"}
-        )
-
-        noaa_payload = {
-            "metar": {
-                "available": True,
-                "raw": f"GEO {lat:.4f}/{lon:.4f} (Анализ по сетке численных моделей)",
-                "temp_c": None,
-                "dewpoint_c": None,
-                "wind_speed_kts": None,
-            },
-            "taf": {"available": False, "raw": "TAF доступен только для официальных станций ICAO"},
-        }
-
-        summary_text = build_summary_caption(
-            custom_location_data, synth_result, noaa_payload, target_date_local
-        )
-
-        package_dict = build_raw_data_package_dict(
-            custom_location_data, raw_forecast_payload, synth_result, noaa_payload
-        )
-
-        json_bytes = json.dumps(package_dict, ensure_ascii=False, indent=2).encode("utf-8")
-        clean_filename = f"weather_package_coords_{abs(lat):.2f}_{abs(lon):.2f}_{target_date_local}.json"
-        document_file = BufferedInputFile(file=json_bytes, filename=clean_filename)
-
-        await status_msg.delete()
-        await target_message.answer(summary_text, parse_mode="HTML")
-        await target_message.answer_document(
-            document=document_file,
-            caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{clean_filename}</code>",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при обработке координат ({lat}, {lon}): {e}", exc_info=True)
-        await status_msg.edit_text("❌ <b>Произошла ошибка при обработке координат.</b>", parse_mode="HTML")
-
-
-async def _execute_weather_pipeline(user_query: str, target_message: Message):
-    """Пайплайн для прямого запроса погоды по ICAO."""
-    status_msg = await target_message.answer(
-        f"🔍 <i>Сбор данных и генерация RAW Data Package для {user_query}...</i>",
-        parse_mode="HTML",
-    )
-
-    try:
-        success, summary_text, document_file, err_msg = await _collect_weather_data(user_query)
-        if not success:
-            await status_msg.edit_text(err_msg, parse_mode="HTML")
-            return
-
-        await status_msg.delete()
-        await target_message.answer(summary_text, parse_mode="HTML")
-        await target_message.answer_document(
-            document=document_file,
-            caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{document_file.filename}</code>",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при обработке запроса '{user_query}': {e}", exc_info=True)
-        await status_msg.edit_text("❌ <b>Произошла ошибка при обработке запроса.</b>", parse_mode="HTML")
-
-
 async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: float, raw_input: str, target_message: Message):
-    """Генерирует финальный отчет со стаканом, расчетом по сетке Roadmap и метеосводкой."""
     title = event_data.get("title", "Погодный маркет")
     slug = event_data.get("slug", "")
     description = event_data.get("description", "")
@@ -524,7 +445,7 @@ async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: fl
 
 
 # -------------------------------------------------------------
-# БЛОК 1: Приоритетные системные команды и кнопки меню
+# БЛОК 1: Главное меню и команды
 # -------------------------------------------------------------
 
 @router.message(CommandStart(), StateFilter("*"))
@@ -532,14 +453,10 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     welcome_text = (
         "👋 <b>Weather & Alpha Bot активен!</b>\n\n"
-        "🔹 <b>Анализ погоды:</b>\n"
-        "• Отправь 4-значный ICAO-код (например, <code>KJFK</code> или <code>UHHH</code>)\n"
-        "• Или отправь координаты (например: <code>48.52, 135.18</code>)\n"
-        "• Или нажми <b>«🌍 Избранные города»</b>\n\n"
-        "🔹 <b>Сканер маркетов:</b>\n"
-        "• Нажми <b>«🔍 Сканировать маркет»</b>, отправь ссылку и баланс.\n\n"
-        "🔹 <b>Управление радаром:</b>\n"
-        "• Нажми <b>«⚙️ Радар аномалий»</b> для выбора отслеживаемых городов."
+        "🔹 <b>Анализ погоды:</b> Отправь ICAO-код (например, <code>KJFK</code>) или координаты.\n"
+        "🔹 <b>Сканер маркетов:</b> Нажми <b>«🔍 Сканировать маркет»</b>.\n"
+        "🔹 <b>Контроль сделок:</b> Нажми <b>«📌 Мои позиции»</b> для отслеживания открытых сделок.\n"
+        "🔹 <b>Радар аномалий:</b> Нажми <b>«⚙️ Радар аномалий»</b> для выбора городов."
     )
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=main_keyboard)
 
@@ -550,15 +467,168 @@ async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
     help_text = (
         "📖 <b>Справка по работе с ботом:</b>\n\n"
-        "1. <b>Сканирование стаканов:</b>\n"
-        "   Нажми <b>«🔍 Сканировать маркет»</b>, отправь ссылку, а затем укажи баланс.\n\n"
-        "2. <b>Радар аномалий:</b>\n"
-        "   Нажми <b>«⚙️ Радар аномалий»</b> и переключай города тумблерами ВКЛ/ВЫКЛ.\n\n"
-        "3. <b>Метеосводки по коду или координатам:</b>\n"
-        "   Введи 4-буквенный ICAO-код или отправь координаты (например: <code>55.75, 37.61</code>)."
+        "1. <b>«🔍 Сканировать маркет»:</b> Полный разбор стакана и метеопакета.\n"
+        "2. <b>«📌 Мои позиции»:</b> Добавь купленные исходы (например, 23, 24), и бот будет предупреждать о фронтах, разворотах ветра и окнах прогрева.\n"
+        "3. <b>«⚙️ Радар аномалий»:</b> Управление фоновым слежением за городами."
     )
     await message.answer(help_text, parse_mode="HTML", reply_markup=main_keyboard)
 
+
+# -------------------------------------------------------------
+# БЛОК 2: Меню «📌 Мои позиции» (Управление сделками)
+# -------------------------------------------------------------
+
+@router.message(F.text == "📌 Мои позиции", StateFilter("*"))
+@router.message(Command("positions"), StateFilter("*"))
+async def cmd_my_positions(message: Message, state: FSMContext):
+    await state.clear()
+    positions = get_user_positions(message.from_user.id)
+
+    if not positions:
+        text = (
+            "📌 <b>У тебя пока нет активных сделок на контроле.</b>\n\n"
+            "Нажми <b>«➕ Добавить сделку»</b>, чтобы радар персонально следил за твоей позицией "
+            "(контролировал сломы погоды, морской бриз, окно солнца и максимумы)!"
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_new_pos")]]
+        )
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    text_lines = ["📌 <b>Твои активные сделки под защитой радара:</b>\n"]
+    buttons = []
+
+    for pos in positions:
+        city_label = ALL_RADAR_CITIES.get(pos["icao"], pos["icao"])
+        text_lines.append(
+            f"• <b>{city_label}</b> | Исходы: <code>{pos['outcomes']}</code> | Дата: <code>{pos['target_date']}</code>"
+        )
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"❌ Закрыть: {pos['icao']} ({pos['outcomes']})",
+                callback_data=f"del_pos:{pos['id']}"
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text="➕ Добавить еще сделку", callback_data="add_new_pos")])
+
+    await message.answer(
+        "\n".join(text_lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.callback_query(F.data == "add_new_pos")
+async def process_add_pos_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AddPositionStates.waiting_for_city)
+    await callback.message.edit_text(
+        "🌍 <b>Шаг 1 из 2: Выбери город твоей открытой сделки:</b>",
+        parse_mode="HTML",
+        reply_markup=position_city_keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("pos_city:"))
+async def process_pos_city_selected(callback: CallbackQuery, state: FSMContext):
+    icao_code = callback.data.split(":")[1]
+    
+    # Автоматически определяем целевую дату по часовому поясу аэропорта
+    airport_data = resolve_airport(icao_code) or {}
+    tz_name = airport_data.get("timezone", "UTC")
+    try:
+        local_date = datetime.now(zoneinfo.ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+    except Exception:
+        local_date = datetime.now().strftime("%Y-%m-%d")
+
+    await state.update_data(pos_icao=icao_code, pos_date=local_date)
+    await state.set_state(AddPositionStates.waiting_for_outcomes)
+
+    city_name = ALL_RADAR_CITIES.get(icao_code, icao_code)
+    await callback.message.edit_text(
+        f"🎯 <b>Шаг 2 из 2: Локация {city_name}</b>\n\n"
+        "Напиши сообщением купленные исходы (например: <code>23, 24</code> или <code>80-81F</code>):",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AddPositionStates.waiting_for_outcomes, F.text)
+async def process_pos_outcomes_input(message: Message, state: FSMContext):
+    outcomes_text = message.text.strip()
+    data = await state.get_data()
+    icao = data.get("pos_icao", "EGLC")
+    target_date = data.get("pos_date", datetime.now().strftime("%Y-%m-%d"))
+
+    # Добавляем в базу данных SQLite
+    add_position(
+        user_id=message.from_user.id,
+        icao=icao,
+        outcomes=outcomes_text,
+        target_date=target_date
+    )
+
+    # Автоматически добавляем город в активный радар
+    active_radar_cities.add(icao)
+
+    await state.clear()
+    city_name = ALL_RADAR_CITIES.get(icao, icao)
+    
+    success_text = (
+        f"✅ <b>Позиция успешно взята под радарный контроль!</b>\n\n"
+        f"📍 <b>Город:</b> {city_name}\n"
+        f"🎯 <b>Купленные исходы:</b> <code>{outcomes_text}</code>\n"
+        f"📅 <b>Целевая дата:</b> <code>{target_date}</code>\n\n"
+        f"🛡️ <i>Радар каждые 15 минут будет проверять Front Crash, смену ветра и таймер инсоляции. "
+        f"При угрозе позиции ты мгновенно получишь уведомление!</i>"
+    )
+    await message.answer(success_text, parse_mode="HTML", reply_markup=main_keyboard)
+
+
+@router.callback_query(F.data.startswith("del_pos:"))
+async def process_del_pos_callback(callback: CallbackQuery):
+    pos_id = int(callback.data.split(":")[1])
+    delete_position(pos_id, callback.from_user.id)
+    await callback.answer("✅ Сделка закрыта и снята с контроля.")
+    
+    # Обновляем список
+    positions = get_user_positions(callback.from_user.id)
+    if not positions:
+        await callback.message.edit_text(
+            "📌 <b>Все сделки закрыты. Активных позиций на радаре нет.</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_new_pos")]]
+            )
+        )
+        return
+
+    buttons = []
+    text_lines = ["📌 <b>Твои активные сделки под защитой радара:</b>\n"]
+    for pos in positions:
+        city_label = ALL_RADAR_CITIES.get(pos["icao"], pos["icao"])
+        text_lines.append(
+            f"• <b>{city_label}</b> | Исходы: <code>{pos['outcomes']}</code> | Дата: <code>{pos['target_date']}</code>"
+        )
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"❌ Закрыть: {pos['icao']} ({pos['outcomes']})",
+                callback_data=f"del_pos:{pos['id']}"
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text="➕ Добавить еще сделку", callback_data="add_new_pos")])
+
+    await callback.message.edit_text(
+        "\n".join(text_lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+# -------------------------------------------------------------
+# БЛОК 3: Инлайн-колбэки (Сканер, Города, Тумблеры)
+# -------------------------------------------------------------
 
 @router.message(F.text == "⚙️ Радар аномалий", StateFilter("*"))
 @router.message(Command("radar"), StateFilter("*"))
@@ -626,10 +696,6 @@ async def cmd_scan_market(message: Message, state: FSMContext):
     )
 
 
-# -------------------------------------------------------------
-# БЛОК 2: Инлайн-колбэки (Кнопки городов, Радара и Баланса)
-# -------------------------------------------------------------
-
 @router.callback_query(F.data.startswith("set_bal:"))
 async def process_quick_balance(callback: CallbackQuery, state: FSMContext):
     balance_val = float(callback.data.split(":")[1])
@@ -675,7 +741,7 @@ async def process_toggle_radar(callback: CallbackQuery):
 
 
 # -------------------------------------------------------------
-# БЛОК 3: Обработка FSM: 1) Ссылка -> 2) Ручной ввод Баланса
+# БЛОК 4: Обработка ссылок и текста (FSM + ICAO)
 # -------------------------------------------------------------
 
 @router.message(MarketScanStates.waiting_for_link, F.text)
@@ -733,9 +799,98 @@ async def process_manual_balance_input(message: Message, state: FSMContext):
         await message.answer("⚠️ Сессия истекла. Нажми <b>«🔍 Сканировать маркет»</b> заново.", parse_mode="HTML")
 
 
-# -------------------------------------------------------------
-# БЛОК 4: Обработка ICAO-кодов и Координат (Ввод текста)
-# -------------------------------------------------------------
+async def _execute_coordinates_pipeline(lat: float, lon: float, target_message: Message):
+    status_msg = await target_message.answer(
+        f"🧭 <i>Определяю часовой пояс и собираю метеомодели для [{lat:.4f}, {lon:.4f}]...</i>",
+        parse_mode="HTML",
+    )
+
+    try:
+        tz_name = await asyncio.to_thread(tf.timezone_at, lng=lon, lat=lat) or "UTC"
+        local_tz = zoneinfo.ZoneInfo(tz_name)
+        target_date_local = datetime.now(local_tz).strftime("%Y-%m-%d")
+
+        custom_location_data = {
+            "icao": "GEO",
+            "name": f"Координаты [{lat:.4f}, {lon:.4f}]",
+            "city": f"Точка {lat:.3f}, {lon:.3f}",
+            "country": "GEO",
+            "latitude": lat,
+            "longitude": lon,
+            "timezone": tz_name,
+        }
+
+        raw_forecast_payload = await asyncio.to_thread(
+            fetch_openmeteo_forecast, lat, lon, tz_name, target_date_local
+        )
+
+        if not isinstance(raw_forecast_payload, dict):
+            raw_forecast_payload = {}
+
+        synth_result = (
+            await asyncio.to_thread(synthesize_forecast, raw_forecast_payload)
+            if raw_forecast_payload
+            else {"success": False, "error": "Нет данных"}
+        )
+
+        noaa_payload = {
+            "metar": {
+                "available": True,
+                "raw": f"GEO {lat:.4f}/{lon:.4f} (Анализ по сетке численных моделей)",
+                "temp_c": None,
+                "dewpoint_c": None,
+                "wind_speed_kts": None,
+            },
+            "taf": {"available": False, "raw": "TAF доступен только для официальных станций ICAO"},
+        }
+
+        summary_text = build_summary_caption(
+            custom_location_data, synth_result, noaa_payload, target_date_local
+        )
+
+        package_dict = build_raw_data_package_dict(
+            custom_location_data, raw_forecast_payload, synth_result, noaa_payload
+        )
+
+        json_bytes = json.dumps(package_dict, ensure_ascii=False, indent=2).encode("utf-8")
+        clean_filename = f"weather_package_coords_{abs(lat):.2f}_{abs(lon):.2f}_{target_date_local}.json"
+        document_file = BufferedInputFile(file=json_bytes, filename=clean_filename)
+
+        await status_msg.delete()
+        await target_message.answer(summary_text, parse_mode="HTML")
+        await target_message.answer_document(
+            document=document_file,
+            caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{clean_filename}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при обработке координат: {e}", exc_info=True)
+        await status_msg.edit_text("❌ <b>Произошла ошибка при обработке координат.</b>", parse_mode="HTML")
+
+
+async def _execute_weather_pipeline(user_query: str, target_message: Message):
+    status_msg = await target_message.answer(
+        f"🔍 <i>Сбор данных и генерация RAW Data Package для {user_query}...</i>",
+        parse_mode="HTML",
+    )
+
+    try:
+        success, summary_text, document_file, err_msg = await _collect_weather_data(user_query)
+        if not success:
+            await status_msg.edit_text(err_msg, parse_mode="HTML")
+            return
+
+        await status_msg.delete()
+        await target_message.answer(summary_text, parse_mode="HTML")
+        await target_message.answer_document(
+            document=document_file,
+            caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{document_file.filename}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при обработке запроса: {e}", exc_info=True)
+        await status_msg.edit_text("❌ <b>Произошла ошибка при обработке запроса.</b>", parse_mode="HTML")
+
 
 @router.message(F.text)
 async def process_weather_request(message: Message):
@@ -756,6 +911,7 @@ async def process_weather_request(message: Message):
         "⚠️ <b>Формат не распознан.</b>\n\n"
         "• Отправь <b>4-значный ICAO-код</b> (например: <code>KJFK</code> или <code>UHHH</code>)\n"
         "• Отправь <b>координаты</b> (например: <code>48.52, 135.18</code>)\n"
+        "• Нажми <b>«📌 Мои позиции»</b> для контроля сделок\n"
         "• Или нажми <b>«🔍 Сканировать маркет»</b> для анализа ссылки.",
         parse_mode="HTML",
     )
