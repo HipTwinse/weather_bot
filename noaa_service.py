@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 
 NOAA_METAR_URL = "https://aviationweather.gov/api/data/metar"
 NOAA_TAF_URL = "https://aviationweather.gov/api/data/taf"
-REQUEST_TIMEOUT = 3.5  # Быстрый таймаут для мгновенной отдачи в Telegram
-MAX_RETRIES = 1        # Всего 1 повтор, чтобы бот не висел
-RETRY_DELAY = 0.5      # Минимальная пауза между попытками
+REQUEST_TIMEOUT = 10  # Жесткий таймаут на один запрос
+MAX_RETRIES = 2       # Количество повторных попыток при сбоях (всего 3 попытки)
+RETRY_DELAY = 1.0     # Пауза в секундах между попытками
 
 
 def _format_utc_timestamp(timestamp_val: Optional[Any]) -> Optional[str]:
@@ -31,7 +31,7 @@ def _format_utc_timestamp(timestamp_val: Optional[Any]) -> Optional[str]:
 
 def _fetch_with_retry(url: str) -> tuple[Optional[requests.Response], Optional[str]]:
     """
-    Вспомогательная функция выполняет HTTP GET запрос с быстрой retry-механикой
+    Вспомогательная функция выполняет HTTP GET запрос с retry-механикой
     для временных Timeout и HTTP 5xx ошибок.
     """
     last_error = None
@@ -49,7 +49,7 @@ def _fetch_with_retry(url: str) -> tuple[Optional[requests.Response], Optional[s
             return response, None
 
         except requests.exceptions.Timeout:
-            last_error = f"NOAA Request Timeout ({REQUEST_TIMEOUT}s limit exceeded)"
+            last_error = "NOAA Request Timeout (10s limit exceeded)"
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
                 continue
@@ -62,7 +62,7 @@ def _fetch_with_retry(url: str) -> tuple[Optional[requests.Response], Optional[s
 def get_metar(icao_code: str) -> Dict[str, Any]:
     """
     Запрашивает METAR данные с сервера NOAA для указанного ICAO кода.
-    Использует оптимизированную retry-механику при сбоях.
+    Использует retry-механику при сбоях.
     """
     url = f"{NOAA_METAR_URL}?ids={icao_code}&format=json"
     response, error = _fetch_with_retry(url)
@@ -91,6 +91,7 @@ def get_metar(icao_code: str) -> Dict[str, Any]:
             "wind_speed_kts": None
         }
 
+    # HTTP 204 означает, что сервер штатно обработал запрос, но данных по ICAO нет
     if response.status_code == 204:
         return {
             "available": False,
@@ -115,11 +116,7 @@ def get_metar(icao_code: str) -> Dict[str, Any]:
             "wind_speed_kts": None
         }
 
-    try:
-        data = response.json()
-    except Exception:
-        data = None
-
+    data = response.json()
     if not data or not isinstance(data, list):
         return {
             "available": False,
@@ -133,6 +130,8 @@ def get_metar(icao_code: str) -> Dict[str, Any]:
         }
 
     metar_item = data[0]
+    
+    # Приоритет: obsTime (точный момент наблюдения) -> reportTime (fallback)
     obs_time_raw = metar_item.get("obsTime") or metar_item.get("reportTime")
     obs_time_utc = _format_utc_timestamp(obs_time_raw)
 
@@ -151,6 +150,7 @@ def get_metar(icao_code: str) -> Dict[str, Any]:
 def get_taf(icao_code: str) -> Dict[str, Any]:
     """
     Запрашивает RAW TAF и базовые временные метки с сервера NOAA.
+    Использует retry-механику при сбоях.
     """
     url = f"{NOAA_TAF_URL}?ids={icao_code}&format=json"
     response, error = _fetch_with_retry(url)
@@ -175,6 +175,7 @@ def get_taf(icao_code: str) -> Dict[str, Any]:
             "valid_to_utc": None
         }
 
+    # HTTP 204 означает, что TAF для данного ICAO отсутствует
     if response.status_code == 204:
         return {
             "available": False,
@@ -195,11 +196,7 @@ def get_taf(icao_code: str) -> Dict[str, Any]:
             "valid_to_utc": None
         }
 
-    try:
-        data = response.json()
-    except Exception:
-        data = None
-
+    data = response.json()
     if not data or not isinstance(data, list):
         return {
             "available": False,
@@ -236,7 +233,7 @@ if __name__ == "__main__":
     import json
     
     test_codes = ["KJFK", "UHHH", "XXXX"]
-    print("=== ЗАПУСК ТЕСТОВ NOAA SERVICE (БЫСТРЫЙ ТАЙМАУТ) ===\n")
+    print("=== ЗАПУСК ТЕСТОВ NOAA SERVICE (С RETRY) ===\n")
     
     for code in test_codes:
         result = get_noaa_package(code)
