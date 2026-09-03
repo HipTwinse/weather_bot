@@ -44,6 +44,9 @@ previous_wind_dirs: Dict[str, int] = {}
 # Память дневного максимума: ключ 'ICAO_YYYY-MM-DD' -> max_temp_float
 daily_max_records: Dict[str, float] = {}
 
+# Контроль частоты опроса моделей радаром для защиты лимитов API
+last_model_scan_time: Dict[str, float] = {}
+
 
 async def setup_bot_commands(bot: Bot) -> None:
     commands = [
@@ -172,7 +175,6 @@ async def check_multi_model_mispricing(bot: Bot, icao: str, admin_id: Optional[i
 
         price_cents = round(yes_price * 100, 1)
 
-        # Проверяем, какая из моделей попадает в этот исход (с допуском +- 0.6°C)
         matching_models = [
             f"{m_name.upper()} ({m_peak}°C)"
             for m_name, m_peak in model_peaks.items()
@@ -233,12 +235,16 @@ async def check_multi_model_mispricing(bot: Bot, icao: str, admin_id: Optional[i
 
 
 async def background_radar_worker(bot: Bot) -> None:
+    """
+    Фоновый радар с защитой лимитов:
+    - METAR проверяется каждые 15 минут (легкий запрос к NOAA).
+    - Тяжелые численные модели Open-Meteo опрашиваются не чаще одного раза в 2 часа на город.
+    """
     logger.info("📡 Фоновый Радар Аномалий и Страж Позиций запущен.")
     admin_id = getattr(config, "ADMIN_CHAT_ID", None)
 
     while True:
         try:
-            # Опрос каждые 15 минут
             await asyncio.sleep(900)
 
             current_timestamp = asyncio.get_event_loop().time()
@@ -252,10 +258,13 @@ async def background_radar_worker(bot: Bot) -> None:
                 continue
 
             for icao in list(target_icaos):
-                # 1. Запуск сканера копеечных и недооцененных аномалий (Penny + Value)
-                await check_multi_model_mispricing(bot, icao, admin_id)
+                # 1. Защита лимитов: тяжелый опрос моделей Open-Meteo запускается раз в 2 часа (7200 с)
+                last_scan = last_model_scan_time.get(icao, 0.0)
+                if current_timestamp - last_scan >= 7200:
+                    last_model_scan_time[icao] = current_timestamp
+                    await check_multi_model_mispricing(bot, icao, admin_id)
 
-                # 2. Метеоконтроль через METAR
+                # 2. Метеоконтроль через легкий METAR (NOAA) каждые 15 минут
                 noaa_data = await asyncio.to_thread(get_noaa_package, icao)
                 metar = noaa_data.get("metar", {})
 

@@ -107,6 +107,12 @@ MODEL_CONFIGS = {
     }
 }
 
+# Заголовок для предотвращения сброса соединения со стороны Cloudflare WAF
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json"
+}
+
 
 def _parse_retry_after(retry_after_header: str | None) -> float | None:
     """
@@ -155,7 +161,7 @@ def _http_get_with_retry(url: str, params: dict, retries: int = 3, timeout: int 
 
     for attempt in range(retries + 1):
         try:
-            response = requests.get(url, params=params, timeout=timeout)
+            response = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=timeout)
             
             # Успешный ответ
             if response.status_code == 200:
