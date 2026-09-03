@@ -1,6 +1,7 @@
 """
 Модуль сбора, валидации и агрегации метеоданных (Phase 3 Engine).
-Оптимизирован для высокоскоростного параллельного опроса моделей (ThreadPoolExecutor).
+Оптимизирован для высокоскоростного параллельного опроса моделей (ThreadPoolExecutor)
+с надежными таймаутами для исключения сбоев 'available: false'.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -119,14 +120,15 @@ def _parse_retry_after(retry_after_header: Optional[str]) -> Optional[float]:
         return None
 
 
-def _http_get_with_retry(url: str, params: dict, retries: int = 1, timeout: int = 4) -> Optional[requests.Response]:
-    """Быстрый сетевой запрос с коротким таймаутом без длительного зависания."""
+def _http_get_with_retry(url: str, params: dict, retries: int = 2, timeout: int = 8) -> Optional[requests.Response]:
+    """Сетевой запрос с достаточным таймаутом (8s) и User-Agent."""
+    headers = {"User-Agent": "WeatherAlphaBot/6.1 (Automated Market Analysis)"}
     retryable_statuses = {500, 502, 503, 504}
     backoff_delay = 0.5
 
     for attempt in range(retries + 1):
         try:
-            response = requests.get(url, params=params, timeout=timeout)
+            response = requests.get(url, params=params, headers=headers, timeout=timeout)
             if response.status_code == 200:
                 return response
 
@@ -246,7 +248,8 @@ def _fetch_single_model(model_key: str, cfg: dict, url: str, base_params: dict, 
     params = base_params.copy()
     params["models"] = cfg["api_param"]
     
-    resp = _http_get_with_retry(url, params=params, retries=1, timeout=4)
+    # 8 секунд таймаута и 2 ретрая предотвращают сбои при медленном ответе Open-Meteo
+    resp = _http_get_with_retry(url, params=params, retries=2, timeout=8)
     
     status_info = {
         "available": False,
@@ -308,9 +311,7 @@ def fetch_openmeteo_forecast(
     iana_timezone: str,
     target_date_local: str
 ) -> dict:
-    """
-    Параллельный опрос всех 4 моделей за 1 секунду вместо последовательного ожидания.
-    """
+    """Параллельный опрос всех 4 моделей через ThreadPoolExecutor."""
     retrieved_at_utc = datetime.now(timezone.utc).isoformat()
     expected_hours = _get_expected_local_hours(iana_timezone, target_date_local)
     
