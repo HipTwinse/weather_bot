@@ -2,22 +2,30 @@
 Модуль единого автоматического сканера метеоданных и динамики рынков (Auto Scanner v7.1).
 
 Регламент работы:
-1. Тайм-фильтр: Активен строго с 10:00 до 00:00 по времени Хабаровска (UTC+10).
-   В ночные часы переходит в спящий режим для экономии квот.
-2. Единый дайджест (раз в 30 минут):
+1. Синхронизация с METAR (строго 2 раза в час):
+   Европейские станции выпускают сводки в :00 и :30 (в NOAA поступают к :02 и :32).
+   Дайджест отправляется строго в :02 и :32 минуты каждого часа (ХБР / UTC).
+   Никакого спама при перезапусках: сон точно рассчитывается до ближайшей точки :02 или :32.
+2. Тайм-фильтр:
+   Активен строго с 10:00 до 00:00 по времени Хабаровска (UTC+10).
+   В ночные часы (00:00–10:00 ХБР) сканер спит до 10:02.
+3. Устранение ложного СКИПа из-за ночного выхолаживания:
+   - Если местное время станции LT < 09:00: расчет темпа и триггер физического слома
+     НЕ переводят рынок в СКИП. Фиксируется только утренняя база (Morning Floor),
+     а статус рынка стабилен: 🟡 ПОТЕНЦИАЛ ВХОДА (Ожидание старта инсоляции).
+   - Триггер физического слома прогрева (темп < +0.4°C/ч при BKN/OVC) активируется
+     СТРОГО в окне активной дневной инсоляции: с 10:30 LT до 15:00 LT.
+4. Единый дайджест:
    Все 4 города (Лондон, Париж, Милан, Мадрид) объединяются в ОДИН пост.
-   - Первое сообщение дня (10:00 ХБР): «🌅 НОВЫЙ ТОРГОВЫЙ ДЕНЬ | БАЗОВЫЙ ПРОГНОЗ ([ДАТА])».
-   - Последующие (каждые 30 мин): «🔄 ОБНОВЛЕНИЕ НА HH:MM ХБР | ДИНАМИКА».
-3. Персонализация позиций (positions.db):
-   При наличии открытой сделки (status = 'OPEN') блок города дополняется PnL,
-   триггерами Тейк-Профита (>= +35% или >= 60¢), Тайм-Стопа (13:30 LT) и физического слома.
-   При отсутствии позиции: статус 🟡 ПОТЕНЦИАЛ ВХОДА или ⛔ ВНЕ РЫНКА (СКИП).
-   Слово «CASHOUT» без открытой сделки не используется!
-4. Под каждым сообщением прикреплены инлайн-кнопки экспресс-анализа 4 городов в 2 ряда.
+   - Первое сообщение дня (10:02 ХБР): «🌅 НОВЫЙ ТОРГОВЫЙ ДЕНЬ | БАЗОВЫЙ ПРОГНОЗ ([ДАТА])».
+   - Последующие (каждые :02 и :32): «🔄 ОБНОВЛЕНИЕ НА HH:MM ХБР | ДИНАМИКА».
+5. Персонализация позиций (positions.db):
+   При наличии открытой сделки блок города дополняется PnL, триггерами Тейк-Профита (>= +35% / >= 60¢),
+   Тайм-Стопа (13:30 LT) и дневного физического слома. Без сделки слово «CASHOUT» не используется.
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,6 +55,7 @@ TARGET_CITIES = {
 # Хранилище утренней базы прогрева: icao -> {"date": "YYYY-MM-DD", "temp": float, "timestamp": float}
 _MORNING_BASELINES: Dict[str, dict] = {}
 _LAST_MORNING_DIGEST_DATE: Optional[str] = None
+_LAST_SENT_SLOT: Optional[str] = None
 
 # Инлайн-кнопки быстрого анализа под сводным сообщением
 express_scan_keyboard = InlineKeyboardMarkup(
@@ -69,6 +78,33 @@ def is_khv_active_hours() -> bool:
     return 10 <= now_khv.hour < 24
 
 
+def get_next_sleep_seconds(now: datetime) -> Tuple[float, datetime, str]:
+    """
+    Рассчитывает целевое время следующей контрольной точки (:02 или :32)
+    и точное количество секунд сна до неё.
+    С буфером в 2 секунды (:02:02 / :32:02) для гарантированного попадания в NOAA METAR.
+    """
+    if now.minute < 2 or (now.minute == 2 and now.second < 2):
+        target = now.replace(minute=2, second=2, microsecond=0)
+    elif now.minute < 32 or (now.minute == 32 and now.second < 2):
+        target = now.replace(minute=32, second=2, microsecond=0)
+    else:
+        next_hour = now + timedelta(hours=1)
+        target = next_hour.replace(minute=2, second=2, microsecond=0)
+
+    sleep_secs = (target - now).total_seconds()
+    if sleep_secs <= 0.1:
+        if now.minute < 32:
+            target = now.replace(minute=32, second=2, microsecond=0)
+        else:
+            next_hour = now + timedelta(hours=1)
+            target = next_hour.replace(minute=2, second=2, microsecond=0)
+        sleep_secs = max(1.0, (target - now).total_seconds())
+
+    slot_key = target.strftime("%Y-%m-%d %H:%M")
+    return sleep_secs, target, slot_key
+
+
 def _calculate_dynamics(
     icao: str,
     current_temp: Optional[float],
@@ -77,6 +113,8 @@ def _calculate_dynamics(
 ) -> Tuple[str, str, float]:
     """
     Рассчитывает темп прогрева (°C/час), остаток инсоляции и числовой темп.
+    До 09:00 местного времени фиксируется только утренний пол (выхолаживание),
+    а числовой темп блокируется от ложных отрицательных скачков.
     """
     if current_temp is None:
         return "Н/Д", "Н/Д", 0.0
@@ -91,16 +129,26 @@ def _calculate_dynamics(
             "timestamp": current_ts,
         }
         baseline = _MORNING_BASELINES[icao]
+    elif local_dt.hour < 9:
+        # До 09:00 LT идет предрассветное выхолаживание: фиксируем минимальный утренний пол
+        if current_temp < baseline["temp"]:
+            baseline["temp"] = current_temp
+            baseline["timestamp"] = current_ts
 
-    time_diff_hours = (current_ts - baseline["timestamp"]) / 3600.0
-    temp_diff = current_temp - baseline["temp"]
-
-    if time_diff_hours >= 0.4:
-        rate_val = round(temp_diff / time_diff_hours, 2)
-        rate_str = f"{'+' if rate_val >= 0 else ''}{rate_val:.1f}°C/ч"
-    else:
+    # До 09:00 LT солнце еще не прогревает станцию, темп не считается за слом
+    if local_dt.hour < 9:
         rate_val = 0.0
-        rate_str = "База зафиксирована"
+        rate_str = "Утренний пол (выхолаживание)"
+    else:
+        time_diff_hours = (current_ts - baseline["timestamp"]) / 3600.0
+        temp_diff = current_temp - baseline["temp"]
+
+        if time_diff_hours >= 0.4:
+            rate_val = round(temp_diff / time_diff_hours, 2)
+            rate_str = f"{'+' if rate_val >= 0 else ''}{rate_val:.1f}°C/ч"
+        else:
+            rate_val = 0.0
+            rate_str = "База зафиксирована"
 
     local_hour = local_dt.hour + local_dt.minute / 60.0
     sunset_close = 17.0
@@ -214,7 +262,7 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
 
 
 def build_morning_city_block(city_data: Dict[str, Any]) -> str:
-    """Формирует блок города для утреннего базового прогноза (10:00 ХБР)."""
+    """Формирует блок города для утреннего базового прогноза (10:02 ХБР)."""
     icao = city_data["icao"]
     city_name = city_data["city_name"]
     local_dt = city_data["local_dt"]
@@ -246,7 +294,7 @@ def build_morning_city_block(city_data: Dict[str, Any]) -> str:
 
 
 def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[Dict[str, Any]]) -> str:
-    """Формирует блок города для 30-минутного обновления динамики."""
+    """Формирует блок города для регулярного обновления динамики (:02 и :32)."""
     icao = city_data["icao"]
     city_name = city_data["city_name"]
     local_dt = city_data["local_dt"]
@@ -261,6 +309,7 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
 
     local_hour = local_dt.hour
     local_min = local_dt.minute
+    local_time_val = local_hour + local_min / 60.0
 
     lines = [
         f"📍 <b>{city_name}</b> (<code>{local_dt.strftime('%H:%M')} LT</code> | Инсоляция: <b>{rem_hours}</b>)",
@@ -299,16 +348,19 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
                 f"До экспирации не сидеть! Сбрасывай страйк по лимитке в стакан прямо сейчас!"
             )
         # 2. Триггер Тайм-Стопа (13:30 LT)
-        elif (local_hour > 13 or (local_hour == 13 and local_min >= 30)) and (target_temp and temp_c and temp_c < target_temp):
+        elif (local_time_val >= 13.5) and (target_temp and temp_c and temp_c < target_temp):
             verdict = (
                 f"⏱️ <b>ТАЙМ-СТОП (13:30 LT)</b> — Сброс в рынок для спасения остаточной стоимости! До полудня цель не пробита."
             )
-        # 3. Триггер Физического слома (темп затух < +0.4°C/ч или натекла облачность BKN/OVC)
-        elif (rate_val < 0.4 and local_hour >= 11 and "База" not in rate_str) or any(c in raw_metar for c in ["BKN", "OVC", "RA"]):
+        # 3. Триггер Физического слома: СТРОГО в диапазоне дневной инсоляции (10:30 LT - 15:00 LT)
+        elif 10.5 <= local_time_val <= 15.0 and (rate_val < 0.4 and any(c in raw_metar for c in ["BKN", "OVC", "RA"])):
             verdict = (
-                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — Темп прогрева затух или небо затянуло облачностью!"
+                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — Темп прогрева затух (<+0.4°C/ч) и небо затянуло облачностью!"
             )
-        # 4. Нормальное удержание
+        # 4. Раннее утро (LT < 09:00): ночное выхолаживание не инвалидирует позу
+        elif local_hour < 9:
+            verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННИЙ ПОЛ)</b> — До 09:00 LT идет предрассветное выхолаживание, старт инсоляции впереди."
+        # 5. Нормальное удержание
         else:
             verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> — Темп прогрева в норме, инсоляция работает по плану."
 
@@ -317,12 +369,35 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
     # СЦЕНАРИЙ 2: Позиции нет — оцениваем общий статус рынка
     else:
         is_overcast = any(c in raw_metar for c in ["OVC", "RA", "DZ"])
-        if is_overcast or rem_hours == "Окно закрыто":
-            status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>"
-        elif rate_val >= 0.5 or "База" in rate_str:
-            status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Следи за утренним импульсом)"
+        has_heavy_rain = any(c in raw_metar for c in ["RA", "DZ", "TS", "SN"]) and "OVC" in raw_metar
+
+        # 1. Раннее утро (LT < 09:00): расчет темпа не переводит в СКИП!
+        if local_hour < 9:
+            if has_heavy_rain:
+                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Обложные осадки глушат утреннюю радиацию)"
+            else:
+                status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Ожидание старта инсоляции)"
+
+        # 2. Окно дневной инсоляции закрыто (после 16:30 LT):
+        elif rem_hours == "Окно закрыто" or local_time_val >= 16.5:
+            status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Дневной пик пройден)"
+
+        # 3. Активный дневной диапазон инсоляции (10:30 LT - 15:00 LT):
+        elif 10.5 <= local_time_val <= 15.0:
+            is_cloudy = any(c in raw_metar for c in ["BKN", "OVC", "RA", "DZ"])
+            if rate_val < 0.4 and is_cloudy:
+                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Физический слом: темп < +0.4°C/ч и натекание облачности)"
+            elif rate_val >= 0.5:
+                status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Импульсный дневной прогрев)"
+            else:
+                status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Мониторинг дневной динамики)"
+
+        # 4. Промежуток 09:00 - 10:30 LT (первый разогрев после восхода):
         else:
-            status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>"
+            if has_heavy_rain:
+                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Осадки блокируют утренний прогрев)"
+            else:
+                status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Утренний разгон инсоляции)"
 
         lines.append(f"👉 {status_desc}")
 
@@ -404,46 +479,77 @@ async def send_consolidated_digest(
 
 async def run_auto_scanner(bot: Bot) -> None:
     """
-    Основной бесконечный цикл фонового автосканера.
-    Работает строго с 10:00 до 00:00 по времени Хабаровска (UTC+10).
-    Каждые 30 минут формирует единый консолидированный дайджест.
+    Основной цикл автоматического сканера.
+    Синхронизирован со сводками METAR строго 2 раза в час: ровно в :02 и :32 минуты.
+    Работает в активное торговое окно 10:00 - 00:00 по времени Хабаровска (UTC+10).
     """
-    global _LAST_MORNING_DIGEST_DATE
-    logger.info("🚀 Единый консолидированный автосканер v7.1 запущен (Тайм-фильтр: 10:00–00:00 ХБР).")
+    global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT
+    logger.info("🚀 Единый консолидированный автосканер v7.1 запущен (Расписание METAR: :02 и :32).")
 
     while True:
         try:
             now_khv = datetime.now(KHV_TZ)
+
+            # 1. Проверяем ночное окно Хабаровска (вне 10:00 - 00:00 ХБР)
             if not is_khv_active_hours():
-                now_khv_str = now_khv.strftime("%H:%M")
-                logger.info(f"🌙 Ночное окно Хабаровска ({now_khv_str} ХБР). Сканер спит до 10:00.")
-                await asyncio.sleep(900)
+                # Рассчитываем точное время сна до 10:02 ХБР
+                if now_khv.hour < 10:
+                    wake_target = now_khv.replace(hour=10, minute=2, second=2, microsecond=0)
+                else:
+                    wake_target = (now_khv + timedelta(days=1)).replace(hour=10, minute=2, second=2, microsecond=0)
+                sleep_night = max(10.0, (wake_target - now_khv).total_seconds())
+                logger.info(
+                    f"🌙 Ночное окно Хабаровска ({now_khv.strftime('%H:%M')} ХБР). "
+                    f"Сканер спит до 10:02 ХБР ({int(sleep_night // 3600)}ч {int((sleep_night % 3600) // 60)}м)."
+                )
+                await asyncio.sleep(sleep_night)
                 continue
 
-            today_khv_str = now_khv.strftime("%Y-%m-%d")
-            is_morning_base = False
+            # 2. Проверяем, находимся ли мы прямо сейчас в контрольной минуте (:02 или :32)
+            current_checkpoint_slot: Optional[str] = None
+            if now_khv.minute in (2, 3):
+                current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:02"
+            elif now_khv.minute in (32, 33):
+                current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:32"
 
-            # Проверяем, нужно ли отправить утренний базовый прогноз
-            if now_khv.hour == 10 and _LAST_MORNING_DIGEST_DATE != today_khv_str:
-                is_morning_base = True
-                _LAST_MORNING_DIGEST_DATE = today_khv_str
-                logger.info("🌅 Формирование утреннего базового прогноза (10:00 ХБР)...")
-            else:
-                logger.info(f"🔄 Сбор 30-минутного обновления динамики ({now_khv.strftime('%H:%M')} ХБР)...")
+            # 3. Если мы в контрольной точке И дайджест для этого слота еще не отправлялся — отправляем!
+            if current_checkpoint_slot and current_checkpoint_slot != _LAST_SENT_SLOT:
+                today_khv_str = now_khv.strftime("%Y-%m-%d")
 
-            # Параллельный сбор метрик по всем 4 ключевым городам
-            metrics_tasks = [collect_city_metrics(icao) for icao in TARGET_CITIES.keys()]
-            cities_metrics = await asyncio.gather(*metrics_tasks, return_exceptions=False)
+                # Утренний базовый пост отправляется на первом слоте 10:00 ХБР
+                is_morning_base = False
+                if now_khv.hour == 10 and _LAST_MORNING_DIGEST_DATE != today_khv_str:
+                    is_morning_base = True
+                    _LAST_MORNING_DIGEST_DATE = today_khv_str
+                    logger.info("🌅 Формирование утреннего базового прогноза (10:02 ХБР)...")
+                else:
+                    logger.info(f"🔄 Сбор планового METAR-обновления ({current_checkpoint_slot} ХБР)...")
 
-            # Отправка единого поста
-            await send_consolidated_digest(bot, cities_metrics, is_morning_base, now_khv)
+                # Параллельный сбор метрик по всем 4 городам
+                metrics_tasks = [collect_city_metrics(icao) for icao in TARGET_CITIES.keys()]
+                cities_metrics = await asyncio.gather(*metrics_tasks, return_exceptions=False)
 
-            # Ожидание 30 минут (1800 секунд)
-            await asyncio.sleep(1800)
+                # Отправка дайджеста
+                await send_consolidated_digest(bot, cities_metrics, is_morning_base, now_khv)
+
+                # Защита от повторной отправки в этом же слоте
+                _LAST_SENT_SLOT = current_checkpoint_slot
+                logger.info(f"✅ Дайджест {current_checkpoint_slot} ХБР успешно разослан.")
+
+            # 4. Расчет точного сна до СЛЕДУЮЩЕЙ контрольной точки (:02 или :32)
+            now_after = datetime.now(KHV_TZ)
+            sleep_secs, next_target, next_slot_str = get_next_sleep_seconds(now_after)
+
+            logger.info(
+                f"⏳ Следующий плановый дайджест в {next_target.strftime('%H:%M:%S')} ХБР "
+                f"(сон: {int(sleep_secs)} сек / {sleep_secs/60:.1f} мин)."
+            )
+            await asyncio.sleep(sleep_secs)
 
         except asyncio.CancelledError:
             logger.info("🛑 Автосканер остановлен.")
             break
         except Exception as loop_err:
             logger.error(f"⚠️ Сбой в основном цикле автосканера: {loop_err}", exc_info=True)
-            await asyncio.sleep(60)
+            await asyncio.sleep(15)
+
