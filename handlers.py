@@ -407,7 +407,7 @@ async def process_express_scan_callback(callback: CallbackQuery):
                 favorite_candidate = item
                 basket_sum += p_cents
 
-        if basket_sum >= 80.0:
+        if basket_sum >= 80.0 or (favorite_candidate and favorite_candidate["price_cents"] >= 80.0):
             is_overheated = True
     else:
         orderbook_lines.append("⚠️ <i>Активный контракт на Polymarket для этой даты пока не опубликован или закрыт.</i>")
@@ -418,14 +418,14 @@ async def process_express_scan_callback(callback: CallbackQuery):
     if is_rain or is_overheated:
         strategy_block = (
             "⛔ <b>ВЕРДИКТ: СКИП МАРКЕТА</b>\n"
-            "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером или заблокирован дождем, сиди на заборе."
+            "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
         )
     elif favorite_candidate and 25.0 <= favorite_candidate["price_cents"] <= 48.0 and rem_hours >= 3.0:
         strategy_block = (
-            f"🎯 <b>СИГНАЛ: ОДИНОЧНЫЙ ВХОД (SNIPER MOMENTUM)</b>\n"
+            f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b>\n"
             f"• <b>Рекомендуемый исход:</b> <code>{favorite_candidate['title']}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b>)\n"
             f"• <b>Запас инсоляции:</b> {rem_hours:.1f} ч | Приоритет: {priority_model}\n"
-            f"• <b>Тейк-профит:</b> Выход лимиткой при росте на +25%...+40% или достижении 60¢ на дневном импульсе переоценки толпой!"
+            f"• <b>Цель:</b> продажа токена толпе на дневном разгоне (+25%...+40% или 60¢–70¢), а не удержание до ночи!"
         )
     else:
         # Корзинный вход

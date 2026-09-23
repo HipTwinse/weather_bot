@@ -261,6 +261,24 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
     }
 
 
+def _get_priority_target(icao: str, models: Dict[str, float], avg_peak: float) -> Tuple[float, str]:
+    """Определяет приоритетный ориентир температуры по правилам KB v7.1."""
+    if icao in ["EGLC", "LFPB"]:
+        gfs_val = models.get("gfs_global")
+        if gfs_val is not None:
+            return gfs_val, f"GFS ({gfs_val:.1f}°C)"
+        return avg_peak, f"Консенсус ({avg_peak:.1f}°C)"
+    elif icao == "LIMC":
+        icon_val = models.get("icon_global")
+        if icon_val is not None:
+            return icon_val, f"ICON ({icon_val:.1f}°C)"
+        return avg_peak, f"Консенсус ({avg_peak:.1f}°C)"
+    elif icao == "EDDM":
+        return avg_peak + 1.2, f"Альпийский фён ({avg_peak+1.2:.1f}°C)"
+    else:
+        return avg_peak, f"Медиана ({avg_peak:.1f}°C)"
+
+
 def build_morning_city_block(city_data: Dict[str, Any]) -> str:
     """Формирует блок города для утреннего базового прогноза (10:02 ХБР)."""
     icao = city_data["icao"]
@@ -269,17 +287,44 @@ def build_morning_city_block(city_data: Dict[str, Any]) -> str:
     temp_c = city_data["temp_c"]
     models = city_data["models_max"]
     peak_str = city_data["peak_str"]
+    avg_peak = city_data.get("avg_peak", 20.0)
     physics_note = city_data["physics_note"]
     raw_metar = city_data["raw_metar"]
+    orderbook = city_data.get("orderbook", [])
 
     ecmwf_s = f"{models.get('ecmwf_hres', 'Н/Д')}°C"
     gfs_s = f"{models.get('gfs_global', 'Н/Д')}°C"
     icon_s = f"{models.get('icon_global', 'Н/Д')}°C"
     gem_s = f"{models.get('gem_global', 'Н/Д')}°C"
 
+    target_val, priority_name = _get_priority_target(icao, models, avg_peak)
+
+    # Проверка стакана на Sniper Momentum и Анти-Скип
+    favorite_candidate = None
+    is_overheated = False
+    if orderbook:
+        for item in orderbook:
+            t_num = item.get("temp")
+            p_cents = item.get("price_cents", 0.0)
+            if t_num is not None and abs(t_num - target_val) <= 0.6:
+                favorite_candidate = item
+                if p_cents >= 80.0:
+                    is_overheated = True
+
     is_rain = any(s in raw_metar for s in ["RA", "DZ", "TS", "SN"]) and "OVC" in raw_metar
     if is_rain:
         status_line = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> — Обложные осадки глушат дневную радиацию."
+    elif is_overheated:
+        status_line = (
+            "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
+            "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
+        )
+    elif favorite_candidate and 25.0 <= favorite_candidate["price_cents"] <= 48.0:
+        status_line = (
+            f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b>\n"
+            f"• Рекомендуемый исход: <code>{favorite_candidate['title']}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b>)\n"
+            f"• Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи."
+        )
     else:
         status_line = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Ориентир корзины ≤ 75¢, одиночный Sniper 25¢–48¢)."
 
@@ -287,7 +332,7 @@ def build_morning_city_block(city_data: Dict[str, Any]) -> str:
         f"📍 <b>{city_name}</b> (Время: <code>{local_dt.strftime('%H:%M')} LT</code>)\n"
         f"• Факт METAR: <code>{temp_c if temp_c is not None else 'Н/Д'}°C</code>\n"
         f"• Модели: ECMWF: {ecmwf_s} | GFS: {gfs_s} | ICON: {icon_s} | GEM: {gem_s}\n"
-        f"• Ожидаемый пик: <b>{peak_str}</b>\n"
+        f"• Ожидаемый пик: <b>{peak_str}</b> (Опора: {priority_name})\n"
         f"• Драйвер: <i>{physics_note}</i>\n"
         f"{status_line}"
     )
@@ -299,10 +344,12 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
     city_name = city_data["city_name"]
     local_dt = city_data["local_dt"]
     temp_c = city_data["temp_c"]
+    models = city_data.get("models_max", {})
     rate_str = city_data["rate_str"]
     rate_val = city_data["rate_val"]
     rem_hours = city_data["rem_hours_str"]
     peak_str = city_data["peak_str"]
+    avg_peak = city_data.get("avg_peak", 20.0)
     physics_note = city_data["physics_note"]
     raw_metar = city_data["raw_metar"]
     orderbook = city_data["orderbook"]
@@ -344,7 +391,7 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
         # 1. Триггер Тейк-Профита (Take-Profit Alert: PnL >= +35% или цена >= 60¢)
         if (entry_price > 0 and (cur_price - entry_price) / entry_price >= 0.35) or cur_price >= 60.0:
             verdict = (
-                f"🚨 <b>ТЕЙК-ПРОФИТ (ВЫХОДИ ЛИМИТКОЙ)</b> — Импульс закрыт ({pnl_str}). "
+                f"🚨 <b>ТЕЙК-ПРОФИТ (ВЫХОДИ ЛИМИТКОЙ)</b> — Цель импульса закрыта ({pnl_str}). "
                 f"До экспирации не сидеть! Сбрасывай страйк по лимитке в стакан прямо сейчас!"
             )
         # 2. Триггер Тайм-Стопа (13:30 LT)
@@ -371,6 +418,18 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
         is_overcast = any(c in raw_metar for c in ["OVC", "RA", "DZ"])
         has_heavy_rain = any(c in raw_metar for c in ["RA", "DZ", "TS", "SN"]) and "OVC" in raw_metar
 
+        target_val, priority_name = _get_priority_target(icao, models, avg_peak)
+        fav_candidate = None
+        is_overheated = False
+        if orderbook:
+            for item in orderbook:
+                t_num = item.get("temp")
+                p_cents = item.get("price_cents", 0.0)
+                if t_num is not None and abs(t_num - target_val) <= 0.6:
+                    fav_candidate = item
+                    if p_cents >= 80.0:
+                        is_overheated = True
+
         # 1. Раннее утро (LT < 09:00): расчет темпа не переводит в СКИП!
         if local_hour < 9:
             if has_heavy_rain:
@@ -387,6 +446,17 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
             is_cloudy = any(c in raw_metar for c in ["BKN", "OVC", "RA", "DZ"])
             if rate_val < 0.4 and is_cloudy:
                 status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Физический слом: темп < +0.4°C/ч и натекание облачности)"
+            elif is_overheated:
+                status_desc = (
+                    "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
+                    "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
+                )
+            elif fav_candidate and 25.0 <= fav_candidate["price_cents"] <= 48.0:
+                status_desc = (
+                    f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b> "
+                    f"(Вход: <code>{fav_candidate['title']}</code> {fav_candidate['price_cents']:.0f}¢. "
+                    f"Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи)"
+                )
             elif rate_val >= 0.5:
                 status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Импульсный дневной прогрев)"
             else:
@@ -396,6 +466,17 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
         else:
             if has_heavy_rain:
                 status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Осадки блокируют утренний прогрев)"
+            elif is_overheated:
+                status_desc = (
+                    "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
+                    "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
+                )
+            elif fav_candidate and 25.0 <= fav_candidate["price_cents"] <= 48.0:
+                status_desc = (
+                    f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b> "
+                    f"(Вход: <code>{fav_candidate['title']}</code> {fav_candidate['price_cents']:.0f}¢. "
+                    f"Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи)"
+                )
             else:
                 status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Утренний разгон инсоляции)"
 
