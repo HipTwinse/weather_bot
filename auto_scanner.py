@@ -261,9 +261,27 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
     }
 
 
-def _get_priority_target(icao: str, models: Dict[str, float], avg_peak: float) -> Tuple[float, str]:
-    """Определяет приоритетный ориентир температуры по правилам KB v7.1."""
-    if icao in ["EGLC", "LFPB"]:
+def _get_priority_target(icao: str, models: Dict[str, float], avg_peak: float, raw_metar: str = "") -> Tuple[float, str]:
+    """Определяет приоритетный ориентир температуры по правилам KB v7.5."""
+    if icao == "EGLC":
+        # Проверяем направление ветра из raw_metar
+        # ВЕТО НА GFS при восточном ветре (050°–120°): дует холодный эстуарий Темзы
+        wind_match = re.search(r"\b(\d{3})\d{2,3}(?:G\d{2,3})?KT\b", raw_metar)
+        if wind_match:
+            wdir = int(wind_match.group(1))
+            if 50 <= wdir <= 120:
+                icon_val = models.get("icon_global")
+                ecm_val = models.get("ecmwf_hres")
+                if icon_val is not None:
+                    return icon_val, f"ICON ({icon_val:.1f}°C, Барьер Темзы)"
+                elif ecm_val is not None:
+                    return ecm_val, f"ECMWF ({ecm_val:.1f}°C, Барьер Темзы)"
+
+        gfs_val = models.get("gfs_global")
+        if gfs_val is not None:
+            return gfs_val, f"GFS ({gfs_val:.1f}°C)"
+        return avg_peak, f"Консенсус ({avg_peak:.1f}°C)"
+    elif icao == "LFPB":
         gfs_val = models.get("gfs_global")
         if gfs_val is not None:
             return gfs_val, f"GFS ({gfs_val:.1f}°C)"
@@ -297,7 +315,7 @@ def build_morning_city_block(city_data: Dict[str, Any]) -> str:
     icon_s = f"{models.get('icon_global', 'Н/Д')}°C"
     gem_s = f"{models.get('gem_global', 'Н/Д')}°C"
 
-    target_val, priority_name = _get_priority_target(icao, models, avg_peak)
+    target_val, priority_name = _get_priority_target(icao, models, avg_peak, raw_metar)
 
     # Проверка стакана на Sniper Momentum и Анти-Скип
     favorite_candidate = None
@@ -418,7 +436,7 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
         is_overcast = any(c in raw_metar for c in ["OVC", "RA", "DZ"])
         has_heavy_rain = any(c in raw_metar for c in ["RA", "DZ", "TS", "SN"]) and "OVC" in raw_metar
 
-        target_val, priority_name = _get_priority_target(icao, models, avg_peak)
+        target_val, priority_name = _get_priority_target(icao, models, avg_peak, raw_metar)
         fav_candidate = None
         is_overheated = False
         if orderbook:

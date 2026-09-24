@@ -366,7 +366,24 @@ async def process_express_scan_callback(callback: CallbackQuery):
     avg_peak = round(sum(peaks) / len(peaks), 1) if peaks else (temp_c or 20.0)
 
     # Региональный приоритет моделей
-    if icao in ["EGLC", "LFPB"]:
+    if icao == "EGLC":
+        wind_match = re.search(r"\b(\d{3})\d{2,3}(?:G\d{2,3})?KT\b", raw_metar)
+        is_east_wind = False
+        if wind_match:
+            wdir = int(wind_match.group(1))
+            if 50 <= wdir <= 120:
+                is_east_wind = True
+
+        if is_east_wind:
+            # ВЕТО НА GFS: дует с холодного эстуария Темзы, UHI выключен
+            icon_t = models_max.get("icon_global")
+            ecm_t = models_max.get("ecmwf_hres")
+            target_val = icon_t or ecm_t or avg_peak
+            priority_model = f"ICON ({target_val:.1f}°C, Барьер Темзы)"
+        else:
+            priority_model = f"GFS ({models_max.get('gfs_global', 'Н/Д')}°C)"
+            target_val = models_max.get("gfs_global", avg_peak)
+    elif icao == "LFPB":
         priority_model = f"GFS ({models_max.get('gfs_global', 'Н/Д')}°C)"
         target_val = models_max.get("gfs_global", avg_peak)
     elif icao == "LIMC":
