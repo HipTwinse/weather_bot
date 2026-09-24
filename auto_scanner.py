@@ -159,30 +159,46 @@ def _calculate_dynamics(
 
 
 def _get_city_physics_note(icao: str, raw_metar: str, temp_c: Optional[float], local_dt: datetime) -> str:
-    """Возвращает актуальную синоптическую заметку на базе правил KB v7.1."""
+    """Возвращает актуальную синоптическую заметку на базе квант-законов KB v8.0."""
+    wind_match = re.search(r"\b(\d{3})(\d{2,3})(?:G\d{2,3})?KT\b", raw_metar)
+    wdir = int(wind_match.group(1)) if wind_match else None
+    wspd = int(wind_match.group(2)) if wind_match else None
+
+    has_low_cloud = any(c in raw_metar for c in ["OVC0", "BKN0", "OVC01", "BKN01", "OVC02", "BKN02", "OVC03", "BKN03"])
+    has_cirrus = any(c in raw_metar for c in ["CI", "CS", "FEW2", "SCT2", "FEW3", "SCT3", "NCD", "CAVOK", "CLR", "SKC"])
+    has_rain = any(r in raw_metar for r in ["RA", "DZ", "TS", "SN"])
+
+    if has_rain:
+        return "Осадки (дождь/морось): скрытое тепло испарения блокирует подъем температуры."
+
     if icao == "EGLC":
-        is_sw = ("2" in raw_metar[:10] or "SW" in raw_metar) and "KT" in raw_metar
-        match_kt = re.search(r"(\d{2})KT", raw_metar)
-        wind_kt = int(match_kt.group(1)) if match_kt else 0
-        if is_sw and wind_kt >= 28:
-            return "Шквалистый SW (>=28 kt): UHI пробивает Доклендс транзитом (+1.2...+1.6°C к моделям, верхняя планка GFS)."
-        elif is_sw and wind_kt >= 10:
-            return "SW-ветер несет городской остров тепла Доклендса (+0.8...+1.2°C к европейским моделям)."
-        return "Лондон: ориентир на модель GFS при окнах солнца между осадками."
+        if wdir is not None and 50 <= wdir <= 120:
+            return "Восточный ветер (050°-120°): холодный воздух с эстуария Темзы гасит UHI. ВЕТО на GFS! Рулит ICON (MAE 0.34°C)."
+        elif wdir is not None and 190 <= wdir <= 280:
+            if wspd and wspd >= 20:
+                return "Шквалистый SW-ветер (>=20 kt): тепловой шлейф Лондона пробивает полосу транзитом (+1.2°C)."
+            return "SW-ветер несет городской остров тепла центра Лондона (UHI активен, опора на ICON+GFS)."
+        return "Лондон: стабильный радиационный прогрев при прозрачной атмосфере (лидер ICON)."
 
     elif icao == "LFPB":
-        return "Париж: GFS в приоритете для сухого радиационного прогрева Иль-де-Франс."
+        calm_str = " (Штиль <=4 kt: ламинарный перегрев +0.6°C)" if (wspd and wspd <= 4) else ""
+        if has_cirrus and not has_low_cloud:
+            return f"Париж: перистые облака Cirrus не блокируют солнечную радиацию (пропускание >85%). Лидер ICON.{calm_str}"
+        return f"Париж: приоритет ICON (MAE 0.40°C). Холодный дефект ECMWF (-1.04°C) игнорируется.{calm_str}"
 
     elif icao == "LIMC":
-        utc_hour = local_dt.astimezone(zoneinfo.ZoneInfo("UTC")).hour
-        if 4 <= utc_hour <= 6 and temp_c is not None and temp_c >= 18.0:
-            return "Милан: утренний METAR >=18°C! Нижние страйки блокируются, фокус на верхний консенсус."
-        return "Милан: термический купол долины реки По (приоритет ICON/GEM при штиле)."
+        calm_str = " (Штиль: ламинарный слой долины По +0.4°C)" if (wspd and wspd <= 4) else ""
+        if has_cirrus and not has_low_cloud:
+            return f"Милан: перистые облака удерживают тепло купола По. Опора строго на ICON (MAE 0.46°C).{calm_str}"
+        return f"Милан: термический купол долины реки По. Абсолютный лидер ICON (ECMWF занижает на 1.0°C).{calm_str}"
 
     elif icao == "LEMD":
-        return "Мадрид: плато Месета (>600м), дневной ветер срывает перегрев (опора на медиану ECMWF/GFS)."
+        return "Мадрид: сухое плато Месета (>600 м). СТРОГОЕ ВЕТО на GFS (-1.01°C занижение!). Опора на ICON+0.4°C."
 
-    return "Синтез физических моделей."
+    elif icao == "EDDM":
+        return "Мюнхен: при южном ветре (150°-210°) работает Альпийский фён (+1.2°C...+2.0°C к консенсусу)."
+
+    return "Синтез эмпирических физических законов KB v8.0."
 
 
 async def collect_city_metrics(icao: str) -> Dict[str, Any]:
@@ -261,40 +277,98 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
     }
 
 
-def _get_priority_target(icao: str, models: Dict[str, float], avg_peak: float, raw_metar: str = "") -> Tuple[float, str]:
-    """Определяет приоритетный ориентир температуры по правилам KB v7.5."""
-    if icao == "EGLC":
-        # Проверяем направление ветра из raw_metar
-        # ВЕТО НА GFS при восточном ветре (050°–120°): дует холодный эстуарий Темзы
-        wind_match = re.search(r"\b(\d{3})\d{2,3}(?:G\d{2,3})?KT\b", raw_metar)
-        if wind_match:
-            wdir = int(wind_match.group(1))
-            if 50 <= wdir <= 120:
-                icon_val = models.get("icon_global")
-                ecm_val = models.get("ecmwf_hres")
-                if icon_val is not None:
-                    return icon_val, f"ICON ({icon_val:.1f}°C, Барьер Темзы)"
-                elif ecm_val is not None:
-                    return ecm_val, f"ECMWF ({ecm_val:.1f}°C, Барьер Темзы)"
+def get_priority_target(icao: str, models: Dict[str, float], avg_peak: float, raw_metar: str = "") -> Tuple[float, str]:
+    """
+    Определяет приоритетный целевой пик температуры на базе физических законов KB v8.0.
+    Учитывает:
+    1. Абсолютное лидерство ICON (MAE 0.34-0.60°C по Европе).
+    2. Холодный дефект ECMWF в Париже (-1.04°C) и Милане (-1.01°C).
+    3. Дефект занижения GFS в Мадриде (-1.01°C).
+    4. Ветровую адвекцию Лондона (E/NE барьер Темзы vs SW/W UHI).
+    5. Ламинарный перегрев при штиле (<=4 kt: +0.4...+0.6°C) vs турбулентный сдув при порывах.
+    6. Перистые облака (Cirrus): прозрачность для солнца (>85%) и парниковое удержание тепла (+0.3...+0.5°C).
+    """
+    wind_match = re.search(r"\b(\d{3})(\d{2,3})(?:G\d{2,3})?KT\b", raw_metar)
+    wdir = int(wind_match.group(1)) if wind_match else None
+    wspd = int(wind_match.group(2)) if wind_match else None
 
-        gfs_val = models.get("gfs_global")
-        if gfs_val is not None:
-            return gfs_val, f"GFS ({gfs_val:.1f}°C)"
-        return avg_peak, f"Консенсус ({avg_peak:.1f}°C)"
+    has_low_cloud = any(c in raw_metar for c in ["OVC0", "BKN0", "OVC01", "BKN01", "OVC02", "BKN02", "OVC03", "BKN03"])
+    has_cirrus = any(c in raw_metar for c in ["CI", "CS", "FEW2", "SCT2", "FEW3", "SCT3", "NCD", "CAVOK", "CLR", "SKC"])
+    is_calm = wspd is not None and wspd <= 4
+
+    icon_val = models.get("icon_global")
+    gfs_val = models.get("gfs_global")
+    ecm_val = models.get("ecmwf_hres")
+
+    if icao == "EGLC":
+        # Лондон
+        if wdir is not None and 50 <= wdir <= 120:
+            # Холодный эстуарий Темзы: UHI выключен. Строгое вето на GFS!
+            val = icon_val if icon_val is not None else (ecm_val if ecm_val is not None else avg_peak)
+            return val, f"ICON ({val:.1f}°C, Барьер Темзы)"
+        elif wdir is not None and 190 <= wdir <= 280:
+            # SW ветер несет городской остров тепла (UHI)
+            if wspd and wspd >= 20:
+                base = icon_val or avg_peak
+                return round(base + 1.0, 1), f"ICON+UHI ({base+1.0:.1f}°C, Шквал SW)"
+            if icon_val is not None and gfs_val is not None:
+                val = round((icon_val + gfs_val) / 2.0, 1)
+                return val, f"ICON+GFS ({val:.1f}°C, UHI активен)"
+            val = icon_val if icon_val is not None else (gfs_val if gfs_val is not None else avg_peak)
+            return val, f"ICON ({val:.1f}°C, UHI)"
+        else:
+            val = icon_val if icon_val is not None else avg_peak
+            return val, f"ICON ({val:.1f}°C, Лидер точности)"
+
     elif icao == "LFPB":
-        gfs_val = models.get("gfs_global")
-        if gfs_val is not None:
-            return gfs_val, f"GFS ({gfs_val:.1f}°C)"
-        return avg_peak, f"Консенсус ({avg_peak:.1f}°C)"
+        # Париж (Ле Бурже): Лидер ICON (MAE 0.40°C), вето на ECMWF (-1.04°C)
+        base = icon_val if icon_val is not None else (gfs_val if gfs_val is not None else avg_peak)
+        add = 0.0
+        reason = f"ICON ({base:.1f}°C)"
+        if is_calm:
+            add += 0.4
+            reason = f"ICON+0.4°C ({base+add:.1f}°C, Штиль/Ламинар)"
+        elif has_cirrus and not has_low_cloud:
+            add += 0.3
+            reason = f"ICON+0.3°C ({base+add:.1f}°C, Cirrus)"
+        return round(base + add, 1), reason
+
     elif icao == "LIMC":
-        icon_val = models.get("icon_global")
+        # Милан (Мальпенса): Лидер ICON (MAE 0.46°C), вето на ECMWF (-1.01°C)
+        base = icon_val if icon_val is not None else avg_peak
+        add = 0.0
+        reason = f"ICON ({base:.1f}°C)"
+        if is_calm:
+            add += 0.4
+            reason = f"ICON+0.4°C ({base+add:.1f}°C, Купол По)"
+        elif has_cirrus and not has_low_cloud:
+            add += 0.3
+            reason = f"ICON+0.3°C ({base+add:.1f}°C, Cirrus)"
+        return round(base + add, 1), reason
+
+    elif icao == "LEMD":
+        # Мадрид (Барахас): Плато Месета (>600 м). Строгое ВЕТО на GFS (-1.01°C занижение!)
         if icon_val is not None:
-            return icon_val, f"ICON ({icon_val:.1f}°C)"
+            val = round(icon_val + 0.4, 1)
+            return val, f"ICON+0.4°C ({val:.1f}°C, Месета)"
+        elif ecm_val is not None:
+            return ecm_val, f"ECMWF ({ecm_val:.1f}°C, Месета)"
         return avg_peak, f"Консенсус ({avg_peak:.1f}°C)"
+
     elif icao == "EDDM":
-        return avg_peak + 1.2, f"Альпийский фён ({avg_peak+1.2:.1f}°C)"
+        # Мюнхен: Альпийский фён при южном ветре
+        if wdir is not None and 150 <= wdir <= 210:
+            val = round(avg_peak + 1.2, 1)
+            return val, f"Альпийский фён ({val:.1f}°C)"
+        val = icon_val if icon_val is not None else avg_peak
+        return val, f"ICON ({val:.1f}°C)"
+
     else:
-        return avg_peak, f"Медиана ({avg_peak:.1f}°C)"
+        val = icon_val if icon_val is not None else avg_peak
+        return val, f"ICON/Консенсус ({val:.1f}°C)"
+
+
+_get_priority_target = get_priority_target
 
 
 def build_morning_city_block(city_data: Dict[str, Any]) -> str:

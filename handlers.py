@@ -51,6 +51,7 @@ from weather_synthesizer import (
     synthesize_forecast,
 )
 from gemini_analyzer import analyze_city_weather_ai, is_gemini_configured
+from auto_scanner import get_priority_target
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -365,36 +366,8 @@ async def process_express_scan_callback(callback: CallbackQuery):
     peaks = list(models_max.values())
     avg_peak = round(sum(peaks) / len(peaks), 1) if peaks else (temp_c or 20.0)
 
-    # Региональный приоритет моделей
-    if icao == "EGLC":
-        wind_match = re.search(r"\b(\d{3})\d{2,3}(?:G\d{2,3})?KT\b", raw_metar)
-        is_east_wind = False
-        if wind_match:
-            wdir = int(wind_match.group(1))
-            if 50 <= wdir <= 120:
-                is_east_wind = True
-
-        if is_east_wind:
-            # ВЕТО НА GFS: дует с холодного эстуария Темзы, UHI выключен
-            icon_t = models_max.get("icon_global")
-            ecm_t = models_max.get("ecmwf_hres")
-            target_val = icon_t or ecm_t or avg_peak
-            priority_model = f"ICON ({target_val:.1f}°C, Барьер Темзы)"
-        else:
-            priority_model = f"GFS ({models_max.get('gfs_global', 'Н/Д')}°C)"
-            target_val = models_max.get("gfs_global", avg_peak)
-    elif icao == "LFPB":
-        priority_model = f"GFS ({models_max.get('gfs_global', 'Н/Д')}°C)"
-        target_val = models_max.get("gfs_global", avg_peak)
-    elif icao == "LIMC":
-        priority_model = f"ICON ({models_max.get('icon_global', 'Н/Д')}°C)"
-        target_val = models_max.get("icon_global", avg_peak)
-    elif icao == "EDDM":
-        priority_model = "Альпийский фён / ECMWF+GFS"
-        target_val = avg_peak + 1.2
-    else:
-        priority_model = f"Медиана GFS/ECMWF ({avg_peak}°C)"
-        target_val = avg_peak
+    # Региональный приоритет моделей и расчет целевой температуры (KB v8.0)
+    target_val, priority_model = get_priority_target(icao, models_max, avg_peak, raw_metar)
 
     # Расчет остатка инсоляции
     local_hour = local_dt.hour + local_dt.minute / 60.0

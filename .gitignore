@@ -19,3 +19,4 @@ __pycache__/
 test_socks.py
 .pytest_cache/
 *.log
+scratch/
