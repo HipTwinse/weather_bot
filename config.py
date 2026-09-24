@@ -38,3 +38,6 @@ PROXY_URL = os.getenv("TELEGRAM_PROXY", "").strip() or None
 
 # Ключ Gemini API для встроенного квант-синоптика Weather Alpha
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip() or None
+
+# Модель Gemini для анализа (по умолчанию флагманская gemini-3.8-flash)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()

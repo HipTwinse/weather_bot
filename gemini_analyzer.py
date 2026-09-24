@@ -183,7 +183,10 @@ async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[st
         logger.warning("GEMINI_API_KEY не задан в конфигурации.")
         return None
 
-    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-3.8-flash")
+    default_cascade = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+    # Убираем дубликаты, сохраняя приоритет
+    models_to_try = list(dict.fromkeys([preferred_model] + default_cascade))
     
     headers = {
         "Content-Type": "application/json",
