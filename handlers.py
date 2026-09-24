@@ -50,6 +50,7 @@ from weather_synthesizer import (
     build_summary_caption,
     synthesize_forecast,
 )
+from gemini_analyzer import analyze_city_weather_ai, is_gemini_configured
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -447,7 +448,48 @@ async def process_express_scan_callback(callback: CallbackQuery):
         + strategy_block
     )
 
-    await status_msg.edit_text(response_text, parse_mode="HTML")
+    # 4. Формируем 1-Click кнопки перехода на Preddy и Polymarket (Вариант А)
+    trade_buttons = []
+    trade_row = []
+    if event_data and event_data.get("slug"):
+        slug = event_data["slug"]
+        event_id = event_data.get("id")
+        preddy_link = f"https://preddy.trade/event/{slug}/{event_id}" if event_id else f"https://preddy.trade/event/{slug}"
+        poly_link = f"https://polymarket.com/event/{slug}"
+        trade_row.append(InlineKeyboardButton(text="⚡ Открыть в Preddy", url=preddy_link))
+        trade_row.append(InlineKeyboardButton(text="📊 Polymarket", url=poly_link))
+        trade_buttons.append(trade_row)
+
+    trade_buttons.append([
+        InlineKeyboardButton(text=f"🔄 Обновить ({icao})", callback_data=f"express_scan:{icao}")
+    ])
+    trade_markup = InlineKeyboardMarkup(inline_keyboard=trade_buttons)
+
+    # 5. Интеграция с квант-синоптиком Gemini AI (Вариант 1)
+    if is_gemini_configured():
+        city_pack = {
+            "icao": icao,
+            "city_name": city_label,
+            "local_dt": local_dt,
+            "temp_c": temp_c,
+            "raw_metar": raw_metar,
+            "models_max": models_max,
+            "rate_str": f"{round(target_val - (temp_c or target_val), 1)}°C/остаток",
+            "rem_hours_str": f"{rem_hours:.1f} ч",
+            "orderbook": orderbook,
+        }
+        try:
+            ai_verdict = await analyze_city_weather_ai(city_pack, scenario="A")
+            if ai_verdict:
+                response_text = ai_verdict
+        except Exception as e:
+            logger.warning(f"Ошибка вызова Gemini AI: {e}")
+
+    # Защита от лимита длины сообщения Telegram (4096 символов)
+    if len(response_text) > 4000:
+        response_text = response_text[:3990] + "..."
+
+    await status_msg.edit_text(response_text, parse_mode="HTML", reply_markup=trade_markup)
 
 
 # -------------------------------------------------------------
@@ -479,6 +521,28 @@ async def cmd_help(message: Message, state: FSMContext):
         "4. <b>Тайм-стоп 13:30 LT:</b> если к полудню цель не пробита — сброс остаточной стоимости в рынок."
     )
     await message.answer(help_text, parse_mode="HTML", reply_markup=main_keyboard)
+
+
+@router.message(Command("ai", "gemini"), StateFilter("*"))
+async def cmd_ai_status(message: Message, state: FSMContext):
+    await state.clear()
+    if is_gemini_configured():
+        text = (
+            "🤖 <b>AI Квант-Синоптик Gemini v7.4 АКТИВЕН!</b>\n\n"
+            "Все экспресс-сканы рынков обрабатываются нейросетью Google Gemini с применением синоптической базы, "
+            "анализа полного стакана Polymarket и тактических Pro-Tips.\n\n"
+            "Выбери город ниже для мгновенного AI-анализа с кнопками перехода в Preddy:"
+        )
+    else:
+        text = (
+            "ℹ️ <b>AI Квант-Синоптик Gemini v7.4</b>\n\n"
+            "Чтобы активировать встроенный AI-анализ прямо в боте, добавь в файл <code>.env</code> бесплатный ключ:\n"
+            "<code>GEMINI_API_KEY=ваш_ключ</code>\n\n"
+            "🔑 Получить ключ можно бесплатно в Google AI Studio:\n"
+            "https://aistudio.google.com/app/apikey\n\n"
+            "<i>(Сейчас бот работает на надежном локальном алгоритме синтеза).</i>"
+        )
+    await message.answer(text, parse_mode="HTML", reply_markup=cities_inline_keyboard)
 
 
 @router.message(F.text == "📌 Мои позиции", StateFilter("*"))
@@ -809,6 +873,18 @@ async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: fl
     detected_icao = _detect_city_icao(search_context)
     detected_date = _detect_market_target_date(search_context)
 
+    # Формируем 1-Click кнопки перехода на Preddy и Polymarket (Вариант А)
+    trade_buttons = []
+    trade_row = []
+    if slug:
+        event_id = event_data.get("id")
+        preddy_link = f"https://preddy.trade/event/{slug}/{event_id}" if event_id else f"https://preddy.trade/event/{slug}"
+        poly_link = f"https://polymarket.com/event/{slug}"
+        trade_row.append(InlineKeyboardButton(text="⚡ Открыть в Preddy", url=preddy_link))
+        trade_row.append(InlineKeyboardButton(text="📊 Polymarket", url=poly_link))
+        trade_buttons.append(trade_row)
+    trade_markup = InlineKeyboardMarkup(inline_keyboard=trade_buttons) if trade_buttons else None
+
     if detected_icao:
         date_label = f" на {detected_date}" if detected_date else ""
         status_msg = await target_message.answer(
@@ -819,7 +895,7 @@ async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: fl
 
         if success and summary_text:
             unified_report = f"{orderbook_block}\n\n{'━' * 22}\n\n{summary_text}"
-            await status_msg.edit_text(unified_report, parse_mode="HTML")
+            await status_msg.edit_text(unified_report, parse_mode="HTML", reply_markup=trade_markup)
             await target_message.answer_document(
                 document=document_file,
                 caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{document_file.filename}</code>",
@@ -827,7 +903,7 @@ async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: fl
             )
             return
 
-    await target_message.answer(orderbook_block, parse_mode="HTML")
+    await target_message.answer(orderbook_block, parse_mode="HTML", reply_markup=trade_markup)
     await target_message.answer(
         "🌍 <b>Город не распознан автоматически.</b> Выбери его из списка ниже:",
         parse_mode="HTML",

@@ -35,3 +35,6 @@ WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "").strip() or None
 
 # Прокси (если переменная не задана в облаке — бот подключится напрямую)
 PROXY_URL = os.getenv("TELEGRAM_PROXY", "").strip() or None
+
+# Ключ Gemini API для встроенного квант-синоптика Weather Alpha
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip() or None

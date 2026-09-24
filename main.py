@@ -46,6 +46,7 @@ async def setup_bot_commands(bot: Bot) -> None:
     commands = [
         BotCommand(command="start", description="🚀 Главное меню и статус бота"),
         BotCommand(command="scan", description="🔍 Сканировать маркет (Preddy / Polymarket)"),
+        BotCommand(command="ai", description="🤖 AI-анализ погоды (Gemini v7.4)"),
         BotCommand(command="positions", description="📌 Мои открытые сделки"),
         BotCommand(command="cities", description="🌍 Быстрый выбор избранных городов"),
         BotCommand(command="help", description="📖 Справка и регламент v7.1"),
