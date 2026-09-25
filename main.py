@@ -64,11 +64,11 @@ async def run_health_check_server() -> None:
     Критически важен для удержания бесплатного контейнера Render от засыпания.
     """
     async def handle_ping(request: web.Request) -> web.Response:
-        return web.Response(text="OK: Weather Alpha Bot v7.1 is running 24/7", status=200)
+        return web.Response(text="OK: Weather Alpha Bot v8.0 is running 24/7", status=200)
 
     app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/healthz", handle_ping)
+    for path in ["/", "/healthz", "/health", "/ping", "/cron", "/status"]:
+        app.router.add_route("*", path, handle_ping)
 
     runner = web.AppRunner(app)
     await runner.setup()
