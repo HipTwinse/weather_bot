@@ -14,9 +14,17 @@ from openmeteo_service import (
     _http_get_with_retry,
     _parse_retry_after,
     calculate_derived_metrics,
+    clear_model_updates_cache,
     fetch_model_updates_metadata,
     fetch_openmeteo_forecast,
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_cache():
+    clear_model_updates_cache()
+    yield
+    clear_model_updates_cache()
 
 
 # ==============================================================================

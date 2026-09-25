@@ -698,9 +698,12 @@ async def run_auto_scanner(bot: Bot) -> None:
                 else:
                     logger.info(f"🔄 Сбор планового METAR-обновления ({current_checkpoint_slot} ХБР)...")
 
-                # Параллельный сбор метрик по всем 4 городам
-                metrics_tasks = [collect_city_metrics(icao) for icao in TARGET_CITIES.keys()]
-                cities_metrics = await asyncio.gather(*metrics_tasks, return_exceptions=False)
+                # Последовательный сбор метрик с интервалом 0.25 сек (защита от Open-Meteo 429)
+                cities_metrics = []
+                for icao in TARGET_CITIES.keys():
+                    cm = await collect_city_metrics(icao)
+                    cities_metrics.append(cm)
+                    await asyncio.sleep(0.25)
 
                 # Отправка дайджеста
                 await send_consolidated_digest(bot, cities_metrics, is_morning_base, now_khv)

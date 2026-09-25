@@ -208,8 +208,24 @@ def _safe_convert_timestamp(val) -> str | None:
         return None
 
 
-def fetch_model_updates_metadata() -> dict:
-    """Запрашивает метаданные прогонов моделей из Open-Meteo Model Updates API."""
+_MODEL_UPDATES_CACHE: dict = {}
+_MODEL_UPDATES_CACHE_TS: float = 0.0
+
+
+def clear_model_updates_cache():
+    """Сбрасывает локальный кэш метаданных обновлений моделей."""
+    global _MODEL_UPDATES_CACHE, _MODEL_UPDATES_CACHE_TS
+    _MODEL_UPDATES_CACHE = {}
+    _MODEL_UPDATES_CACHE_TS = 0.0
+
+
+def fetch_model_updates_metadata(use_cache: bool = True) -> dict:
+    """Запрашивает метаданные прогонов моделей из Open-Meteo Model Updates API (с кэшированием на 30 мин)."""
+    global _MODEL_UPDATES_CACHE, _MODEL_UPDATES_CACHE_TS
+    now = time.time()
+    if use_cache and _MODEL_UPDATES_CACHE and (now - _MODEL_UPDATES_CACHE_TS < 1800):
+        return copy.deepcopy(_MODEL_UPDATES_CACHE)
+
     url = "https://customer-model-updates.open-meteo.com/v1/model-updates"
     resp = _http_get_with_retry(url, params={}, retries=1, timeout=5)
     
@@ -248,7 +264,9 @@ def fetch_model_updates_metadata() -> dict:
                     "temporal_resolution_seconds": int(parsed_res) if isinstance(parsed_res, (int, float)) else def_res,
                     "update_interval_seconds": int(parsed_interval) if isinstance(parsed_interval, (int, float)) else None
                 }
-        return default_meta
+        _MODEL_UPDATES_CACHE = default_meta
+        _MODEL_UPDATES_CACHE_TS = now
+        return copy.deepcopy(_MODEL_UPDATES_CACHE)
     except Exception:
         return default_meta
 
@@ -379,11 +397,16 @@ def fetch_openmeteo_forecast(
         "timezone": iana_timezone,
         "models": models_csv,
         "hourly": hourly_param_str,
-        "forecast_days": 3
+        "past_days": 2,
+        "forecast_days": 7
     }
 
-    # Единый запрос ко всем 4 моделям сразу
-    resp = _http_get_with_retry(url, params=params)
+    # Единый запрос ко всем 4 моделям сразу с резервным fallback
+    resp = _http_get_with_retry(url, params=params, retries=2, timeout=12)
+    if not resp or resp.status_code != 200:
+        # Резервный эндпоинт Open-Meteo
+        fallback_url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+        resp = _http_get_with_retry(fallback_url, params=params, retries=1, timeout=12)
 
     primary_models_res = {}
     secondary_models_res = {}
