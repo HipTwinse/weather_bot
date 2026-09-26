@@ -11,6 +11,7 @@
 
 import asyncio
 from datetime import datetime
+import html
 import json
 import logging
 import re
@@ -852,8 +853,9 @@ async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: fl
         return
 
     tier_name, bet_size, corridor_info = calculate_tier_sizing(user_balance)
+    safe_title = html.escape(str(title))
     report_lines = [
-        f"📊 <b>{title}</b>\n",
+        f"📊 <b>{safe_title}</b>\n",
         f"💼 <b>Твой депозит:</b> <code>${user_balance:.2f}</code> ({tier_name})",
         f"🎯 <b>Точечный вход:</b> <code>${bet_size:.2f}</code>",
         f"🛡️ <b>Коридор:</b> <code>{corridor_info}</code>\n",
@@ -861,7 +863,8 @@ async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: fl
     ]
 
     for item in markets:
-        question = item.get("groupItemTitle") or item.get("question", "Исход")
+        raw_question = item.get("groupItemTitle") or item.get("question", "Исход")
+        question = html.escape(str(raw_question))
         prices_str = item.get("outcomePrices", '["0", "0"]')
         try:
             prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
@@ -910,7 +913,13 @@ async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: fl
 
         if success and summary_text:
             unified_report = f"{orderbook_block}\n\n{'━' * 22}\n\n{summary_text}"
-            await status_msg.edit_text(unified_report, parse_mode="HTML", reply_markup=trade_markup)
+            try:
+                await status_msg.edit_text(unified_report, parse_mode="HTML", reply_markup=trade_markup)
+            except Exception as e_edit:
+                logger.warning(f"Ошибка edit_text с HTML: {e_edit}, пробуем plain-text")
+                plain_report = html.unescape(re.sub(r"<[^>]+>", "", unified_report))
+                await status_msg.edit_text(plain_report, parse_mode=None, reply_markup=trade_markup)
+
             await target_message.answer_document(
                 document=document_file,
                 caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{document_file.filename}</code>",
@@ -918,7 +927,11 @@ async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: fl
             )
             return
 
-    await target_message.answer(orderbook_block, parse_mode="HTML", reply_markup=trade_markup)
+    try:
+        await target_message.answer(orderbook_block, parse_mode="HTML", reply_markup=trade_markup)
+    except Exception:
+        plain_ob = html.unescape(re.sub(r"<[^>]+>", "", orderbook_block))
+        await target_message.answer(plain_ob, parse_mode=None, reply_markup=trade_markup)
     await target_message.answer(
         "🌍 <b>Город не распознан автоматически.</b> Выбери его из списка ниже:",
         parse_mode="HTML",

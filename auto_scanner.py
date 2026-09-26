@@ -26,6 +26,7 @@
 
 import asyncio
 from datetime import datetime, timedelta
+import html
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -70,6 +71,21 @@ express_scan_keyboard = InlineKeyboardMarkup(
         ],
     ]
 )
+
+
+def sanitize_telegram_html(text: str) -> str:
+    """
+    Экранирует недопустимые символы <, > и & для Telegram HTML-парсера,
+    сохраняя при этом валидные поддерживаемые теги (<b>, <i>, <code>, <a>, <pre>, <u>, <s>, <blockquote>).
+    """
+    if not text:
+        return ""
+    # 1. Экранируем &, если это не валидная сущность (&amp;, &lt;, &gt;, &quot;)
+    text = re.sub(r"&(?!(?:amp|lt|gt|quot);)", "&amp;", text)
+    # 2. Экранируем <, если это не открывающий или закрывающий валидный тег Telegram
+    valid_tags_pattern = r"<(?!/?(?:b|i|u|s|code|pre|a|strong|em|ins|strike|del|span|blockquote|tg-spoiler)(?:\s+[^>]*)?>)"
+    text = re.sub(valid_tags_pattern, "&lt;", text, flags=re.IGNORECASE)
+    return text
 
 
 def is_khv_active_hours() -> bool:
@@ -176,14 +192,14 @@ def _get_city_physics_note(icao: str, raw_metar: str, temp_c: Optional[float], l
             return "Восточный ветер (050°-120°): холодный воздух с эстуария Темзы гасит UHI. ВЕТО на GFS! Рулит ICON (MAE 0.34°C)."
         elif wdir is not None and 190 <= wdir <= 280:
             if wspd and wspd >= 20:
-                return "Шквалистый SW-ветер (>=20 kt): тепловой шлейф Лондона пробивает полосу транзитом (+1.2°C)."
+                return "Шквалистый SW-ветер (≥20 kt): тепловой шлейф Лондона пробивает полосу транзитом (+1.2°C)."
             return "SW-ветер несет городской остров тепла центра Лондона (UHI активен, опора на ICON+GFS)."
         return "Лондон: стабильный радиационный прогрев при прозрачной атмосфере (лидер ICON)."
 
     elif icao == "LFPB":
-        calm_str = " (Штиль <=4 kt: ламинарный перегрев +0.6°C)" if (wspd and wspd <= 4) else ""
+        calm_str = " (Штиль ≤4 kt: ламинарный перегрев +0.6°C)" if (wspd and wspd <= 4) else ""
         if has_cirrus and not has_low_cloud:
-            return f"Париж: перистые облака Cirrus не блокируют солнечную радиацию (пропускание >85%). Лидер ICON.{calm_str}"
+            return f"Париж: перистые облака Cirrus не блокируют солнечную радиацию (пропускание свыше 85%). Лидер ICON.{calm_str}"
         return f"Париж: приоритет ICON (MAE 0.40°C). Холодный дефект ECMWF (-1.04°C) игнорируется.{calm_str}"
 
     elif icao == "LIMC":
@@ -193,7 +209,7 @@ def _get_city_physics_note(icao: str, raw_metar: str, temp_c: Optional[float], l
         return f"Милан: термический купол долины реки По. Абсолютный лидер ICON (ECMWF занижает на 1.0°C).{calm_str}"
 
     elif icao == "LEMD":
-        return "Мадрид: сухое плато Месета (>600 м). СТРОГОЕ ВЕТО на GFS (-1.01°C занижение!). Опора на ICON+0.4°C."
+        return "Мадрид: сухое плато Месета (более 600 м). СТРОГОЕ ВЕТО на GFS (-1.01°C занижение!). Опора на ICON+0.4°C."
 
     elif icao == "EDDM":
         return "Мюнхен: при южном ветре (150°-210°) работает Альпийский фён (+1.2°C...+2.0°C к консенсусу)."
@@ -412,9 +428,10 @@ def build_morning_city_block(city_data: Dict[str, Any]) -> str:
             "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
         )
     elif favorite_candidate and 25.0 <= favorite_candidate["price_cents"] <= 48.0:
+        fav_title = html.escape(str(favorite_candidate["title"]))
         status_line = (
             f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b>\n"
-            f"• Рекомендуемый исход: <code>{favorite_candidate['title']}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b>)\n"
+            f"• Рекомендуемый исход: <code>{fav_title}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b>)\n"
             f"• Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи."
         )
     else:
@@ -473,8 +490,9 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
             pnl_str = "+0%"
             entry_price = cur_price
 
+        safe_outcomes = html.escape(str(target_outcomes))
         lines.append(
-            f"💼 <b>ВАША ПОЗИЦИЯ:</b> <code>{target_outcomes}</code> "
+            f"💼 <b>ВАША ПОЗИЦИЯ:</b> <code>{safe_outcomes}</code> "
             f"(вход: <code>{entry_price:.0f}¢</code> | сейчас в стакане: <code>{cur_price:.0f}¢</code> | PnL: <b>{pnl_str}</b>)"
         )
 
@@ -494,7 +512,7 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
         # 3. Триггер Физического слома: СТРОГО в диапазоне дневной инсоляции (10:30 LT - 15:00 LT)
         elif 10.5 <= local_time_val <= 15.0 and (rate_val < 0.4 and any(c in raw_metar for c in ["BKN", "OVC", "RA"])):
             verdict = (
-                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — Темп прогрева затух (<+0.4°C/ч) и небо затянуло облачностью!"
+                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — Темп прогрева затух (ниже +0.4°C/ч) и небо затянуло облачностью!"
             )
         # 4. Раннее утро (LT < 09:00): ночное выхолаживание не инвалидирует позу
         elif local_hour < 9:
@@ -537,16 +555,17 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
         elif 10.5 <= local_time_val <= 15.0:
             is_cloudy = any(c in raw_metar for c in ["BKN", "OVC", "RA", "DZ"])
             if rate_val < 0.4 and is_cloudy:
-                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Физический слом: темп < +0.4°C/ч и натекание облачности)"
+                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Физический слом: темп ниже +0.4°C/ч и натекание облачности)"
             elif is_overheated:
                 status_desc = (
                     "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
                     "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
                 )
             elif fav_candidate and 25.0 <= fav_candidate["price_cents"] <= 48.0:
+                cand_title = html.escape(str(fav_candidate['title']))
                 status_desc = (
                     f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b> "
-                    f"(Вход: <code>{fav_candidate['title']}</code> {fav_candidate['price_cents']:.0f}¢. "
+                    f"(Вход: <code>{cand_title}</code> {fav_candidate['price_cents']:.0f}¢. "
                     f"Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи)"
                 )
             elif rate_val >= 0.5:
@@ -564,9 +583,10 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
                     "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
                 )
             elif fav_candidate and 25.0 <= fav_candidate["price_cents"] <= 48.0:
+                cand_title = html.escape(str(fav_candidate['title']))
                 status_desc = (
                     f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b> "
-                    f"(Вход: <code>{fav_candidate['title']}</code> {fav_candidate['price_cents']:.0f}¢. "
+                    f"(Вход: <code>{cand_title}</code> {fav_candidate['price_cents']:.0f}¢. "
                     f"Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи)"
                 )
             else:
@@ -575,6 +595,41 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
         lines.append(f"👉 {status_desc}")
 
     return "\n".join(lines)
+
+
+async def _safe_send_digest(bot: Bot, chat_id: int, message_html: str, reply_markup=None) -> bool:
+    """
+    Надёжная отправка дайджеста с автоматической санитизацией HTML
+    и аварийным fallback на Plain-Text без потери данных.
+    """
+    safe_text = sanitize_telegram_html(message_html)
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=safe_text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+        return True
+    except Exception as html_err:
+        logger.warning(
+            f"⚠️ Ошибка отправки HTML-дайджеста в чат {chat_id}: {html_err}. "
+            "Переключаемся на аварийную Plain-Text отправку..."
+        )
+        try:
+            plain_text = re.sub(r"<[^>]+>", "", message_html)
+            plain_text = html.unescape(plain_text)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=plain_text,
+                parse_mode=None,
+                reply_markup=reply_markup,
+            )
+            logger.info(f"✅ Дайджест успешно доставлен в чат {chat_id} через Plain-Text fallback.")
+            return True
+        except Exception as plain_err:
+            logger.error(f"❌ Критический сбой отправки дайджеста в чат {chat_id}: {plain_err}")
+            return False
 
 
 async def send_consolidated_digest(
@@ -617,15 +672,7 @@ async def send_consolidated_digest(
                 admin_blocks.append(build_dynamic_city_block(cm, admin_pos))
             full_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(admin_blocks)
 
-        try:
-            await bot.send_message(
-                chat_id=admin_id,
-                text=full_msg,
-                parse_mode="HTML",
-                reply_markup=express_scan_keyboard,
-            )
-        except Exception as e:
-            logger.warning(f"Сбой отправки дайджеста админу {admin_id}: {e}")
+        await _safe_send_digest(bot, admin_id, full_msg, express_scan_keyboard)
 
     # 2. Отправка пользователям, держащим открытые позиции
     distinct_user_ids = {p["user_id"] for p in active_positions if p.get("user_id") and p.get("user_id") != admin_id}
@@ -639,15 +686,7 @@ async def send_consolidated_digest(
                 user_blocks.append(build_dynamic_city_block(cm, user_pos))
             user_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(user_blocks)
 
-        try:
-            await bot.send_message(
-                chat_id=uid,
-                text=user_msg,
-                parse_mode="HTML",
-                reply_markup=express_scan_keyboard,
-            )
-        except Exception as e:
-            logger.debug(f"Не удалось отправить дайджест пользователю {uid}: {e}")
+        await _safe_send_digest(bot, uid, user_msg, express_scan_keyboard)
 
 
 async def run_auto_scanner(bot: Bot) -> None:
