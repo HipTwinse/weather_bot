@@ -477,7 +477,17 @@ async def process_express_scan_callback(callback: CallbackQuery):
 
     # Защита от лимита длины сообщения Telegram (4096 символов)
     if len(response_text) > 4000:
-        response_text = response_text[:3990] + "..."
+        split_pos = response_text.rfind("\n\n3. ", 0, 3900)
+        if split_pos == -1:
+            split_pos = response_text.rfind("\n\n", 0, 3900)
+        if split_pos != -1:
+            part1 = response_text[:split_pos].strip()
+            part2 = response_text[split_pos:].strip()
+            await status_msg.edit_text(part1, parse_mode="HTML")
+            await status_msg.answer(part2, parse_mode="HTML", reply_markup=trade_markup)
+            return
+        else:
+            response_text = response_text[:3990] + "..."
 
     await status_msg.edit_text(response_text, parse_mode="HTML", reply_markup=trade_markup)
 

@@ -149,6 +149,9 @@ SYSTEM_PROMPT_V8_0 = """Ты — Weather Alpha Engine v8.0: квант-сино�
 
 5. 🛑 <b>СТОП-ТРИГГЕРЫ:</b>
 • Разворот ветра / натекание плотной облачности BKN/OVC / темп прогрева к 11:30 LT ниже +0.4°C/час.
+
+ФОРМАТ ВЫВОДА:
+Пиши строго по пунктам, плотно, без лишних введений и общих рассуждений. Объем текста должен быть около 2500–3300 символов, чтобы полностью помещаться в одно сообщение Telegram. Все 5 разделов должны быть полностью раскрыты и логически завершены.
 """
 
 SYSTEM_PROMPT_V7_4 = SYSTEM_PROMPT_V8_0
@@ -226,7 +229,7 @@ async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[st
         ],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 8192,
         }
     }
 
@@ -234,7 +237,7 @@ async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[st
         for model_name in models_to_try:
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
             try:
-                async with session.post(endpoint, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=20.0)) as resp:
+                async with session.post(endpoint, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=35.0)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         candidates = data.get("candidates", [])
@@ -247,8 +250,7 @@ async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[st
                     else:
                         err_text = await resp.text()
                         logger.warning(f"Gemini API ({model_name}) вернул HTTP {resp.status}: {err_text[:200]}")
-                        if resp.status == 429:
-                            continue # пробуем следующую модель
+                        continue  # пробуем следующую модель в каскаде при любой ошибке (429, 503, 500 и т.д.)
             except Exception as e:
                 logger.warning(f"Ошибка запроса к Gemini ({model_name}): {e}")
                 continue
