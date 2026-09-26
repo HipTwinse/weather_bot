@@ -201,10 +201,10 @@ async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[st
         logger.warning("GEMINI_API_KEY не задан в конфигурации.")
         return None
 
-    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-3.7-flash")
+    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-3.8-flash")
     default_cascade = [
-        "gemini-3.7-flash",
         "gemini-3.8-flash",
+        "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
