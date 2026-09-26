@@ -483,13 +483,28 @@ async def process_express_scan_callback(callback: CallbackQuery):
         if split_pos != -1:
             part1 = response_text[:split_pos].strip()
             part2 = response_text[split_pos:].strip()
-            await status_msg.edit_text(part1, parse_mode="HTML")
-            await status_msg.answer(part2, parse_mode="HTML", reply_markup=trade_markup)
+            try:
+                await status_msg.edit_text(part1, parse_mode="HTML")
+                await status_msg.answer(part2, parse_mode="HTML", reply_markup=trade_markup)
+            except Exception as err:
+                logger.error(f"Ошибка при edit_text разметки (part1/part2): {err}")
+                await status_msg.edit_text(part1, parse_mode=None)
+                await status_msg.answer(part2, parse_mode=None, reply_markup=trade_markup)
             return
         else:
             response_text = response_text[:3990] + "..."
 
-    await status_msg.edit_text(response_text, parse_mode="HTML", reply_markup=trade_markup)
+    try:
+        await status_msg.edit_text(response_text, parse_mode="HTML", reply_markup=trade_markup)
+    except Exception as err:
+        logger.error(f"Ошибка при edit_text: {err}")
+        try:
+            # Fallback 1: Отправка без парсинга HTML, если разметка Telegram сбилась
+            await status_msg.edit_text(response_text, parse_mode=None, reply_markup=trade_markup)
+        except Exception as err2:
+            logger.error(f"Ошибка при edit_text fallback: {err2}")
+            # Fallback 2: Отправка новым сообщением
+            await callback.message.answer(response_text, parse_mode=None, reply_markup=trade_markup)
 
 
 # -------------------------------------------------------------
