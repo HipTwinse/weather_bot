@@ -51,7 +51,7 @@ from weather_synthesizer import (
     build_summary_caption,
     synthesize_forecast,
 )
-from gemini_analyzer import analyze_city_weather_ai, is_gemini_configured
+from gemini_analyzer import analyze_city_weather_ai, is_gemini_configured, get_gemini_status
 from auto_scanner import get_priority_target
 
 logger = logging.getLogger(__name__)
@@ -90,14 +90,39 @@ main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
             KeyboardButton(text="🔍 Сканировать маркет"),
-            KeyboardButton(text="📌 Мои позиции"),
+            KeyboardButton(text="🤖 AI Аналитик"),
         ],
         [
+            KeyboardButton(text="📌 Мои позиции"),
             KeyboardButton(text="🌍 Избранные города"),
-            KeyboardButton(text="📖 Справка / Регламент v7.1"),
+        ],
+        [
+            KeyboardButton(text="📖 Справка / Команды"),
         ],
     ],
     resize_keyboard=True,
+)
+
+# Инлайн-клавиатура для команды /ai — запускает экспресс-скан с Gemini AI анализом
+ai_cities_inline_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🇬🇧 Лондон (EGLC)", callback_data="express_scan:EGLC"),
+            InlineKeyboardButton(text="🇫🇷 Париж (LFPB)", callback_data="express_scan:LFPB"),
+        ],
+        [
+            InlineKeyboardButton(text="🇮🇹 Милан (LIMC)", callback_data="express_scan:LIMC"),
+            InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="express_scan:LEMD"),
+        ],
+        [
+            InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="express_scan:EDDM"),
+            InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="express_scan:KJFK"),
+        ],
+        [
+            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="express_scan:RJTT"),
+            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="express_scan:RKSI"),
+        ],
+    ]
 )
 
 cities_inline_keyboard = InlineKeyboardMarkup(
@@ -516,49 +541,60 @@ async def process_express_scan_callback(callback: CallbackQuery):
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     welcome_text = (
-        "👋 <b>Weather Alpha Engine v7.1 активен!</b>\n\n"
-        "🔹 <b>Анализ погоды:</b> Отправь 4-значный ICAO-код (например, <code>EGLC</code>, <code>KJFK</code>) или координаты.\n"
-        "🔹 <b>Сканер маркетов:</b> Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку с Preddy / Polymarket.\n"
-        "🔹 <b>Мои позиции:</b> Нажми <b>«📌 Мои позиции»</b> для взятия сделок под защиту автосканера.\n"
-        "🔹 <b>Быстрый выбор:</b> Нажми <b>«🌍 Избранные города»</b>."
+        "👋 <b>Weather Alpha Engine v8.0 активен!</b>\n\n"
+        "🤖 <b>AI-Квант-Синоптик:</b> Нажми <b>«🤖 AI Аналитик»</b> или отправь /ai для полного нейросетевого разбора (Gemini).\n"
+        "🔍 <b>Сканер маркетов:</b> Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку с Preddy / Polymarket.\n"
+        "📌 <b>Мои позиции:</b> Нажми <b>«📌 Мои позиции»</b> для контроля открытых сделок и PnL.\n"
+        "🌍 <b>Города:</b> Нажми <b>«🌍 Избранные города»</b> или отправь 4-значный ICAO-код (<code>EGLC</code>, <code>KJFK</code>)."
     )
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=main_keyboard)
 
 
 @router.message(Command("help"), StateFilter("*"))
-@router.message(F.text == "📖 Справка / Регламент v7.1", StateFilter("*"))
+@router.message(F.text.in_(["📖 Справка / Команды", "📖 Справка / Регламент v7.1", "📖 Справка", "/help"]), StateFilter("*"))
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
     help_text = (
-        "📖 <b>Справка Weather Alpha Engine v7.1:</b>\n\n"
-        "1. <b>Консолидированный дайджест:</b> раз в 30 минут с 10:00 до 00:00 ХБР бот присылает единую сводку по Лондону, Парижу, Милану и Мадриду с кнопками моментального анализа стакана.\n"
-        "2. <b>Sniper Momentum (одиночный вход):</b> вход в один исход разрешен при цене 25¢–48¢, запасе солнца >= 3ч и подтверждении приоритетной модели города.\n"
-        "3. <b>Дисциплина Тейк-Профита:</b> при росте купленного токена на >= +35% или цене >= 60¢ — немедленно фиксируй прибыль лимиткой в стакан!\n"
-        "4. <b>Тайм-стоп 13:30 LT:</b> если к полудню цель не пробита — сброс остаточной стоимости в рынок."
+        "📖 <b>Справка и регламент Weather Alpha Engine v8.0:</b>\n\n"
+        "1. <b>🤖 AI Квант-Синоптик (/ai):</b> Мгновенный глубокий нейросетевой анализ (Gemini v8.0) по любому городу с разбором микрофизики и цен стакана.\n"
+        "2. <b>🔍 Сканер маркета (/scan):</b> Отправь ссылку с Preddy/Polymarket — расчет сайзинга банкролла, безопасного коридора и генерация RAW Data Package.\n"
+        "3. <b>📌 Мои позиции (/positions):</b> Мониторинг PnL открытых сделок, расчет темпа прогрева, триггеры Тейк-Профита (+35% / 60¢) и Тайм-Стопа (13:30 LT).\n"
+        "4. <b>🔄 Консолидированный автосканер:</b> Каждые полчаса (:02 и :32) с 10:00 до 00:00 ХБР автоматическая рассылка единой сводки.\n"
+        "5. <b>⚡ Ввод ICAO или координат:</b> Отправь <code>EGLC</code> или координаты (<code>48.52, 135.18</code>) для моментального отчета 4 моделей (ECMWF, GFS, ICON, GEM)."
     )
     await message.answer(help_text, parse_mode="HTML", reply_markup=main_keyboard)
 
 
+@router.message(F.text.in_(["🤖 AI Аналитик", "🤖 AI Анализ", "🤖 Gemini AI", "/ai", "/gemini"]), StateFilter("*"))
 @router.message(Command("ai", "gemini"), StateFilter("*"))
 async def cmd_ai_status(message: Message, state: FSMContext):
     await state.clear()
-    if is_gemini_configured():
+    status_info = get_gemini_status()
+    if status_info["configured"]:
+        active_model = status_info["active_model"]
+        cascade_str = " ➔ ".join(status_info["cascade"][:4])
         text = (
-            "🤖 <b>AI Квант-Синоптик Gemini v7.4 АКТИВЕН!</b>\n\n"
-            "Все экспресс-сканы рынков обрабатываются нейросетью Google Gemini с применением синоптической базы, "
-            "анализа полного стакана Polymarket и тактических Pro-Tips.\n\n"
-            "Выбери город ниже для мгновенного AI-анализа с кнопками перехода в Preddy:"
+            "🤖 <b>AI Квант-Синоптик Weather Alpha (Gemini)</b>\n\n"
+            f"• <b>Статус AI-агента:</b> {status_info['status_label']}\n"
+            f"• <b>Активная модель в запросе:</b> <code>{active_model}</code>\n"
+            f"• <b>Отказоустойчивый каскад:</b> <code>{cascade_str}</code>\n"
+            "• <b>Синоптическая база:</b> 5 законов микрофизики KB v8.1 + полный стакан котировок\n"
+            "• <b>Принцип расчета:</b> Строгий приоритет физической истины (вероятность не подгоняется под стакан!)\n\n"
+            "👇 <b>Выбери город для мгновенного AI-анализа:</b>\n"
+            "<i>(Сразу формируется полный квант-разбор с синоптикой, стаканом цен и кнопками 1-Click перехода в Preddy)</i>"
         )
     else:
         text = (
-            "ℹ️ <b>AI Квант-Синоптик Gemini v7.4</b>\n\n"
-            "Чтобы активировать встроенный AI-анализ прямо в боте, добавь в файл <code>.env</code> бесплатный ключ:\n"
+            "🤖 <b>AI Квант-Синоптик Weather Alpha (Gemini)</b>\n\n"
+            f"• <b>Статус AI-агента:</b> {status_info['status_label']}\n\n"
+            "Для активации нейросетевого квант-синоптика прямо в Telegram добавь бесплатный ключ в файл <code>.env</code>:\n"
             "<code>GEMINI_API_KEY=ваш_ключ</code>\n\n"
-            "🔑 Получить ключ можно бесплатно в Google AI Studio:\n"
+            "🔑 Получить ключ бесплатно за 1 минуту в Google AI Studio:\n"
             "https://aistudio.google.com/app/apikey\n\n"
-            "<i>(Сейчас бот работает на надежном локальном алгоритме синтеза).</i>"
+            "<i>(Пока ключ не задан, бот использует надежный локальный алгоритм синтеза физических законов KB v8.0).</i>\n\n"
+            "👇 Выбери город для экспресс-скана:"
         )
-    await message.answer(text, parse_mode="HTML", reply_markup=cities_inline_keyboard)
+    await message.answer(text, parse_mode="HTML", reply_markup=ai_cities_inline_keyboard)
 
 
 @router.message(F.text == "📌 Мои позиции", StateFilter("*"))
