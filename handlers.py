@@ -53,7 +53,13 @@ from weather_synthesizer import (
     synthesize_forecast,
 )
 from gemini_analyzer import analyze_city_weather_ai, is_gemini_configured, get_gemini_status
-from auto_scanner import get_priority_target, _calculate_dynamics
+from auto_scanner import (
+    get_priority_target,
+    _calculate_dynamics,
+    has_real_low_cloud,
+    is_blocking_rain_and_clouds,
+    get_strike_for_temp,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -394,7 +400,8 @@ async def process_express_scan_callback(callback: CallbackQuery):
     avg_peak = round(sum(peaks) / len(peaks), 1) if peaks else (temp_c or 20.0)
 
     # Региональный приоритет моделей и расчет целевой температуры (KB v8.0)
-    target_val, priority_model = get_priority_target(icao, models_max, avg_peak, raw_metar)
+    target_val, priority_model = get_priority_target(icao, models_max, avg_peak, raw_metar, local_dt=local_dt)
+    target_strike = get_strike_for_temp(target_val)
 
     # Расчет темпа прогрева и остатка инсоляции
     current_ts = asyncio.get_event_loop().time()
@@ -407,6 +414,7 @@ async def process_express_scan_callback(callback: CallbackQuery):
 
     orderbook_lines = []
     favorite_candidate = None
+    best_diff = 999.0
     basket_sum = 0.0
     is_overheated = False
 
@@ -417,8 +425,8 @@ async def process_express_scan_callback(callback: CallbackQuery):
             p_cents = item["price_cents"]
             title = item["title"]
 
-            # Ищем совпадение с целевой температурой
-            is_target = t_val is not None and abs(t_val - target_val) <= 0.6
+            # Ищем совпадение с расчетным страйком
+            is_target = (t_val is not None and t_val == target_strike)
             tag = " 🎯 <b>(ЦЕЛЬ)</b>" if is_target else ""
 
             orderbook_lines.append(f"• <code>{title}</code>: <b>{p_cents:.0f}¢</b> (${item['yes_price']:.2f}){tag}")
@@ -426,6 +434,12 @@ async def process_express_scan_callback(callback: CallbackQuery):
             if is_target:
                 favorite_candidate = item
                 basket_sum += p_cents
+                best_diff = 0.0
+            elif t_val is not None and favorite_candidate is None:
+                diff = abs(t_val - target_val)
+                if diff < best_diff and diff <= 0.7:
+                    best_diff = diff
+                    favorite_candidate = item
 
         if basket_sum >= 80.0 or (favorite_candidate and favorite_candidate["price_cents"] >= 80.0):
             is_overheated = True
@@ -479,15 +493,25 @@ async def process_express_scan_callback(callback: CallbackQuery):
             pos_verdict = (
                 f"⏱️ <b>ТАЙМ-СТОП (13:30 LT)</b> — Сброс в рынок для спасения остаточной стоимости! До полудня цель не пробита."
             )
-        # 3. Физический слом прогрева (10:30 - 15:00 LT, rate < 0.4°C/h под облачностью/дождем)
-        elif 10.5 <= local_time_val <= 15.0 and (rate_val < 0.4 and any(c in raw_metar for c in ["BKN", "OVC", "RA"])):
+        # 3. Физический слом:
+        # До 12:30 LT утреннее замедление или высокая облачность НЕ инвалидируют позицию!
+        elif local_time_val < 12.5:
+            if is_blocking_rain_and_clouds(raw_metar):
+                pos_verdict = (
+                    f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — На станцию вышли обложные осадки / плотный низкий Stratus!"
+                )
+            elif rate_val < 0.4 and local_dt.hour >= 9:
+                pos_verdict = (
+                    f"🟡 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННЯЯ ПАУЗА)</b> — Прогрев отстает, но солнечный полдень впереди (12:30–14:00 LT). Критической блокировки нет."
+                )
+            elif local_dt.hour < 9:
+                pos_verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННИЙ ПОЛ)</b> — До 09:00 LT идет предрассветное выхолаживание, старт инсоляции впереди."
+            else:
+                pos_verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> — Темп прогрева в норме, инсоляция работает по плану."
+        elif 12.5 <= local_time_val <= 15.0 and (rate_val < 0.4 and (has_real_low_cloud(raw_metar) or is_blocking_rain_and_clouds(raw_metar)) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
             pos_verdict = (
-                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — Темп прогрева затух (ниже +0.4°C/ч) и небо затянуло облачностью!"
+                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — После полудня темп затух под низкой облачностью, отставание от цели {target_temp - temp_c:.1f}°C критично!"
             )
-        # 4. Раннее утро (< 09:00 LT): ночной пол
-        elif local_dt.hour < 9:
-            pos_verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННИЙ ПОЛ)</b> — До 09:00 LT идет предрассветное выхолаживание, старт инсоляции впереди."
-        # 5. Нормальное удержание
         else:
             pos_verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> — Темп прогрева в норме, инсоляция работает по плану."
 
@@ -509,7 +533,7 @@ async def process_express_scan_callback(callback: CallbackQuery):
         }
 
     # 3. Выработка стратегии по правилам KB v7.1
-    is_rain = any(s in raw_metar for s in ["RA", "DZ", "TS", "SN"]) and "OVC" in raw_metar
+    is_rain = is_blocking_rain_and_clouds(raw_metar)
 
     if is_rain or is_overheated:
         strategy_block = (
@@ -517,15 +541,16 @@ async def process_express_scan_callback(callback: CallbackQuery):
             "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
         )
     elif favorite_candidate and 25.0 <= favorite_candidate["price_cents"] <= 48.0 and rem_hours >= 3.0:
+        fav_title = html.escape(str(favorite_candidate['title']))
         strategy_block = (
             f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b>\n"
-            f"• <b>Рекомендуемый исход:</b> <code>{favorite_candidate['title']}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b>)\n"
+            f"• <b>Рекомендуемый исход:</b> <code>{fav_title}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b>)\n"
             f"• <b>Запас инсоляции:</b> {rem_hours:.1f} ч | Приоритет: {priority_model}\n"
             f"• <b>Цель:</b> продажа токена толпе на дневном разгоне (+25%...+40% или 60¢–70¢), а не удержание до ночи!"
         )
     else:
         # Корзинный вход
-        base_t = int(round(target_val))
+        base_t = target_strike
         strategy_block = (
             f"🟢 <b>СИГНАЛ: СВЯЗКА КОРЗИНОЙ (MOMENTUM CASHOUT)</b>\n"
             f"• <b>Базовый страйк:</b> <code>{base_t}°C</code> + опцион <code>{base_t+1}°C</code> (сумма связки ≤ 75¢)\n"

@@ -174,18 +174,89 @@ def _calculate_dynamics(
     return rate_str, rem_hours_str, rate_val
 
 
+def get_cloud_ceiling_ft(raw_metar: str) -> Optional[int]:
+    """
+    Извлекает высоту нижней кромки сплошной/значительной облачности (BKN, OVC, VV) в футах.
+    Возвращает None, если сплошной облачности нет.
+    """
+    matches = re.findall(r"\b(?:OVC|BKN|VV)(\d{3})\b", raw_metar)
+    if not matches:
+        return None
+    return min(int(m) * 100 for m in matches)
+
+
+def has_real_low_cloud(raw_metar: str) -> bool:
+    """
+    Проверяет наличие реальной низкоярусной облачности (Stratus / Low Cloud <= 3000 ft),
+    которая эффективно блокирует прямую солнечную радиацию.
+    """
+    if "VV0" in raw_metar or " FG " in f" {raw_metar} ":
+        return True
+    ceiling = get_cloud_ceiling_ft(raw_metar)
+    return ceiling is not None and ceiling <= 3000
+
+
+def is_blocking_rain_and_clouds(raw_metar: str) -> bool:
+    """
+    Определяет, присутствуют ли настоящие обложные блокирующие осадки / плотный Stratus,
+    убивающие дневной радиационный прогрев.
+    - Высокая облачность (OVC100+ / 10 000+ ft) и кратковременная морось (-DZ / -RA) НЕ являются блокирующими.
+    - Блокирующими являются:
+      1) Плотный туман / вертикальная видимость (FG, VV001-003)
+      2) Сильный дождь (+RA, +DZ, +SN, TSRA)
+      3) Осадки (RA, DZ, SN) в сочетании с низкой слоистой облачностью (потолок <= 3500 ft)
+      4) Сплошной низкий Stratus (OVC <= 2000 ft) без просветов
+    """
+    ceiling = get_cloud_ceiling_ft(raw_metar)
+
+    if " FG " in f" {raw_metar} " or (ceiling is not None and ceiling <= 300):
+        return True
+
+    if any(s in raw_metar for s in ["+RA", "+DZ", "+SN", "TSRA", "+TSRA"]):
+        return True
+
+    has_precip = any(s in raw_metar for s in [" RA", " DZ", " SN", " -RA", " -DZ"])
+    if has_precip and (ceiling is not None and ceiling <= 3500):
+        return True
+
+    ovc_matches = re.findall(r"\bOVC(\d{3})\b", raw_metar)
+    if ovc_matches:
+        min_ovc = min(int(m) * 100 for m in ovc_matches)
+        if min_ovc <= 2000:
+            return True
+
+    return False
+
+
+def get_strike_for_temp(target_val: float) -> int:
+    """
+    Определяет целочисленный страйк Polymarket для непрерывной целевой температуры.
+    На метеостанциях (METAR) температура округляется по математическим правилам:
+    значения до .5 включительно (например, 19.0..19.5) чаще закрываются в нижний страйк (19°C),
+    а переход в верхний страйк (20°C) требует уверенного пробоя 19.6°C+.
+    Поэтому:
+    - если дробная часть < 0.6 (например, 19.0, 19.3, 19.4, 19.5) -> страйк 19°C
+    - если дробная часть >= 0.6 (например, 19.6..19.9) -> страйк 20°C
+    """
+    base = int(target_val)
+    fraction = target_val - base
+    if fraction >= 0.6:
+        return base + 1
+    return base
+
+
 def _get_city_physics_note(icao: str, raw_metar: str, temp_c: Optional[float], local_dt: datetime) -> str:
     """Возвращает актуальную синоптическую заметку на базе квант-законов KB v8.0."""
     wind_match = re.search(r"\b(\d{3})(\d{2,3})(?:G\d{2,3})?KT\b", raw_metar)
     wdir = int(wind_match.group(1)) if wind_match else None
     wspd = int(wind_match.group(2)) if wind_match else None
 
-    has_low_cloud = any(c in raw_metar for c in ["OVC0", "BKN0", "OVC01", "BKN01", "OVC02", "BKN02", "OVC03", "BKN03"])
+    has_low_cloud = has_real_low_cloud(raw_metar)
     has_cirrus = any(c in raw_metar for c in ["CI", "CS", "FEW2", "SCT2", "FEW3", "SCT3", "NCD", "CAVOK", "CLR", "SKC"])
-    has_rain = any(r in raw_metar for r in ["RA", "DZ", "TS", "SN"])
+    blocking_rain = is_blocking_rain_and_clouds(raw_metar)
 
-    if has_rain:
-        return "Осадки (дождь/морось): скрытое тепло испарения блокирует подъем температуры."
+    if blocking_rain:
+        return "Обложные осадки / плотный Stratus: скрытое тепло испарения блокирует подъем температуры."
 
     if icao == "EGLC":
         if wdir is not None and 50 <= wdir <= 120:
@@ -193,13 +264,15 @@ def _get_city_physics_note(icao: str, raw_metar: str, temp_c: Optional[float], l
         elif wdir is not None and 190 <= wdir <= 280:
             if wspd and wspd >= 20:
                 return "Шквалистый SW-ветер (≥20 kt): тепловой шлейф Лондона пробивает полосу транзитом (+1.2°C)."
-            return "SW-ветер несет городской остров тепла центра Лондона (UHI активен, опора на ICON+GFS)."
+            if wspd and wspd >= 8 and (9 <= local_dt.hour < 18):
+                return "SW-ветер несет городской остров тепла центра Лондона (UHI активен, опора на ICON+GFS)."
+            return "Слабый SW-ветер: UHI локализован, опора строго на лидер ICON."
         return "Лондон: стабильный радиационный прогрев при прозрачной атмосфере (лидер ICON)."
 
     elif icao == "LFPB":
-        calm_str = " (Штиль ≤4 kt: ламинарный перегрев +0.6°C)" if (wspd and wspd <= 4) else ""
+        calm_str = " (Штиль ≤4 kt: ламинарный перегрев +0.4°C)" if (wspd and wspd <= 4) else ""
         if has_cirrus and not has_low_cloud:
-            return f"Париж: перистые облака Cirrus не блокируют солнечную радиацию (пропускание свыше 85%). Лидер ICON.{calm_str}"
+            return f"Париж: перистые/высокие облака не блокируют солнечную радиацию (пропускание свыше 85%). Лидер ICON.{calm_str}"
         return f"Париж: приоритет ICON (MAE 0.40°C). Холодный дефект ECMWF (-1.04°C) игнорируется.{calm_str}"
 
     elif icao == "LIMC":
@@ -293,7 +366,13 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
     }
 
 
-def get_priority_target(icao: str, models: Dict[str, float], avg_peak: float, raw_metar: str = "") -> Tuple[float, str]:
+def get_priority_target(
+    icao: str,
+    models: Dict[str, float],
+    avg_peak: float,
+    raw_metar: str = "",
+    local_dt: Optional[datetime] = None,
+) -> Tuple[float, str]:
     """
     Определяет приоритетный целевой пик температуры на базе физических законов KB v8.0.
     Учитывает:
@@ -308,9 +387,10 @@ def get_priority_target(icao: str, models: Dict[str, float], avg_peak: float, ra
     wdir = int(wind_match.group(1)) if wind_match else None
     wspd = int(wind_match.group(2)) if wind_match else None
 
-    has_low_cloud = any(c in raw_metar for c in ["OVC0", "BKN0", "OVC01", "BKN01", "OVC02", "BKN02", "OVC03", "BKN03"])
+    has_low_cloud = has_real_low_cloud(raw_metar)
     has_cirrus = any(c in raw_metar for c in ["CI", "CS", "FEW2", "SCT2", "FEW3", "SCT3", "NCD", "CAVOK", "CLR", "SKC"])
     is_calm = wspd is not None and wspd <= 4
+    local_hour = local_dt.hour if local_dt else 12
 
     icon_val = models.get("icon_global")
     gfs_val = models.get("gfs_global")
@@ -327,11 +407,13 @@ def get_priority_target(icao: str, models: Dict[str, float], avg_peak: float, ra
             if wspd and wspd >= 20:
                 base = icon_val or avg_peak
                 return round(base + 1.0, 1), f"ICON+UHI ({base+1.0:.1f}°C, Шквал SW)"
-            if icon_val is not None and gfs_val is not None:
-                val = round((icon_val + gfs_val) / 2.0, 1)
-                return val, f"ICON+GFS ({val:.1f}°C, UHI активен)"
-            val = icon_val if icon_val is not None else (gfs_val if gfs_val is not None else avg_peak)
-            return val, f"ICON ({val:.1f}°C, UHI)"
+            # Ночью (< 09:00 LT) или при слабом ветре (< 8 kt) дневной UHI не активен!
+            if wspd and wspd >= 8 and (9 <= local_hour < 18):
+                if icon_val is not None and gfs_val is not None:
+                    val = round((icon_val + gfs_val) / 2.0, 1)
+                    return val, f"ICON+GFS ({val:.1f}°C, UHI активен)"
+            val = icon_val if icon_val is not None else avg_peak
+            return val, f"ICON ({val:.1f}°C, Умеренный SW)"
         else:
             val = icon_val if icon_val is not None else avg_peak
             return val, f"ICON ({val:.1f}°C, Лидер точности)"
@@ -405,21 +487,30 @@ def build_morning_city_block(city_data: Dict[str, Any]) -> str:
     icon_s = f"{models.get('icon_global', 'Н/Д')}°C"
     gem_s = f"{models.get('gem_global', 'Н/Д')}°C"
 
-    target_val, priority_name = _get_priority_target(icao, models, avg_peak, raw_metar)
+    target_val, priority_name = _get_priority_target(icao, models, avg_peak, raw_metar, local_dt=local_dt)
+    target_strike = get_strike_for_temp(target_val)
 
     # Проверка стакана на Sniper Momentum и Анти-Скип
     favorite_candidate = None
+    best_diff = 999.0
     is_overheated = False
     if orderbook:
         for item in orderbook:
             t_num = item.get("temp")
-            p_cents = item.get("price_cents", 0.0)
-            if t_num is not None and abs(t_num - target_val) <= 0.6:
+            if t_num is None:
+                continue
+            diff = abs(t_num - target_val)
+            if t_num == target_strike:
                 favorite_candidate = item
-                if p_cents >= 80.0:
-                    is_overheated = True
+                best_diff = 0.0
+            elif diff < best_diff and diff <= 0.7 and favorite_candidate is None:
+                best_diff = diff
+                favorite_candidate = item
 
-    is_rain = any(s in raw_metar for s in ["RA", "DZ", "TS", "SN"]) and "OVC" in raw_metar
+        if favorite_candidate and favorite_candidate.get("price_cents", 0.0) >= 80.0:
+            is_overheated = True
+
+    is_rain = is_blocking_rain_and_clouds(raw_metar)
     if is_rain:
         status_line = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> — Обложные осадки глушат дневную радиацию."
     elif is_overheated:
@@ -509,15 +600,25 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
             verdict = (
                 f"⏱️ <b>ТАЙМ-СТОП (13:30 LT)</b> — Сброс в рынок для спасения остаточной стоимости! До полудня цель не пробита."
             )
-        # 3. Триггер Физического слома: СТРОГО в диапазоне дневной инсоляции (10:30 LT - 15:00 LT)
-        elif 10.5 <= local_time_val <= 15.0 and (rate_val < 0.4 and any(c in raw_metar for c in ["BKN", "OVC", "RA"])):
+        # 3. Триггер Физического слома:
+        # ВАЖНО: До 12:30 LT утреннее замедление или высокая облачность НЕ инвалидируют позицию!
+        elif local_time_val < 12.5:
+            if is_blocking_rain_and_clouds(raw_metar):
+                verdict = (
+                    f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — На станцию вышли обложные осадки / плотный низкий Stratus!"
+                )
+            elif rate_val < 0.4 and local_hour >= 9:
+                verdict = (
+                    f"🟡 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННЯЯ ПАУЗА)</b> — Прогрев отстает, но солнечный полдень впереди (12:30–14:00 LT). Критической блокировки нет."
+                )
+            elif local_hour < 9:
+                verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННИЙ ПОЛ)</b> — До 09:00 LT идет предрассветное выхолаживание, старт инсоляции впереди."
+            else:
+                verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> — Темп прогрева в норме, инсоляция работает по плану."
+        elif 12.5 <= local_time_val <= 15.0 and (rate_val < 0.4 and (has_real_low_cloud(raw_metar) or is_blocking_rain_and_clouds(raw_metar)) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
             verdict = (
-                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — Темп прогрева затух (ниже +0.4°C/ч) и небо затянуло облачностью!"
+                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — После полудня темп затух под низкой облачностью, отставание от цели {target_temp - temp_c:.1f}°C критично!"
             )
-        # 4. Раннее утро (LT < 09:00): ночное выхолаживание не инвалидирует позу
-        elif local_hour < 9:
-            verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННИЙ ПОЛ)</b> — До 09:00 LT идет предрассветное выхолаживание, старт инсоляции впереди."
-        # 5. Нормальное удержание
         else:
             verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> — Темп прогрева в норме, инсоляция работает по плану."
 
@@ -525,24 +626,32 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
 
     # СЦЕНАРИЙ 2: Позиции нет — оцениваем общий статус рынка
     else:
-        is_overcast = any(c in raw_metar for c in ["OVC", "RA", "DZ"])
-        has_heavy_rain = any(c in raw_metar for c in ["RA", "DZ", "TS", "SN"]) and "OVC" in raw_metar
+        has_blocking_weather = is_blocking_rain_and_clouds(raw_metar)
 
-        target_val, priority_name = _get_priority_target(icao, models, avg_peak, raw_metar)
+        target_val, priority_name = _get_priority_target(icao, models, avg_peak, raw_metar, local_dt=local_dt)
+        target_strike = get_strike_for_temp(target_val)
         fav_candidate = None
+        best_diff = 999.0
         is_overheated = False
         if orderbook:
             for item in orderbook:
                 t_num = item.get("temp")
-                p_cents = item.get("price_cents", 0.0)
-                if t_num is not None and abs(t_num - target_val) <= 0.6:
+                if t_num is None:
+                    continue
+                diff = abs(t_num - target_val)
+                if t_num == target_strike:
                     fav_candidate = item
-                    if p_cents >= 80.0:
-                        is_overheated = True
+                    best_diff = 0.0
+                elif diff < best_diff and diff <= 0.7 and fav_candidate is None:
+                    best_diff = diff
+                    fav_candidate = item
+
+            if fav_candidate and fav_candidate.get("price_cents", 0.0) >= 80.0:
+                is_overheated = True
 
         # 1. Раннее утро (LT < 09:00): расчет темпа не переводит в СКИП!
         if local_hour < 9:
-            if has_heavy_rain:
+            if has_blocking_weather:
                 status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Обложные осадки глушат утреннюю радиацию)"
             else:
                 status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Ожидание старта инсоляции)"
@@ -553,9 +662,10 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
 
         # 3. Активный дневной диапазон инсоляции (10:30 LT - 15:00 LT):
         elif 10.5 <= local_time_val <= 15.0:
-            is_cloudy = any(c in raw_metar for c in ["BKN", "OVC", "RA", "DZ"])
-            if rate_val < 0.4 and is_cloudy:
-                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Физический слом: темп ниже +0.4°C/ч и натекание облачности)"
+            if has_blocking_weather:
+                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Обложные осадки / плотный Stratus блокируют прогрев)"
+            elif local_time_val >= 12.5 and rate_val < 0.4 and has_real_low_cloud(raw_metar):
+                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Физический слом: после полудня темп ниже +0.4°C/ч под слоистой облачностью)"
             elif is_overheated:
                 status_desc = (
                     "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
@@ -575,7 +685,7 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
 
         # 4. Промежуток 09:00 - 10:30 LT (первый разогрев после восхода):
         else:
-            if has_heavy_rain:
+            if has_blocking_weather:
                 status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Осадки блокируют утренний прогрев)"
             elif is_overheated:
                 status_desc = (
