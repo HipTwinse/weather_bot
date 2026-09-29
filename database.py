@@ -5,7 +5,7 @@
 
 import sqlite3
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 DB_PATH = Path(__file__).resolve().parent / "positions.db"
 
@@ -33,6 +33,13 @@ def init_db() -> None:
             cursor.execute("ALTER TABLE user_positions ADD COLUMN entry_price REAL DEFAULT 0.0")
         if "status" not in existing_cols:
             cursor.execute("ALTER TABLE user_positions ADD COLUMN status TEXT DEFAULT 'OPEN'")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
 
 
@@ -88,3 +95,38 @@ def delete_position(position_id: int, user_id: int) -> bool:
         """, (position_id, user_id))
         conn.commit()
         return cursor.rowcount > 0
+
+
+def set_bot_state(key: str, value: str) -> None:
+    """Сохраняет строковое значение состояния бота в SQLite."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            INSERT INTO bot_state (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        """, (key, str(value)))
+        conn.commit()
+
+
+def get_bot_state(key: str) -> Optional[str]:
+    """Считывает значение состояния бота из SQLite."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("SELECT value FROM bot_state WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row[0] if row else None

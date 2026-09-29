@@ -37,7 +37,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
 from airport_resolver import resolve_airport
-from database import get_all_active_positions
+from database import get_all_active_positions, set_bot_state, get_bot_state
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
 from polymarket_service import find_city_weather_event, parse_markets_orderbook, get_current_outcome_price, extract_temp_value
@@ -707,20 +707,44 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
     return "\n".join(lines)
 
 
-async def _safe_send_digest(bot: Bot, chat_id: int, message_html: str, reply_markup=None) -> bool:
+# Словарь для отслеживания ID последнего отправленного дайджеста для каждого чата
+_LAST_DIGEST_MESSAGE_IDS: Dict[int, int] = {}
+
+
+async def _safe_send_digest(
+    bot: Bot,
+    chat_id: int,
+    message_html: str,
+    reply_markup=None,
+    delete_previous: bool = True
+) -> bool:
     """
-    Надёжная отправка дайджеста с автоматической санитизацией HTML
+    Надёжная отправка дайджеста с автоматической санитизацией HTML,
+    удалением предыдущего 30-минутного сообщения дайджеста
     и аварийным fallback на Plain-Text без потери данных.
     """
     safe_text = sanitize_telegram_html(message_html)
+
+    # 1. Извлекаем ID предыдущего сообщения дайджеста для этого чата
+    prev_msg_id = _LAST_DIGEST_MESSAGE_IDS.get(chat_id)
+    if not prev_msg_id:
+        try:
+            stored = get_bot_state(f"last_digest_msg_{chat_id}")
+            if stored and stored.isdigit():
+                prev_msg_id = int(stored)
+        except Exception:
+            pass
+
+    sent_msg = None
+    send_success = False
     try:
-        await bot.send_message(
+        sent_msg = await bot.send_message(
             chat_id=chat_id,
             text=safe_text,
             parse_mode="HTML",
             reply_markup=reply_markup,
         )
-        return True
+        send_success = True
     except Exception as html_err:
         logger.warning(
             f"⚠️ Ошибка отправки HTML-дайджеста в чат {chat_id}: {html_err}. "
@@ -729,17 +753,40 @@ async def _safe_send_digest(bot: Bot, chat_id: int, message_html: str, reply_mar
         try:
             plain_text = re.sub(r"<[^>]+>", "", message_html)
             plain_text = html.unescape(plain_text)
-            await bot.send_message(
+            sent_msg = await bot.send_message(
                 chat_id=chat_id,
                 text=plain_text,
                 parse_mode=None,
                 reply_markup=reply_markup,
             )
             logger.info(f"✅ Дайджест успешно доставлен в чат {chat_id} через Plain-Text fallback.")
-            return True
+            send_success = True
         except Exception as plain_err:
             logger.error(f"❌ Критический сбой отправки дайджеста в чат {chat_id}: {plain_err}")
             return False
+
+    if send_success:
+        # 2. Если новый дайджест успешно доставлен — удаляем старый, чтобы не захламлять чат
+        if delete_previous and prev_msg_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=prev_msg_id)
+                logger.info(f"🗑️ Предыдущий дайджест (ID: {prev_msg_id}) удален в чате {chat_id}.")
+            except Exception as del_err:
+                logger.debug(f"Не удалось удалить старое сообщение дайджеста {prev_msg_id} в чате {chat_id}: {del_err}")
+
+        # 3. Фиксируем ID нового отправленного дайджеста
+        if sent_msg is not None:
+            msg_id = getattr(sent_msg, "message_id", None)
+            if isinstance(msg_id, int):
+                _LAST_DIGEST_MESSAGE_IDS[chat_id] = msg_id
+                try:
+                    set_bot_state(f"last_digest_msg_{chat_id}", str(msg_id))
+                except Exception as db_err:
+                    logger.warning(f"Не удалось сохранить ID дайджеста в SQLite: {db_err}")
+
+        return True
+
+    return False
 
 
 async def send_consolidated_digest(

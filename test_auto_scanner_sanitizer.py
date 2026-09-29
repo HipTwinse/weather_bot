@@ -65,3 +65,41 @@ def test_safe_send_digest_fallback_on_html_failure():
     assert fallback_call.kwargs["chat_id"] == 12345
     assert fallback_call.kwargs["parse_mode"] is None
     assert "Important: alert <+0.4°C" in fallback_call.kwargs["text"]
+
+
+def test_safe_send_digest_deletes_previous_message():
+    from auto_scanner import _LAST_DIGEST_MESSAGE_IDS
+    from database import set_bot_state
+    test_chat = 88888
+    _LAST_DIGEST_MESSAGE_IDS.pop(test_chat, None)
+    set_bot_state(f"last_digest_msg_{test_chat}", "")
+
+    bot = MagicMock()
+    msg1 = MagicMock()
+    msg1.message_id = 501
+    msg2 = MagicMock()
+    msg2.message_id = 502
+
+    bot.send_message = AsyncMock(side_effect=[msg1, msg2])
+    bot.delete_message = AsyncMock()
+
+    # 1. Первый дайджест — удалять нечего
+    res1 = asyncio.run(_safe_send_digest(bot, test_chat, "Дайджест 1"))
+    assert res1 is True
+    bot.delete_message.assert_not_called()
+    assert _LAST_DIGEST_MESSAGE_IDS[test_chat] == 501
+
+    # 2. Второй дайджест — удаляет msg1 (ID: 501)
+    res2 = asyncio.run(_safe_send_digest(bot, test_chat, "Дайджест 2"))
+    assert res2 is True
+    bot.delete_message.assert_called_once_with(chat_id=test_chat, message_id=501)
+    assert _LAST_DIGEST_MESSAGE_IDS[test_chat] == 502
+
+
+def test_bot_state_persistence():
+    from database import set_bot_state, get_bot_state
+    set_bot_state("test_key_123", "test_val_456")
+    assert get_bot_state("test_key_123") == "test_val_456"
+    set_bot_state("test_key_123", "updated_val")
+    assert get_bot_state("test_key_123") == "updated_val"
+    assert get_bot_state("non_existent_key_999") is None
