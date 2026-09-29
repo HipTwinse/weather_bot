@@ -13,6 +13,7 @@ import asyncio
 from datetime import datetime
 import html
 import json
+import time
 import logging
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -52,7 +53,13 @@ from weather_synthesizer import (
     build_summary_caption,
     synthesize_forecast,
 )
-from gemini_analyzer import analyze_city_weather_ai, is_gemini_configured, get_gemini_status
+from gemini_analyzer import (
+    analyze_city_weather_ai,
+    is_gemini_configured,
+    get_gemini_status,
+    daily_tracker,
+    compute_weather_delta,
+)
 from auto_scanner import (
     get_priority_target,
     _calculate_dynamics,
@@ -557,8 +564,39 @@ async def process_express_scan_callback(callback: CallbackQuery):
             f"• <b>Тейк-профит:</b> Сброс корзины лимитными ордерами при росте на +25%...+40% до 13:30 LT."
         )
 
+    # 2.2. Проверка истории анализов за сегодня (Сценарий Г)
+    prev_snapshot = daily_tracker.get_latest(user_id or 0, icao, target_date)
+    current_snapshot = {
+        "timestamp": time.time(),
+        "time_str": local_dt.strftime("%H:%M LT"),
+        "target_date": target_date,
+        "temp_c": temp_c,
+        "raw_metar": raw_metar,
+        "rate_str": rate_str,
+        "rate_val": rate_val,
+        "rem_hours_str": rem_hours_str,
+        "orderbook": orderbook,
+        "user_position": pos_info,
+    }
+
+    analysis_delta = None
+    update_banner = ""
+    if prev_snapshot:
+        analysis_delta = compute_weather_delta(prev_snapshot, current_snapshot)
+        elapsed_min_val = analysis_delta.get("elapsed_min", 0)
+        elapsed_str = f"{elapsed_min_val} мин" if elapsed_min_val >= 1 else "менее 1 мин"
+        pos_delta_line = f"\n💼 <b>Сделка:</b> {analysis_delta['pos_delta_str']}" if analysis_delta.get("pos_delta_str") else ""
+        update_banner = (
+            f"🔄 <b>ОБНОВЛЕНИЕ АНАЛИЗА: {city_label}</b>\n"
+            f"🕒 <i>Срез {analysis_delta['time_curr']} относительно {analysis_delta['time_prev']} (прошло {elapsed_str})</i>\n"
+            f"📊 <b>Динамика:</b> {analysis_delta['temp_prev']}°C ➔ {analysis_delta['temp_curr']}°C ({analysis_delta['temp_diff_str']}) | Темп: {analysis_delta['interval_rate_str']}\n"
+            f"📈 <b>Стакан:</b> {analysis_delta['orderbook_shifts_str']}{pos_delta_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+
     response_text = (
-        (pos_header if pos_header else "")
+        update_banner
+        + (pos_header if pos_header else "")
         + f"⚡ <b>ЭКСПРЕСС-АНАЛИЗ: {city_label}</b>\n"
         + f"🕒 <i>Время: {local_dt.strftime('%H:%M')} LT | Дата: {target_date}</i>\n\n"
         + f"🌡️ <b>Факт METAR:</b> <code>{temp_c if temp_c is not None else 'Н/Д'}°C</code>\n"
@@ -600,14 +638,21 @@ async def process_express_scan_callback(callback: CallbackQuery):
             "rem_hours_str": rem_hours_str,
             "orderbook": orderbook,
             "user_position": pos_info,
+            "user_id": user_id or 0,
+            "target_date": target_date,
+            "previous_analysis": prev_snapshot,
+            "analysis_delta": analysis_delta,
         }
         try:
-            scenario_code = "B" if pos_info else "A"
+            scenario_code = "G" if prev_snapshot else ("B" if pos_info else "A")
             ai_verdict = await analyze_city_weather_ai(city_pack, scenario=scenario_code)
             if ai_verdict:
                 response_text = ai_verdict
         except Exception as e:
             logger.warning(f"Ошибка вызова Gemini AI: {e}")
+
+    # Фиксируем актуальный срез в трекере дня
+    daily_tracker.record(user_id or 0, icao, target_date, current_snapshot)
 
     # Защита от лимита длины сообщения Telegram (4096 символов)
     if len(response_text) > 4000:

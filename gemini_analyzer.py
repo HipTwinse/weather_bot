@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import logging
 import aiohttp
 from typing import Dict, Any, Optional, List
@@ -13,11 +14,12 @@ SYSTEM_PROMPT_V8_0 = """Ты — Weather Alpha Engine v8.0: квант-сино�
 Твоя цель — винрейт 95%+ за счет строгой микрофизики атмосферы (солнечная радиация, оптические ярусы облаков, турбулентное вымывание, энтальпия испарения), исключения системных дефектов моделей (ECMWF в Париже/Милане, GFS в Мадриде), математического преимущества раннего входа (Time-Zone Edge) и фиксации прибыли на дневном импульсе толпы (Momentum Cashout).
 
 ================================================================================
-1. АВТОМАТИЧЕСКИЙ ВЫБОР РЕЖИМА (СЦЕНАРИИ А, Б, В)
+1. АВТОМАТИЧЕСКИЙ ВЫБОР РЕЖИМА (СЦЕНАРИИ А, Б, В, Г)
 ================================================================================
-- СЦЕНАРИЙ А (НОВЫЙ ВХОД / УТРЕННИЙ РАЗБОР): Активируется при анализе дня, когда у пользователя нет открытой сделки по городу.
+- СЦЕНАРИЙ А (НОВЫЙ ВХОД / УТРЕННИЙ РАЗБОР): Активируется при первичном анализе дня, когда у пользователя нет открытой сделки по городу.
 - СЦЕНАРИЙ Б (ВНУТРИДНЕВНОЙ МОНИТОРИНГ / КОНТРОЛЬ ОТКРЫТОЙ ПОЗИЦИИ): Активируется, если у пользователя есть открытая сделка («💼 ВАША ОТКРЫТАЯ ПОЗИЦИЯ») или по триггерам мониторинга («Держим?», «Статус», «Динамика»). Задача — сопоставить цену входа с текущим стаканом, оценить производную темпа прогрева и выдать однозначный вердикт: 🟢 ДЕРЖАТЬ ПОЗИЦИЮ / 🚨 ТЕЙК-ПРОФИТ (ВЫХОДИ ЛИМИТКОЙ) / ⏱️ ТАЙМ-СТОП (13:30 LT) / 🛑 ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ).
 - СЦЕНАРИЙ В (АВТОПРОВЕРКА И ПРАКТИЧЕСКИЙ АУДИТ): Активируется отправкой факта дня («Факт», «Итог», «Закрылся на X»). Сверяет результат и выдает понятный практический урок трейдеру.
+- СЦЕНАРИЙ Г (ПОВТОРНЫЙ ЗАПРОС / ДНЕВНОЕ ОБНОВЛЕНИЕ): Активируется, если в этот же день ранее уже выполнялся анализ по этому городу (передан блок «🔄 ДНЕВНОЕ ОБНОВЛЕНИЕ / СРАВНЕНИЕ С ПРОШЛЫМ АНАЛИЗОМ»). Задача — оценить дельту (что изменилось за прошедшее время): факт изменения температуры (ускорился ли прогрев или захлебнулся), сдвиг цен в стакане Polymarket, динамику позиции и обновить вердикт относительно утреннего прогноза.
 
 ================================================================================
 2. 5 ФУНДАМЕНТАЛЬНЫХ ЗАКОНОВ МИКРОФИЗИКИ (KB v8.0)
@@ -140,16 +142,22 @@ SYSTEM_PROMPT_V8_0 = """Ты — Weather Alpha Engine v8.0: квант-сино�
 - До ночи не держать! Сброс только лимитными ордерами в стакан покупателей.
 
 ================================================================================
-7. ФОРМАТ ВЫДАЧИ ОТВЕТА (СЦЕНАРИИ А И Б)
+7. ФОРМАТ ВЫДАЧИ ОТВЕТА (СЦЕНАРИИ А, Б, Г)
 ================================================================================
 Форматируй ответ строго в разметке Telegram HTML (<b>жирный</b>, <i>курсив</i>, <code>код</code>). НЕ используй звездочки markdown (**).
 
-А) ЕСЛИ У ТРЕЙДЕРА ЕСТЬ ОТКРЫТАЯ ПОЗИЦИЯ (ПЕРЕДАН БЛОК «💼 ВАША ОТКРЫТАЯ ПОЗИЦИЯ»):
+А) ПРИ ПОВТОРНОМ ЗАПРОСЕ (ОБНОВЛЕНИЕ АНАЛИЗА В ТЕЧЕНИЕ ДНЯ, СЦЕНАРИЙ Г):
+В самом начале сообщения перед всеми остальными блоками СТРОГО выводи:
+🔄 <b>ОБНОВЛЕНИЕ АНАЛИЗА: [Город]</b> (срез [HH:MM] LT относительно [HH:MM] LT, прошло [X] мин)
+📊 <b>ДИНАМИКА ЗА [X] МИН:</b> Факт: [T1]°C ➔ [T2]°C ([+/-dT]°C) | Темп: [Rate] | Стакан: [ключевые сдвиги цен]
+(Если у трейдера есть открытая позиция — сразу следующими строками выводи плашку «💼 ВАША ПОЗИЦИЯ: ...» и «👉 ВЕРДИКТ ПОЗИЦИИ: ...»).
+
+Б) ЕСЛИ У ТРЕЙДЕРА ЕСТЬ ОТКРЫТАЯ ПОЗИЦИЯ (ПЕРЕДАН БЛОК «💼 ВАША ОТКРЫТАЯ ПОЗИЦИЯ», ПЕРВИЧНЫЙ ЗАПРОС, СЦЕНАРИЙ Б):
 Начинай СТРОГО с двух главных плашек:
 💼 <b>ВАША ПОЗИЦИЯ:</b> <code>[Исход]</code> (вход: <code>[X]¢</code> | сейчас в стакане: <code>[Y]¢</code> | PnL: <b>[+/-Z]%</b>)
 👉 <b>ВЕРДИКТ ПОЗИЦИИ:</b> <b>[ДЕРЖАТЬ ПОЗИЦИЮ / ТЕЙК-ПРОФИТ (ВЫХОДИ ЛИМИТКОЙ) / ТАЙМ-СТОП (13:30 LT) / ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)]</b> — [Краткое обоснование: темп прогрева, оставшееся солнце, поведение стакана].
 
-Б) ЕСЛИ ОТКРЫТОЙ ПОЗИЦИИ НЕТ (НОВЫЙ ВХОД, СЦЕНАРИЙ А):
+В) ЕСЛИ ОТКРЫТОЙ ПОЗИЦИИ НЕТ (ПЕРВИЧНЫЙ ВХОД, СЦЕНАРИЙ А):
 Начинай со стандартной плашки сигнала:
 🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b> (если фаворит в диапазоне 25¢–48¢)
 или
@@ -220,6 +228,166 @@ SYSTEM_PROMPT_V8_0 = """Ты — Weather Alpha Engine v8.0: квант-сино�
 """
 
 SYSTEM_PROMPT_V7_4 = SYSTEM_PROMPT_V8_0
+
+
+class DailyAnalysisTracker:
+    """
+    Хранит историю анализов в течение текущего дня в разрезе (user_id, icao, date_str).
+    Обеспечивает контекст повторного запроса в один и тот же день (Сценарий Г)
+    и автоматически сбрасывает историю при наступлении нового дня.
+    """
+    def __init__(self):
+        # Ключ: (user_id, icao, date_str) -> snapshot dict
+        self._history: Dict[tuple, Dict[str, Any]] = {}
+
+    def cleanup_old_dates(self, current_date_str: str) -> None:
+        """Сбрасывает историю за предыдущие дни."""
+        if not current_date_str:
+            return
+        keys_to_delete = [k for k in self._history if k[2] != current_date_str]
+        for k in keys_to_delete:
+            del self._history[k]
+
+    def record(self, user_id: int, icao: str, date_str: str, snapshot: Dict[str, Any]) -> None:
+        """Сохраняет актуальный срез анализа по городу."""
+        if not icao or not date_str:
+            return
+        self.cleanup_old_dates(date_str)
+        uid = int(user_id or 0)
+        icao_clean = icao.upper().strip()
+        self._history[(uid, icao_clean, date_str)] = snapshot
+        if uid != 0:
+            self._history[(0, icao_clean, date_str)] = snapshot
+
+    def get_latest(self, user_id: int, icao: str, date_str: str) -> Optional[Dict[str, Any]]:
+        """
+        Возвращает предыдущий срез анализа для пользователя в этот же день.
+        Если персонального среза нет, пробует взять общий срез.
+        """
+        if not icao or not date_str:
+            return None
+        self.cleanup_old_dates(date_str)
+        uid = int(user_id or 0)
+        icao_clean = icao.upper().strip()
+
+        # 1. Персональный поиск
+        key = (uid, icao_clean, date_str)
+        if key in self._history:
+            return self._history[key]
+
+        # 2. Поиск общего среза
+        if uid != 0:
+            gen_key = (0, icao_clean, date_str)
+            if gen_key in self._history:
+                return self._history[gen_key]
+
+        return None
+
+    def clear_all(self) -> None:
+        """Сброс всей истории (для тестов)."""
+        self._history.clear()
+
+
+daily_tracker = DailyAnalysisTracker()
+
+
+def compute_orderbook_shifts(prev_ob: List[Dict[str, Any]], curr_ob: List[Dict[str, Any]]) -> str:
+    """
+    Сопоставляет котировки стакана Polymarket между двумя замерами.
+    Возвращает строку со списком сдвигов цен >= 1.0¢.
+    """
+    if not prev_ob or not curr_ob:
+        return "стакан без изменений"
+
+    prev_map = {}
+    for item in prev_ob:
+        k = item.get("title") or item.get("temp")
+        if k is not None:
+            prev_map[str(k).strip()] = item.get("price_cents", 0.0)
+
+    shifts = []
+    for item in curr_ob:
+        k = item.get("title") or item.get("temp")
+        if k is None:
+            continue
+        k_str = str(k).strip()
+        if k_str in prev_map:
+            p_prev = prev_map[k_str]
+            p_curr = item.get("price_cents", 0.0)
+            diff = p_curr - p_prev
+            if abs(diff) >= 1.0:
+                short_title = k_str.replace("°C", "")
+                if short_title.isdigit() or (short_title.startswith("-") and short_title[1:].isdigit()):
+                    short_title = f"{short_title}°C"
+                shifts.append(f"{short_title}: {p_prev:.0f}¢ ➔ {p_curr:.0f}¢ ({diff:+.0f}¢)")
+
+    if not shifts:
+        return "без существенных изменений цен"
+
+    return ", ".join(shifts)
+
+
+def compute_weather_delta(prev_snap: Dict[str, Any], curr_snap: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Вычисляет динамику и дельту между прошлым и текущим срезом анализа.
+    """
+    t_prev_ts = prev_snap.get("timestamp", 0.0)
+    t_curr_ts = curr_snap.get("timestamp", time.time())
+    elapsed_sec = max(0.0, t_curr_ts - t_prev_ts)
+    elapsed_min = int(round(elapsed_sec / 60.0))
+
+    time_prev = prev_snap.get("time_str", "Н/Д")
+    time_curr = curr_snap.get("time_str", "Н/Д")
+
+    temp_prev = prev_snap.get("temp_c")
+    temp_curr = curr_snap.get("temp_c")
+
+    temp_diff = 0.0
+    temp_diff_str = "0.0°C"
+    if temp_prev is not None and temp_curr is not None:
+        temp_diff = round(float(temp_curr) - float(temp_prev), 1)
+        temp_diff_str = f"{temp_diff:+.1f}°C"
+
+    # Расчет темпа прогрева на интервале (dT / dt)
+    if elapsed_min >= 5 and temp_prev is not None and temp_curr is not None:
+        rate_interval = round(temp_diff / (elapsed_min / 60.0), 2)
+        interval_rate_str = f"{rate_interval:+.2f}°C/ч"
+    else:
+        interval_rate_str = curr_snap.get("rate_str", "Н/Д")
+
+    # Сдвиги стакана
+    prev_ob = prev_snap.get("orderbook", [])
+    curr_ob = curr_snap.get("orderbook", [])
+    ob_shifts_str = compute_orderbook_shifts(prev_ob, curr_ob)
+
+    # Динамика позиции пользователя
+    pos_delta_str = ""
+    prev_pos = prev_snap.get("user_position")
+    curr_pos = curr_snap.get("user_position")
+    if prev_pos and curr_pos:
+        p1 = float(prev_pos.get("cur_price") or 0.0)
+        p2 = float(curr_pos.get("cur_price") or 0.0)
+        pnl1 = prev_pos.get("pnl_str", "0%")
+        pnl2 = curr_pos.get("pnl_str", "0%")
+        outcomes = curr_pos.get("outcomes", "")
+        pos_delta_str = f"{outcomes}: цена {p1:.0f}¢ ➔ {p2:.0f}¢, PnL {pnl1} ➔ {pnl2}"
+
+    return {
+        "is_update": True,
+        "elapsed_min": elapsed_min,
+        "time_prev": time_prev,
+        "time_curr": time_curr,
+        "temp_prev": temp_prev,
+        "temp_curr": temp_curr,
+        "temp_diff": temp_diff,
+        "temp_diff_str": temp_diff_str,
+        "rate_prev": prev_snap.get("rate_str", "Н/Д"),
+        "rate_curr": curr_snap.get("rate_str", "Н/Д"),
+        "interval_rate_str": interval_rate_str,
+        "orderbook_shifts_str": ob_shifts_str,
+        "pos_delta_str": pos_delta_str,
+    }
+
 
 # Переменная для отслеживания последней успешно ответившей модели Gemini
 _LAST_SUCCESSFUL_MODEL: Optional[str] = None
@@ -481,7 +649,62 @@ async def analyze_city_weather_ai(city_data: Dict[str, Any], scenario: str = "A"
 2. В разделе 4 («ТОРГОВЫЙ ПЛАН») четко расписать план выхода или фиксации прибыли по этой сделке!
 """
 
-    prompt_scenario = "Б (ВНУТРИДНЕВНОЙ МОНИТОРИНГ И ВЕРДИКТ ПОЗИЦИИ)" if user_position else f"{scenario} (Строго по правилам Weather Alpha Engine v8.0)"
+    user_id = city_data.get("user_id", 0)
+    target_date = city_data.get("target_date") or (local_dt.strftime("%Y-%m-%d") if local_dt else None)
+
+    # Текущий снимок для истории и сравнения
+    current_snapshot = {
+        "timestamp": time.time(),
+        "time_str": local_dt.strftime("%H:%M LT") if local_dt else "Н/Д",
+        "target_date": target_date,
+        "temp_c": temp_c,
+        "raw_metar": raw_metar,
+        "rate_str": rate_str,
+        "rate_val": city_data.get("rate_val", 0.0),
+        "rem_hours_str": rem_hours_str,
+        "orderbook": orderbook,
+        "user_position": user_position,
+    }
+
+    # Проверяем, есть ли предыдущий срез в этот же день
+    prev_snapshot = city_data.get("previous_analysis")
+    if not prev_snapshot and target_date and icao != "Н/Д":
+        prev_snapshot = daily_tracker.get_latest(user_id, icao, target_date)
+
+    is_day_update = False
+    delta_info: Optional[Dict[str, Any]] = None
+    update_prompt_block = ""
+
+    if prev_snapshot:
+        delta_info = city_data.get("analysis_delta") or compute_weather_delta(prev_snapshot, current_snapshot)
+        is_day_update = True
+        elapsed_min_val = delta_info.get("elapsed_min", 0)
+        elapsed_display = f"{elapsed_min_val} мин" if elapsed_min_val >= 1 else "менее 1 мин"
+
+        update_prompt_block = f"""
+🔄 ДНЕВНОЕ ОБНОВЛЕНИЕ / СРАВНЕНИЕ С ПРОШЛЫМ АНАЛИЗОМ:
+• Это ПОВТОРНЫЙ запрос анализа по городу {city_name} за сегодня ({target_date}).
+• Прошлый анализ был сделан в {delta_info['time_prev']} ({elapsed_display} назад). Сейчас: {delta_info['time_curr']}.
+• Динамика температуры METAR: с {delta_info['temp_prev']}°C до {delta_info['temp_curr']}°C ({delta_info['temp_diff_str']}).
+• Темп прогрева на интервале: {delta_info['interval_rate_str']} (ранее общий темп был: {delta_info['rate_prev']}, сейчас: {delta_info['rate_curr']}).
+• Сдвиги в стакане цен Polymarket: {delta_info['orderbook_shifts_str']}.
+{f"• Динамика вашей позиции: {delta_info['pos_delta_str']}" if delta_info.get('pos_delta_str') else ""}
+
+ОБЯЗАТЕЛЬНО:
+1. Выполни анализ по СЦЕНАРИЮ Г (ПОВТОРНЫЙ ЗАПРОС / ДНЕВНОЕ ОБНОВЛЕНИЕ).
+2. Начни ответ СТРОГО с плашки обновления:
+🔄 <b>ОБНОВЛЕНИЕ АНАЛИЗА: {city_name}</b> (срез {delta_info['time_curr']} относительно {delta_info['time_prev']}, прошло {elapsed_display})
+📊 <b>ДИНАМИКА ЗА {elapsed_display.upper()}:</b> Факт: {delta_info['temp_prev']}°C ➔ {delta_info['temp_curr']}°C ({delta_info['temp_diff_str']}) | Темп: {delta_info['interval_rate_str']} | Стакан: {delta_info['orderbook_shifts_str']}
+3. Если у трейдера есть открытая позиция — сразу следующими строками выводи блок «💼 ВАША ПОЗИЦИЯ: ...» и «👉 ВЕРДИКТ ПОЗИЦИИ: ...».
+4. Сравни текущую ситуацию с утренней: прогрев идет с опережением или затухает? Подтверждается ли утренний страйк, или рынок начал переоценивать другой исход? Что делать с позицией (если открыта)?
+"""
+
+    if is_day_update:
+        prompt_scenario = "Г (ПОВТОРНЫЙ ЗАПРОС / ДНЕВНОЕ ОБНОВЛЕНИЕ АНАЛИЗА)"
+    elif user_position:
+        prompt_scenario = "Б (ВНУТРИДНЕВНОЙ МОНИТОРИНГ И ВЕРДИКТ ПОЗИЦИИ)"
+    else:
+        prompt_scenario = f"{scenario} (Строго по правилам Weather Alpha Engine v8.0)"
 
     user_prompt = f"""
 ВХОДНОЙ МЕТЕОПАКЕТ И СТАКАН ДЛЯ АНАЛИЗА:
@@ -494,6 +717,7 @@ async def analyze_city_weather_ai(city_data: Dict[str, Any], scenario: str = "A"
 • Ярусы облаков: {cloud_tier_str}
 • Статус осадков: {rain_desc}
 • Темп прогрева: {rate_str} | До пика инсоляции: {rem_hours_str}
+{update_prompt_block}
 {user_position_block}
 МОДЕЛИ (ДНЕВНЫЕ МАКСИМУМЫ T_MAX):
 • ICON: {models_max.get('icon_global', 'Н/Д')}°C (Абсолютный лидер Европы, MAE 0.34-0.60°C)
@@ -509,4 +733,9 @@ async def analyze_city_weather_ai(city_data: Dict[str, Any], scenario: str = "A"
 {'Если передана открытая позиция — ОБЯЗАТЕЛЬНО начни ответ с оценки позиции и дай однозначный вердикт: ДЕРЖИМ ПОЗИЦИЮ или ВЫХОДИМ (Тейк-профит / Тайм-стоп / Экстренный выход)!' if user_position else ''}
 """
 
-    return await ask_gemini_model(user_prompt, scenario=scenario)
+    res = await ask_gemini_model(user_prompt, scenario=scenario)
+
+    if target_date and icao != "Н/Д":
+        daily_tracker.record(user_id, icao, target_date, current_snapshot)
+
+    return res
