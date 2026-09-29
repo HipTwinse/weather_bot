@@ -162,3 +162,87 @@ def test_afternoon_invalidation_triggers_on_real_low_cloud():
 
     block = build_dynamic_city_block(city_data, user_pos)
     assert "ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)" in block
+
+
+def test_seasonal_heating_cutoff():
+    from auto_scanner import get_seasonal_heating_cutoff
+
+    # Winter (Dec, Jan, Feb): 13:30 LT (13.5)
+    for m in [12, 1, 2]:
+        cutoff, label = get_seasonal_heating_cutoff(m)
+        assert cutoff == 13.5
+        assert label == "Зима"
+
+    # Late Autumn (Oct, Nov): 14:00 LT (14.0)
+    for m in [10, 11]:
+        cutoff, label = get_seasonal_heating_cutoff(m)
+        assert cutoff == 14.0
+        assert label == "Глубокая осень"
+
+    # Early Autumn (Sep) / Early Spring (Mar): 14:30 LT (14.5)
+    for m in [9, 3]:
+        cutoff, label = get_seasonal_heating_cutoff(m)
+        assert cutoff == 14.5
+        assert label == "Осень/Весна"
+
+    # Mid/Late Spring (Apr, May): 15:30 LT (15.5)
+    for m in [4, 5]:
+        cutoff, label = get_seasonal_heating_cutoff(m)
+        assert cutoff == 15.5
+        assert label == "Весна"
+
+    # Summer (Jun, Jul, Aug): 16:30 LT (16.5)
+    for m in [6, 7, 8]:
+        cutoff, label = get_seasonal_heating_cutoff(m)
+        assert cutoff == 16.5
+        assert label == "Лето"
+
+
+def test_seasonal_dynamics_calculation():
+    from auto_scanner import _calculate_dynamics, _MORNING_BASELINES
+
+    # 1. September midday (12:00 LT, cutoff 14:30)
+    dt_sep_noon = datetime(2026, 9, 29, 12, 0, tzinfo=zoneinfo.ZoneInfo("Europe/London"))
+    _MORNING_BASELINES["TEST_SEP"] = {
+        "date": "2026-09-29",
+        "temp": 18.0,
+        "timestamp": dt_sep_noon.timestamp() - 7200,  # 2 hours ago
+    }
+    rate_str, rem_hours_str, rate_val = _calculate_dynamics(
+        "TEST_SEP", 22.0, dt_sep_noon, dt_sep_noon.timestamp()
+    )
+    assert rate_val == 2.0
+    assert "+2.0°C/ч" in rate_str
+    assert "2.5 ч" in rem_hours_str
+    assert "окно до 14:30 LT" in rem_hours_str
+
+    # 2. September afternoon after cutoff (15:00 LT >= 14:30)
+    dt_sep_afternoon = datetime(2026, 9, 29, 15, 0, tzinfo=zoneinfo.ZoneInfo("Europe/London"))
+    _, rem_hours_str_afternoon, _ = _calculate_dynamics(
+        "TEST_SEP", 22.5, dt_sep_afternoon, dt_sep_afternoon.timestamp()
+    )
+    assert "Окно закрыто" in rem_hours_str_afternoon
+    assert "Осень/Весна" in rem_hours_str_afternoon
+
+    # 3. Winter afternoon (January 14:00 LT >= 13:30 cutoff)
+    dt_jan_afternoon = datetime(2026, 1, 15, 14, 0, tzinfo=zoneinfo.ZoneInfo("Europe/London"))
+    _MORNING_BASELINES["TEST_JAN"] = {
+        "date": "2026-01-15",
+        "temp": 4.0,
+        "timestamp": dt_jan_afternoon.timestamp() - 7200,
+    }
+    _, rem_hours_str_jan, _ = _calculate_dynamics(
+        "TEST_JAN", 7.0, dt_jan_afternoon, dt_jan_afternoon.timestamp()
+    )
+    assert "Окно закрыто" in rem_hours_str_jan
+    assert "Зима" in rem_hours_str_jan
+
+
+def test_gemini_prompt_v8_contains_seasonal_law_and_london_barrier():
+    from gemini_analyzer import SYSTEM_PROMPT_V8_0
+
+    assert "ЗАКОН 6: СЕЗОННОЕ ОКНО ИНСОЛЯЦИИ" in SYSTEM_PROMPT_V8_0
+    assert "ВОСТОЧНЫЙ БАРЬЕР ТЕМЗЫ" in SYSTEM_PROMPT_V8_0
+    assert "Heating Cutoff" in SYSTEM_PROMPT_V8_0
+    assert "СКИП МАРКЕТА (ОКНО ПРОГРЕВА ЗАКРЫТО)" in SYSTEM_PROMPT_V8_0
+

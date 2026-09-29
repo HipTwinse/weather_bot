@@ -66,6 +66,7 @@ from auto_scanner import (
     has_real_low_cloud,
     is_blocking_rain_and_clouds,
     get_strike_for_temp,
+    get_seasonal_heating_cutoff,
 )
 
 logger = logging.getLogger(__name__)
@@ -410,11 +411,12 @@ async def process_express_scan_callback(callback: CallbackQuery):
     target_val, priority_model = get_priority_target(icao, models_max, avg_peak, raw_metar, local_dt=local_dt)
     target_strike = get_strike_for_temp(target_val)
 
-    # Расчет темпа прогрева и остатка инсоляции
+    # Расчет темпа прогрева и остатка инсоляции по сезонному окну
     current_ts = asyncio.get_event_loop().time()
     rate_str, rem_hours_str, rate_val = _calculate_dynamics(icao, temp_c, local_dt, current_ts)
     local_hour = local_dt.hour + local_dt.minute / 60.0
-    rem_hours = max(0.0, 17.0 - local_hour)
+    heating_cutoff, season_label = get_seasonal_heating_cutoff(local_dt.month)
+    rem_hours = max(0.0, heating_cutoff - local_hour)
 
     # 2. Разбор стакана котировок Polymarket
     orderbook = parse_markets_orderbook(event_data.get("markets", [])) if event_data else []
@@ -539,20 +541,29 @@ async def process_express_scan_callback(callback: CallbackQuery):
             "calculated_verdict": pos_verdict,
         }
 
-    # 3. Выработка стратегии по правилам KB v7.1
+    # 3. Выработка стратегии по правилам KB v8.0
     is_rain = is_blocking_rain_and_clouds(raw_metar)
+    is_afternoon_cutoff = (local_hour >= heating_cutoff)
 
-    if is_rain or is_overheated:
-        strategy_block = (
-            "⛔ <b>ВЕРДИКТ: СКИП МАРКЕТА</b>\n"
-            "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
-        )
-    elif favorite_candidate and 25.0 <= favorite_candidate["price_cents"] <= 48.0 and rem_hours >= 3.0:
+    if is_rain or is_overheated or is_afternoon_cutoff:
+        if is_afternoon_cutoff:
+            cutoff_m = int((heating_cutoff % 1) * 60)
+            strategy_block = (
+                "⛔ <b>ВЕРДИКТ: СКИП МАРКЕТА (ОКНО ПРОГРЕВА ЗАКРЫТО)</b>\n"
+                f"⚠️ <b>Время {local_dt.strftime('%H:%M')} LT: Активная дневная инсоляция угасла ({season_label}, закрытие в {int(heating_cutoff)}:{cutoff_m:02d} LT).</b> "
+                f"Покупка страйков выше текущего факта ({temp_c if temp_c is not None else 'Н/Д'}°C) — гарантированный слив депозита."
+            )
+        else:
+            strategy_block = (
+                "⛔ <b>ВЕРДИКТ: СКИП МАРКЕТА</b>\n"
+                "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
+            )
+    elif favorite_candidate and 25.0 <= favorite_candidate["price_cents"] <= 48.0 and rem_hours >= 2.0:
         fav_title = html.escape(str(favorite_candidate['title']))
         strategy_block = (
             f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b>\n"
             f"• <b>Рекомендуемый исход:</b> <code>{fav_title}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b>)\n"
-            f"• <b>Запас инсоляции:</b> {rem_hours:.1f} ч | Приоритет: {priority_model}\n"
+            f"• <b>Запас инсоляции:</b> {rem_hours:.1f} ч ({season_label}) | Приоритет: {priority_model}\n"
             f"• <b>Цель:</b> продажа токена толпе на дневном разгоне (+25%...+40% или 60¢–70¢), а не удержание до ночи!"
         )
     else:
@@ -640,6 +651,8 @@ async def process_express_scan_callback(callback: CallbackQuery):
             "user_position": pos_info,
             "user_id": user_id or 0,
             "target_date": target_date,
+            "season_label": season_label,
+            "heating_cutoff": heating_cutoff,
             "previous_analysis": prev_snapshot,
             "analysis_delta": analysis_delta,
         }

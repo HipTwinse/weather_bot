@@ -121,6 +121,28 @@ def get_next_sleep_seconds(now: datetime) -> Tuple[float, datetime, str]:
     return sleep_secs, target, slot_key
 
 
+def get_seasonal_heating_cutoff(month: int) -> Tuple[float, str]:
+    """
+    Возвращает час закрытия активного солнечного прогрева (cutoff LT)
+    и название сезона с учетом высоты стояния солнца и термического лага:
+    - Зима (12, 1, 2): 13:30 LT (13.5)
+    - Глубокая осень (10, 11): 14:00 LT (14.0)
+    - Ранняя осень (9) / Ранняя весна (3): 14:30 LT (14.5)
+    - Весна (4, 5): 15:30 LT (15.5)
+    - Лето (6, 7, 8): 16:30 LT (16.5)
+    """
+    if month in (12, 1, 2):
+        return 13.5, "Зима"
+    elif month in (10, 11):
+        return 14.0, "Глубокая осень"
+    elif month in (9, 3):
+        return 14.5, "Осень/Весна"
+    elif month in (4, 5):
+        return 15.5, "Весна"
+    else:  # 6, 7, 8
+        return 16.5, "Лето"
+
+
 def _calculate_dynamics(
     icao: str,
     current_temp: Optional[float],
@@ -131,6 +153,7 @@ def _calculate_dynamics(
     Рассчитывает темп прогрева (°C/час), остаток инсоляции и числовой темп.
     До 09:00 местного времени фиксируется только утренний пол (выхолаживание),
     а числовой темп блокируется от ложных отрицательных скачков.
+    Остаток прогрева рассчитывается по астрономическому сезонному окну (Seasonal Insolation Curve).
     """
     if current_temp is None:
         return "Н/Д", "Н/Д", 0.0
@@ -167,9 +190,13 @@ def _calculate_dynamics(
             rate_str = "База зафиксирована"
 
     local_hour = local_dt.hour + local_dt.minute / 60.0
-    sunset_close = 17.0
-    rem_hours = max(0.0, sunset_close - local_hour)
-    rem_hours_str = f"{rem_hours:.1f} ч" if rem_hours > 0 else "Окно закрыто"
+    heating_cutoff, season_label = get_seasonal_heating_cutoff(local_dt.month)
+    rem_hours = max(0.0, heating_cutoff - local_hour)
+    if rem_hours > 0:
+        cutoff_m = int((heating_cutoff % 1) * 60)
+        rem_hours_str = f"{rem_hours:.1f} ч (окно до {int(heating_cutoff)}:{cutoff_m:02d} LT, {season_label})"
+    else:
+        rem_hours_str = f"Окно закрыто (спад инсоляции, {season_label})"
 
     return rate_str, rem_hours_str, rate_val
 
