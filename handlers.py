@@ -43,6 +43,7 @@ from polymarket_service import (
     find_city_weather_event,
     parse_markets_orderbook,
     extract_temp_value,
+    get_current_outcome_price,
     fetch_event_by_id_or_slug,
     POLYMARKET_GAMMA_API,
 )
@@ -52,7 +53,7 @@ from weather_synthesizer import (
     synthesize_forecast,
 )
 from gemini_analyzer import analyze_city_weather_ai, is_gemini_configured, get_gemini_status
-from auto_scanner import get_priority_target
+from auto_scanner import get_priority_target, _calculate_dynamics
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -395,7 +396,9 @@ async def process_express_scan_callback(callback: CallbackQuery):
     # Региональный приоритет моделей и расчет целевой температуры (KB v8.0)
     target_val, priority_model = get_priority_target(icao, models_max, avg_peak, raw_metar)
 
-    # Расчет остатка инсоляции
+    # Расчет темпа прогрева и остатка инсоляции
+    current_ts = asyncio.get_event_loop().time()
+    rate_str, rem_hours_str, rate_val = _calculate_dynamics(icao, temp_c, local_dt, current_ts)
     local_hour = local_dt.hour + local_dt.minute / 60.0
     rem_hours = max(0.0, 17.0 - local_hour)
 
@@ -429,6 +432,82 @@ async def process_express_scan_callback(callback: CallbackQuery):
     else:
         orderbook_lines.append("⚠️ <i>Активный контракт на Polymarket для этой даты пока не опубликован или закрыт.</i>")
 
+    # 2.1. Проверка наличия открытой сделки пользователя (positions.db)
+    user_id = callback.from_user.id if callback.from_user else None
+    user_position = None
+    if user_id:
+        try:
+            user_positions = await asyncio.to_thread(get_user_positions, user_id)
+            user_position = next((p for p in user_positions if p.get("icao") == icao and p.get("target_date") == target_date), None)
+            if not user_position:
+                user_position = next((p for p in user_positions if p.get("icao") == icao), None)
+        except Exception as e:
+            logger.warning(f"Ошибка получения позиций для пользователя {user_id}: {e}")
+
+    pos_info = None
+    pos_header = ""
+    if user_position:
+        target_outcomes = user_position.get("outcomes", "Н/Д")
+        entry_price = float(user_position.get("entry_price") or 0.0)
+
+        # Пытаемся получить актуальную цену из стакана Polymarket
+        cur_price = get_current_outcome_price(orderbook, target_outcomes)
+        if cur_price is None:
+            cur_price = entry_price if entry_price > 0 else 35.0
+
+        if entry_price > 0:
+            pnl_val = round(((cur_price - entry_price) / entry_price) * 100, 1)
+            pnl_str = f"{'+' if pnl_val >= 0 else ''}{pnl_val:.0f}%"
+        else:
+            pnl_val = 0.0
+            pnl_str = "+0%"
+            entry_price = cur_price
+
+        target_temp = extract_temp_value(target_outcomes)
+        safe_outcomes = html.escape(str(target_outcomes))
+        local_time_val = local_dt.hour + local_dt.minute / 60.0
+
+        # Триггеры вердикта по открытой позиции:
+        # 1. Тейк-Профит: PnL >= +35% или цена токена в стакане >= 60¢
+        if (entry_price > 0 and (cur_price - entry_price) / entry_price >= 0.35) or cur_price >= 60.0:
+            pos_verdict = (
+                f"🚨 <b>ТЕЙК-ПРОФИТ (ВЫХОДИ ЛИМИТКОЙ)</b> — Цель импульса закрыта ({pnl_str}). "
+                f"До экспирации не сидеть! Сбрасывай страйк по лимитке в стакан прямо сейчас!"
+            )
+        # 2. Тайм-Стоп: 13:30 LT
+        elif (local_time_val >= 13.5) and (target_temp and temp_c and temp_c < target_temp):
+            pos_verdict = (
+                f"⏱️ <b>ТАЙМ-СТОП (13:30 LT)</b> — Сброс в рынок для спасения остаточной стоимости! До полудня цель не пробита."
+            )
+        # 3. Физический слом прогрева (10:30 - 15:00 LT, rate < 0.4°C/h под облачностью/дождем)
+        elif 10.5 <= local_time_val <= 15.0 and (rate_val < 0.4 and any(c in raw_metar for c in ["BKN", "OVC", "RA"])):
+            pos_verdict = (
+                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — Темп прогрева затух (ниже +0.4°C/ч) и небо затянуло облачностью!"
+            )
+        # 4. Раннее утро (< 09:00 LT): ночной пол
+        elif local_dt.hour < 9:
+            pos_verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННИЙ ПОЛ)</b> — До 09:00 LT идет предрассветное выхолаживание, старт инсоляции впереди."
+        # 5. Нормальное удержание
+        else:
+            pos_verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> — Темп прогрева в норме, инсоляция работает по плану."
+
+        pos_header = (
+            f"💼 <b>ВАША ПОЗИЦИЯ:</b> <code>{safe_outcomes}</code> "
+            f"(вход: <code>{entry_price:.0f}¢</code> | сейчас в стакане: <code>{cur_price:.0f}¢</code> | PnL: <b>{pnl_str}</b>)\n"
+            f"👉 <b>ВЕРДИКТ ПОЗИЦИИ:</b> {pos_verdict}\n\n"
+        )
+
+        pos_info = {
+            "outcomes": target_outcomes,
+            "entry_price": entry_price,
+            "cur_price": cur_price,
+            "pnl_str": pnl_str,
+            "pnl_val": pnl_val,
+            "target_temp": target_temp,
+            "target_date": user_position.get("target_date"),
+            "calculated_verdict": pos_verdict,
+        }
+
     # 3. Выработка стратегии по правилам KB v7.1
     is_rain = any(s in raw_metar for s in ["RA", "DZ", "TS", "SN"]) and "OVC" in raw_metar
 
@@ -454,11 +533,12 @@ async def process_express_scan_callback(callback: CallbackQuery):
         )
 
     response_text = (
-        f"⚡ <b>ЭКСПРЕСС-АНАЛИЗ: {city_label}</b>\n"
-        f"🕒 <i>Время: {local_dt.strftime('%H:%M')} LT | Дата: {target_date}</i>\n\n"
-        f"🌡️ <b>Факт METAR:</b> <code>{temp_c if temp_c is not None else 'Н/Д'}°C</code>\n"
-        f"📊 <b>Модели:</b> ECMWF: {models_max.get('ecmwf_hres', 'Н/Д')}°C | GFS: {models_max.get('gfs_global', 'Н/Д')}°C | ICON: {models_max.get('icon_global', 'Н/Д')}°C\n"
-        f"🎯 <b>Расчетный пик:</b> <b>{avg_peak}°C</b> (Опора: <i>{priority_model}</i>)\n\n"
+        (pos_header if pos_header else "")
+        + f"⚡ <b>ЭКСПРЕСС-АНАЛИЗ: {city_label}</b>\n"
+        + f"🕒 <i>Время: {local_dt.strftime('%H:%M')} LT | Дата: {target_date}</i>\n\n"
+        + f"🌡️ <b>Факт METAR:</b> <code>{temp_c if temp_c is not None else 'Н/Д'}°C</code>\n"
+        + f"📊 <b>Модели:</b> ECMWF: {models_max.get('ecmwf_hres', 'Н/Д')}°C | GFS: {models_max.get('gfs_global', 'Н/Д')}°C | ICON: {models_max.get('icon_global', 'Н/Д')}°C\n"
+        + f"🎯 <b>Расчетный пик:</b> <b>{avg_peak}°C</b> (Опора: <i>{priority_model}</i>)\n\n"
         + "\n".join(orderbook_lines) + "\n\n"
         + "━━━━━━━━━━━━━━━━━━━━\n"
         + strategy_block
@@ -490,12 +570,15 @@ async def process_express_scan_callback(callback: CallbackQuery):
             "temp_c": temp_c,
             "raw_metar": raw_metar,
             "models_max": models_max,
-            "rate_str": f"{round(target_val - (temp_c or target_val), 1)}°C/остаток",
-            "rem_hours_str": f"{rem_hours:.1f} ч",
+            "rate_str": rate_str,
+            "rate_val": rate_val,
+            "rem_hours_str": rem_hours_str,
             "orderbook": orderbook,
+            "user_position": pos_info,
         }
         try:
-            ai_verdict = await analyze_city_weather_ai(city_pack, scenario="A")
+            scenario_code = "B" if pos_info else "A"
+            ai_verdict = await analyze_city_weather_ai(city_pack, scenario=scenario_code)
             if ai_verdict:
                 response_text = ai_verdict
         except Exception as e:
@@ -626,7 +709,11 @@ async def cmd_my_positions(message: Message, state: FSMContext):
         )
         buttons.append([
             InlineKeyboardButton(
-                text=f"❌ Закрыть: {pos['icao']} ({pos['outcomes']})",
+                text=f"⚡ AI Анализ: {pos['icao']}",
+                callback_data=f"express_scan:{pos['icao']}"
+            ),
+            InlineKeyboardButton(
+                text=f"❌ Закрыть: {pos['icao']}",
                 callback_data=f"del_pos:{pos['id']}"
             )
         ])
