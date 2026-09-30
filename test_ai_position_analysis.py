@@ -72,3 +72,49 @@ def test_get_current_outcome_price():
     assert get_current_outcome_price(orderbook, "22°C") == 35.0
     assert get_current_outcome_price(orderbook, "23") == 55.0
     assert get_current_outcome_price(orderbook, "25°C") is None
+
+
+def test_quick_position_callbacks():
+    async def _test_flow():
+        from handlers import process_quick_pos_save, process_quick_pos_close
+        from database import init_db, get_user_positions, delete_position
+
+        init_db()
+        user_id = 777888
+        # Clean up test user positions first
+        existing = get_user_positions(user_id)
+        for p in existing:
+            delete_position(p["id"], user_id)
+
+        # 1. Test quick pos save
+        mock_callback = AsyncMock()
+        mock_callback.from_user.id = user_id
+        mock_callback.data = "qps:EGLC:25C:18:2026-09-30"
+        mock_callback.message.edit_text = AsyncMock()
+        mock_callback.answer = AsyncMock()
+
+        await process_quick_pos_save(mock_callback)
+
+        positions = get_user_positions(user_id)
+        assert len(positions) == 1
+        assert positions[0]["icao"] == "EGLC"
+        assert positions[0]["outcomes"] == "25°C"
+        assert positions[0]["entry_price"] == 18.0
+        assert positions[0]["target_date"] == "2026-09-30"
+
+        # 2. Test quick pos close
+        pos_id = positions[0]["id"]
+        close_callback = AsyncMock()
+        close_callback.from_user.id = user_id
+        close_callback.data = f"quick_pos_close:{pos_id}:EGLC"
+        close_callback.answer = AsyncMock()
+
+        with patch("handlers.process_express_scan_callback", new_callable=AsyncMock) as mock_scan:
+            await process_quick_pos_close(close_callback)
+            mock_scan.assert_called_once()
+
+        closed_positions = get_user_positions(user_id)
+        assert len(closed_positions) == 0
+
+    asyncio.run(_test_flow())
+

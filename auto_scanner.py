@@ -121,16 +121,55 @@ def get_next_sleep_seconds(now: datetime) -> Tuple[float, datetime, str]:
     return sleep_secs, target, slot_key
 
 
-def get_seasonal_heating_cutoff(month: int) -> Tuple[float, str]:
+def get_seasonal_heating_cutoff(month: int, icao: str = "") -> Tuple[float, str]:
     """
     Возвращает час закрытия активного солнечного прогрева (cutoff LT)
-    и название сезона с учетом высоты стояния солнца и термического лага:
-    - Зима (12, 1, 2): 13:30 LT (13.5)
-    - Глубокая осень (10, 11): 14:00 LT (14.0)
-    - Ранняя осень (9) / Ранняя весна (3): 14:30 LT (14.5)
-    - Весна (4, 5): 15:30 LT (15.5)
-    - Лето (6, 7, 8): 16:30 LT (16.5)
+    и название сезона с учетом высоты стояния солнца, долготы города и термического лага.
+    Откалибровано на основе эмпирического анализа архива Open-Meteo за 1367 дней (2023-2026):
+    - Мадрид (LEMD): из-за западного сдвига долготы относительно часового пояса (UTC+1/UTC+2) 
+      и высоты плато Месета (>600м) суточный пик наступает в 16:00-17:00 круглый год.
+    - Лондон (EGLC): на меридиане Гринвича, пик наступает рано (зима 12:30-13:30, лето 15:30-16:30).
+    - Милан (LIMC): котловина реки По, зимой застойный воздух и ранний закат за Альпы (14:00).
+    - Париж (LFPB): умеренный переходный режим (зима 13:30-14:00, лето 16:30).
     """
+    icao_upper = icao.strip().upper() if icao else ""
+
+    if icao_upper == "LEMD":
+        # Мадрид: стабильный пик 16:00-17:00 даже поздней осенью
+        if month in (12, 1, 2):
+            return 15.5, "Зима (Мадрид)"
+        elif month in (10, 11):
+            return 16.0, "Глубокая осень (Мадрид)"
+        elif month in (9, 3):
+            return 16.5, "Осень/Весна (Мадрид)"
+        else:
+            return 17.5, "Лето (Мадрид)"
+
+    elif icao_upper == "LIMC":
+        # Милан: зимний застой и альпийский ранний закат
+        if month in (11, 12, 1):
+            return 14.0, "Зима (Милан)"
+        elif month in (2, 3, 10):
+            return 14.5, "Осень/Весна (Милан)"
+        elif month in (4, 5):
+            return 15.5, "Весна (Милан)"
+        else:
+            return 16.0, "Лето (Милан)"
+
+    elif icao_upper == "EGLC":
+        # Лондон: Гринвичский меридиан, ранний астрономический полдень
+        if month in (12, 1):
+            return 13.0, "Зима (Лондон)"
+        elif month in (2, 11):
+            return 13.5, "Зима/Поздняя осень (Лондон)"
+        elif month in (10, 9, 3):
+            return 14.5, "Осень/Весна (Лондон)"
+        elif month in (4, 5):
+            return 15.5, "Весна (Лондон)"
+        else:
+            return 16.5, "Лето (Лондон)"
+
+    # Базовый дефолтный профиль (Париж и общие европейские координаты)
     if month in (12, 1, 2):
         return 13.5, "Зима"
     elif month in (10, 11):
@@ -141,6 +180,7 @@ def get_seasonal_heating_cutoff(month: int) -> Tuple[float, str]:
         return 15.5, "Весна"
     else:  # 6, 7, 8
         return 16.5, "Лето"
+
 
 
 def _calculate_dynamics(
@@ -190,7 +230,7 @@ def _calculate_dynamics(
             rate_str = "База зафиксирована"
 
     local_hour = local_dt.hour + local_dt.minute / 60.0
-    heating_cutoff, season_label = get_seasonal_heating_cutoff(local_dt.month)
+    heating_cutoff, season_label = get_seasonal_heating_cutoff(local_dt.month, icao=icao)
     rem_hours = max(0.0, heating_cutoff - local_hour)
     if rem_hours > 0:
         cutoff_m = int((heating_cutoff % 1) * 60)

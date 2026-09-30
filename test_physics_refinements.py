@@ -242,7 +242,25 @@ def test_gemini_prompt_v8_contains_seasonal_law_and_london_barrier():
     from gemini_analyzer import SYSTEM_PROMPT_V8_0
 
     assert "ЗАКОН 6: СЕЗОННОЕ ОКНО ИНСОЛЯЦИИ" in SYSTEM_PROMPT_V8_0
+    assert "ЗАКОН 7: ДНЕВНОЙ ДОЖДЬ" in SYSTEM_PROMPT_V8_0
     assert "ВОСТОЧНЫЙ БАРЬЕР ТЕМЗЫ" in SYSTEM_PROMPT_V8_0
     assert "Heating Cutoff" in SYSTEM_PROMPT_V8_0
     assert "СКИП МАРКЕТА (ОКНО ПРОГРЕВА ЗАКРЫТО)" in SYSTEM_PROMPT_V8_0
+
+
+def test_city_aware_seasonal_cutoffs():
+    from auto_scanner import get_seasonal_heating_cutoff
+
+    # Madrid: later peak due to western longitude / CET offset
+    madrid_cutoff_winter, label_w = get_seasonal_heating_cutoff(1, icao="LEMD")
+    assert madrid_cutoff_winter == 15.5
+    assert "Мадрид" in label_w
+
+    madrid_cutoff_summer, label_s = get_seasonal_heating_cutoff(7, icao="LEMD")
+    assert madrid_cutoff_summer == 17.5
+
+    # London: Greenwich meridian early sunset in December
+    london_cutoff_dec, label_lon = get_seasonal_heating_cutoff(12, icao="EGLC")
+    assert london_cutoff_dec == 13.0
+    assert "Лондон" in label_lon
 

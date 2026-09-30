@@ -415,7 +415,7 @@ async def process_express_scan_callback(callback: CallbackQuery):
     current_ts = asyncio.get_event_loop().time()
     rate_str, rem_hours_str, rate_val = _calculate_dynamics(icao, temp_c, local_dt, current_ts)
     local_hour = local_dt.hour + local_dt.minute / 60.0
-    heating_cutoff, season_label = get_seasonal_heating_cutoff(local_dt.month)
+    heating_cutoff, season_label = get_seasonal_heating_cutoff(local_dt.month, icao=icao)
     rem_hours = max(0.0, heating_cutoff - local_hour)
 
     # 2. Разбор стакана котировок Polymarket
@@ -629,6 +629,23 @@ async def process_express_scan_callback(callback: CallbackQuery):
         trade_row.append(InlineKeyboardButton(text="⚡ Открыть в Preddy", url=preddy_link))
         trade_row.append(InlineKeyboardButton(text="📊 Polymarket", url=poly_link))
         trade_buttons.append(trade_row)
+
+    # 1-Click фиксация позиции или закрытие сделки прямо из анализа
+    if user_position:
+        pos_id = user_position.get("id")
+        trade_buttons.append([
+            InlineKeyboardButton(
+                text=f"🛑 Закрыть сделку в боте ({user_position.get('outcomes', '')})",
+                callback_data=f"quick_pos_close:{pos_id}:{icao}"
+            )
+        ])
+    else:
+        trade_buttons.append([
+            InlineKeyboardButton(
+                text="💼 Я вошел в сделку",
+                callback_data=f"quick_pos_select:{icao}:{target_date}"
+            )
+        ])
 
     trade_buttons.append([
         InlineKeyboardButton(text=f"🔄 Обновить ({icao})", callback_data=f"express_scan:{icao}")
@@ -911,6 +928,158 @@ async def process_del_pos_callback(callback: CallbackQuery):
         ])
 
     buttons.append([InlineKeyboardButton(text="➕ Добавить еще сделку", callback_data="add_new_pos")])
+    await callback.message.edit_text(
+        "\n".join(text_lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+# -------------------------------------------------------------
+# 1-CLICK БЫСТРАЯ ФИКСАЦИЯ И СБРОС СДЕЛКИ (QUICK POSITIONS)
+# -------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("quick_pos_select:"))
+async def process_quick_pos_select(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    icao = parts[1]
+    target_date = parts[2] if len(parts) > 2 else datetime.now().strftime("%Y-%m-%d")
+
+    city_label = ALL_RADAR_CITIES.get(icao, icao)
+    await callback.answer("Загружаю актуальные страйки...")
+
+    event_data = await find_city_weather_event(icao, target_date)
+    orderbook = []
+    if event_data and event_data.get("markets"):
+        orderbook = parse_markets_orderbook(event_data["markets"])
+
+    buttons = []
+    if orderbook:
+        row = []
+        for item in orderbook:
+            t_num = item.get("temp")
+            price = item.get("price_cents", 0.0)
+            if t_num is not None:
+                outcome_clean = f"{int(t_num)}C"
+                btn_text = f"{int(t_num)}°C ({price:.0f}¢)"
+                cb_data = f"qps:{icao}:{outcome_clean}:{int(round(price))}:{target_date}"
+                row.append(InlineKeyboardButton(text=btn_text, callback_data=cb_data))
+                if len(row) == 2:
+                    buttons.append(row)
+                    row = []
+        if row:
+            buttons.append(row)
+
+    if not buttons:
+        fallback_temps = [20, 21, 22, 23, 24, 25, 26]
+        row = []
+        for t in fallback_temps:
+            cb_data = f"qps:{icao}:{t}C:30:{target_date}"
+            row.append(InlineKeyboardButton(text=f"{t}°C", callback_data=cb_data))
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+    buttons.append([
+        InlineKeyboardButton(text="🔙 Назад к анализу", callback_data=f"express_scan:{icao}")
+    ])
+
+    await callback.message.edit_text(
+        f"💼 <b>Какой страйк вы купили по {city_label}?</b>\n\n"
+        f"Нажмите на кнопку с вашей температурой. Бот мгновенно запишет сделку в базу и включит персональный риск-менеджмент:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.callback_query(F.data.startswith("qps:"))
+async def process_quick_pos_save(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    icao = parts[1]
+    outcome_raw = parts[2]
+    price_val = float(parts[3])
+    target_date = parts[4]
+
+    temp_val = extract_temp_value(outcome_raw)
+    outcomes_str = f"{int(temp_val)}°C" if temp_val is not None else outcome_raw
+    user_id = callback.from_user.id if callback.from_user else 0
+
+    add_position(
+        user_id=user_id,
+        icao=icao,
+        outcomes=outcomes_str,
+        target_date=target_date,
+        entry_price=price_val
+    )
+
+    await callback.answer(f"✅ Позиция {outcomes_str} взята на радар!")
+
+    city_label = ALL_RADAR_CITIES.get(icao, icao)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"⚡ Посмотреть анализ по {icao}", callback_data=f"express_scan:{icao}")],
+            [InlineKeyboardButton(text="📌 Мои позиции", callback_data="open_my_positions")]
+        ]
+    )
+
+    await callback.message.edit_text(
+        f"✅ <b>Позиция успешно взята под защиту!</b>\n\n"
+        f"📍 <b>Город:</b> {city_label}\n"
+        f"🎯 <b>Купленный страйк:</b> <code>{outcomes_str}</code>\n"
+        f"💵 <b>Цена входа:</b> <code>{price_val:.0f}¢</code>\n"
+        f"📅 <b>Дата экспирации:</b> <code>{target_date}</code>\n\n"
+        f"🛡️ <i>Сканер теперь непрерывно сопоставляет факт METAR, ветер и солнце. "
+        f"При признаках слома погоды или при достижении Тейк-Профита (+35% / 60¢) ты получишь персональный сигнал!</i>",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@router.callback_query(F.data.startswith("quick_pos_close:"))
+async def process_quick_pos_close(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    pos_id = int(parts[1])
+    icao = parts[2] if len(parts) > 2 else "EGLC"
+
+    user_id = callback.from_user.id if callback.from_user else 0
+    delete_position(pos_id, user_id)
+    await callback.answer("✅ Сделка закрыта в боте.")
+
+    callback.data = f"express_scan:{icao}"
+    await process_express_scan_callback(callback)
+
+
+@router.callback_query(F.data == "open_my_positions")
+async def process_open_my_positions(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    positions = get_user_positions(callback.from_user.id)
+    if not positions:
+        await callback.message.edit_text(
+            "📌 <b>У тебя пока нет активных сделок на контроле.</b>\n\n"
+            "Нажми <b>«➕ Добавить сделку»</b>, чтобы сканер каждые 30 минут отслеживал PnL!",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_new_pos")]]
+            )
+        )
+        return
+
+    text_lines = ["📌 <b>Твои активные сделки под защитой сканера:</b>\n"]
+    buttons = []
+    for pos in positions:
+        city_label = ALL_RADAR_CITIES.get(pos["icao"], pos["icao"])
+        entry_s = f" (вход: {pos.get('entry_price', 0):.0f}¢)" if pos.get('entry_price') else ""
+        text_lines.append(
+            f"• <b>{city_label}</b> | Исходы: <code>{pos['outcomes']}</code>{entry_s} | Дата: <code>{pos['target_date']}</code>"
+        )
+        buttons.append([
+            InlineKeyboardButton(text=f"⚡ AI Анализ: {pos['icao']}", callback_data=f"express_scan:{pos['icao']}"),
+            InlineKeyboardButton(text=f"❌ Закрыть: {pos['icao']}", callback_data=f"del_pos:{pos['id']}")
+        ])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить еще сделку", callback_data="add_new_pos")])
+
     await callback.message.edit_text(
         "\n".join(text_lines),
         parse_mode="HTML",
