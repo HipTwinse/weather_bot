@@ -264,3 +264,56 @@ def test_city_aware_seasonal_cutoffs():
     assert london_cutoff_dec == 13.0
     assert "Лондон" in label_lon
 
+
+def test_orderbook_execution_rules_and_adverse_selection():
+    from auto_scanner import build_dynamic_city_block, build_morning_city_block
+    from gemini_analyzer import SYSTEM_PROMPT_V8_0
+
+    # 1. Prompt includes Adverse Selection and Morning vs Daytime rules
+    assert "РАЗДЕЛЕНИЕ ВХОДА (УТРО VS ДЕНЬ / ЗАЩИТА ОТ НЕБЛАГОПРИЯТНОГО ОТБОРА)" in SYSTEM_PROMPT_V8_0
+    assert "ЗАКОН «ПАДАЮЩЕГО НОЖА» (ADVERSE SELECTION)" in SYSTEM_PROMPT_V8_0
+
+    # 2. Daytime drop of >=8c triggers adverse selection alert for held position
+    local_dt = datetime(2026, 9, 28, 11, 0, tzinfo=zoneinfo.ZoneInfo("Europe/London"))
+    city_data = {
+        "icao": "EGLC",
+        "city_name": "Лондон (Сити)",
+        "local_dt": local_dt,
+        "temp_c": 21.0,
+        "models_max": {"icon_global": 24.2, "gfs_global": 23.6},
+        "rate_str": "+0.5°C/ч",
+        "rate_val": 0.5,
+        "rem_hours_str": "3.5 ч",
+        "peak_str": "24.2°C",
+        "avg_peak": 24.0,
+        "physics_note": "Ясно.",
+        "raw_metar": "EGLC 281000Z 12005KT CAVOK 21/14 Q1018",
+        "orderbook": [
+            {"temp": 24, "price_cents": 28.0, "title": "24°C", "yes_price": 0.28},
+        ],
+    }
+    user_pos = {
+        "outcomes": "24°C",
+        "entry_price": 40.0,  # Dropped from 40c to 28c (-12c drop)
+        "target_date": "2026-09-28",
+    }
+    block = build_dynamic_city_block(city_data, user_pos)
+    assert "ТРЕВОГА (ПАДЕНИЕ СТАКАНА: -12¢)" in block
+    assert "adverse selection" in block
+
+    # 3. Morning block differentiates entry modes
+    morning_city_data = dict(city_data)
+    morning_city_data["favorite_candidate"] = {"temp": 24, "price_cents": 35.0, "title": "24°C"}
+    # Midday (11:00 LT) -> immediate entry
+    morning_block = build_morning_city_block(morning_city_data)
+    assert "Сразу по рынку / в упор к Best Ask" in morning_block
+
+    # Early morning (08:00 LT) -> morning limit
+    early_dt = datetime(2026, 9, 28, 8, 0, tzinfo=zoneinfo.ZoneInfo("Europe/London"))
+    early_city_data = dict(city_data)
+    early_city_data["local_dt"] = early_dt
+    early_city_data["favorite_candidate"] = {"temp": 24, "price_cents": 35.0, "title": "24°C"}
+    early_block = build_morning_city_block(early_city_data)
+    assert "Утренняя лимитка в спред" in early_block
+
+

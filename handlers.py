@@ -560,9 +560,11 @@ async def process_express_scan_callback(callback: CallbackQuery):
             )
     elif favorite_candidate and 25.0 <= favorite_candidate["price_cents"] <= 48.0 and rem_hours >= 2.0:
         fav_title = html.escape(str(favorite_candidate['title']))
+        entry_hint = "Сразу по рынку / в упор к Best Ask (днем просадка не высиживается)" if local_hour >= 9.5 else "Утренняя лимитка в спред"
         strategy_block = (
             f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b>\n"
             f"• <b>Рекомендуемый исход:</b> <code>{fav_title}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b>)\n"
+            f"• <b>Вход:</b> {entry_hint}\n"
             f"• <b>Запас инсоляции:</b> {rem_hours:.1f} ч ({season_label}) | Приоритет: {priority_model}\n"
             f"• <b>Цель:</b> продажа токена толпе на дневном разгоне (+25%...+40% или 60¢–70¢), а не удержание до ночи!"
         )
