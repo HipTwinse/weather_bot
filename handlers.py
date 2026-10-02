@@ -1021,11 +1021,97 @@ async def process_pos_city_selected(callback: CallbackQuery, state: FSMContext):
         local_date = datetime.now().strftime("%Y-%m-%d")
 
     await state.update_data(pos_icao=icao_code, pos_date=local_date)
-    await state.set_state(AddPositionStates.waiting_for_outcomes)
 
     city_name = ALL_RADAR_CITIES.get(icao_code, icao_code)
+
+    # Загружаем актуальный стакан Polymarket для генерации быстрых кнопок в 1 клик
+    event = await find_city_weather_event(icao_code, target_date=local_date)
+    buttons = []
+    if event and event.get("markets"):
+        orderbook = parse_markets_orderbook(event["markets"])
+        row = []
+        for item in orderbook:
+            t = item.get("temp")
+            p = item.get("price_cents", 0.0)
+            if t is not None and 1.0 <= p <= 95.0:
+                t_str = f"{int(t)}" if t == int(t) else f"{t}"
+                btn_text = f"🎯 {t_str}°C ({p:.0f}¢)"
+                cb_data = f"quick_pick:{icao_code}:{t_str}:{p:.0f}"
+                row.append(InlineKeyboardButton(text=btn_text, callback_data=cb_data))
+                if len(row) == 2:
+                    buttons.append(row)
+                    row = []
+        if row:
+            buttons.append(row)
+
+    buttons.append([InlineKeyboardButton(text="✏️ Ввести исход вручную", callback_data=f"manual_pos:{icao_code}")])
+    buttons.append([InlineKeyboardButton(text="« Назад к выбору города", callback_data="add_new_pos")])
+
     await callback.message.edit_text(
         f"🎯 <b>Шаг 2 из 2: Локация {city_name}</b>\n\n"
+        "👇 <b>Нажми на исход, который ты купил (цена и контракт подтянутся в 1 клик):</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("quick_pick:"))
+async def process_quick_pick_pos(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = callback.data.split(":")
+    icao = parts[1]
+    strike_str = parts[2]
+    price_cents = float(parts[3])
+
+    airport_data = resolve_airport(icao) or {}
+    tz_name = airport_data.get("timezone", "UTC")
+    try:
+        local_date = datetime.now(zoneinfo.ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+    except Exception:
+        local_date = datetime.now().strftime("%Y-%m-%d")
+
+    outcomes_str = f"{strike_str}°C" if not strike_str.endswith("°C") else strike_str
+
+    # Получаем token_id для автопродажи
+    token_id = ""
+    event = await find_city_weather_event(icao, target_date=local_date)
+    if event and event.get("markets"):
+        orderbook = parse_markets_orderbook(event["markets"])
+        token_id = get_outcome_token_id(orderbook, outcomes_str) or ""
+
+    add_position(
+        user_id=callback.from_user.id,
+        icao=icao,
+        outcomes=outcomes_str,
+        target_date=local_date,
+        entry_price=price_cents,
+        token_id=token_id,
+    )
+
+    wallet = get_user_wallet(callback.from_user.id)
+    auto_status = "🟢 <b>АКТИВНА</b> (Трейлинг + Погодный парашют)" if wallet else "⚪ <b>Отключена</b> (отправь /set_key для автовыхода)"
+
+    city_name = ALL_RADAR_CITIES.get(icao, icao)
+    await callback.message.edit_text(
+        f"✅ <b>СДЕЛКА ВЗЯТА НА АВТОПИЛОТ В 1 КЛИК!</b>\n\n"
+        f"• <b>Город:</b> {city_name}\n"
+        f"• <b>Исход:</b> <code>{outcomes_str}</code> (Вход: <b>{price_cents:.0f}¢</b>)\n"
+        f"• <b>Дата:</b> <code>{local_date}</code>\n"
+        f"• <b>Автопродажа:</b> {auto_status}\n\n"
+        f"🛡️ <i>Никаких команд писать не нужно. Бот сам зафиксирует прибыль на пике разгона (+80%...+150%) "
+        f"или катапультируется в рынок при дожде/тучах!</i>",
+        parse_mode="HTML",
+    )
+    await callback.answer("✅ Сделка на автопилоте!")
+
+
+@router.callback_query(F.data.startswith("manual_pos:"))
+async def process_manual_pos_prompt(callback: CallbackQuery, state: FSMContext):
+    icao_code = callback.data.split(":")[1]
+    await state.set_state(AddPositionStates.waiting_for_outcomes)
+    city_name = ALL_RADAR_CITIES.get(icao_code, icao_code)
+    await callback.message.edit_text(
+        f"✏️ <b>Ручной ввод: Локация {city_name}</b>\n\n"
         "Напиши купленный исход и цену входа (например: <code>23°C 35¢</code> или просто <code>23</code>):",
         parse_mode="HTML",
     )
