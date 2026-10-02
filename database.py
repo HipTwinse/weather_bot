@@ -47,10 +47,18 @@ def init_db() -> None:
                 user_id INTEGER PRIMARY KEY,
                 private_key TEXT NOT NULL,
                 wallet_address TEXT NOT NULL,
+                proxy_address TEXT DEFAULT '',
+                signature_type INTEGER DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cursor.execute("PRAGMA table_info(user_wallets)")
+        wallet_cols = {row[1] for row in cursor.fetchall()}
+        if "proxy_address" not in wallet_cols:
+            cursor.execute("ALTER TABLE user_wallets ADD COLUMN proxy_address TEXT DEFAULT ''")
+        if "signature_type" not in wallet_cols:
+            cursor.execute("ALTER TABLE user_wallets ADD COLUMN signature_type INTEGER DEFAULT 1")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bot_state (
@@ -122,29 +130,77 @@ def get_all_active_positions() -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
-def save_user_wallet(user_id: int, private_key: str, wallet_address: str) -> None:
-    """Сохраняет приватный ключ и адрес кошелька пользователя для автопродажи."""
+def _ensure_wallet_columns(cursor: sqlite3.Cursor) -> None:
+    """Гарантирует наличие колонок proxy_address и signature_type в user_wallets."""
+    try:
+        cursor.execute("PRAGMA table_info(user_wallets)")
+        cols = {row[1] for row in cursor.fetchall()}
+        if cols:
+            if "proxy_address" not in cols:
+                cursor.execute("ALTER TABLE user_wallets ADD COLUMN proxy_address TEXT DEFAULT ''")
+            if "signature_type" not in cols:
+                cursor.execute("ALTER TABLE user_wallets ADD COLUMN signature_type INTEGER DEFAULT 1")
+    except Exception:
+        pass
+
+
+def save_user_wallet(
+    user_id: int,
+    private_key: str,
+    wallet_address: str,
+    proxy_address: str = "",
+    signature_type: int = 1,
+) -> None:
+    """Сохраняет приватный ключ, адрес подписанта и адрес торгового прокси Polymarket."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
+        _ensure_wallet_columns(cursor)
         cursor.execute("""
-            INSERT INTO user_wallets (user_id, private_key, wallet_address, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(user_id) DO UPDATE SET
                 private_key = excluded.private_key,
                 wallet_address = excluded.wallet_address,
+                proxy_address = excluded.proxy_address,
+                signature_type = excluded.signature_type,
                 updated_at = CURRENT_TIMESTAMP
-        """, (user_id, private_key.strip(), wallet_address.strip()))
+        """, (user_id, private_key.strip(), wallet_address.strip(), (proxy_address or "").strip(), int(signature_type)))
         conn.commit()
 
 
 def get_user_wallet(user_id: int) -> Optional[Dict[str, Any]]:
-    """Получает сохраненный кошелек пользователя."""
+    """Получает сохраненный кошелек пользователя с автоматическим определением proxyWallet при необходимости."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, private_key, wallet_address FROM user_wallets WHERE user_id = ?", (user_id,))
+        _ensure_wallet_columns(cursor)
+        cursor.execute("""
+            SELECT user_id, private_key, wallet_address,
+                   COALESCE(proxy_address, '') AS proxy_address,
+                   COALESCE(signature_type, 1) AS signature_type
+            FROM user_wallets WHERE user_id = ?
+        """, (user_id,))
         row = cursor.fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        res = dict(row)
+        # Если proxy_address еще не заполнен, динамически разрешаем его через Gamma API
+        if not res.get("proxy_address") and res.get("wallet_address"):
+            try:
+                from clob_trader import resolve_polymarket_proxy
+                proxy = resolve_polymarket_proxy(res["wallet_address"])
+                if proxy:
+                    res["proxy_address"] = proxy
+                    res["signature_type"] = 1
+                    cursor.execute("""
+                        UPDATE user_wallets
+                        SET proxy_address = ?, signature_type = 1
+                        WHERE user_id = ?
+                    """, (proxy, user_id))
+                    conn.commit()
+            except Exception:
+                pass
+        return res
 
 
 def delete_user_wallet(user_id: int) -> bool:

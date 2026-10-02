@@ -384,4 +384,29 @@ def test_auto_trader_and_wallet_management():
     assert get_user_wallet(test_uid) is None
 
 
+def test_polymarket_proxy_resolution_and_balance():
+    from clob_trader import resolve_polymarket_proxy, get_wallet_collateral_balance
+    from database import save_user_wallet, get_user_wallet, delete_user_wallet
+
+    eoa_addr = "0x43537E8fFA90E0B37c1613d709BC9a1eefd673aa"
+    proxy = resolve_polymarket_proxy(eoa_addr)
+    assert proxy is not None
+    assert proxy.lower() == "0xa7ed88c8d3cc77cbf569257af196c1e1044f3688".lower()
+
+    # Balance check on proxy
+    bal = get_wallet_collateral_balance(wallet_address=eoa_addr, proxy_address=proxy)
+    assert bal > 0.0
+
+    # Auto-resolution in get_user_wallet
+    test_uid = 99999111
+    delete_user_wallet(test_uid)
+    save_user_wallet(test_uid, "dummy_key", eoa_addr)
+    loaded = get_user_wallet(test_uid)
+    assert loaded is not None
+    assert loaded["proxy_address"].lower() == proxy.lower()
+    assert loaded["signature_type"] == 1
+    delete_user_wallet(test_uid)
+
+
+
 

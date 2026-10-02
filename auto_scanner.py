@@ -956,8 +956,16 @@ async def check_and_execute_auto_sell(
         logger.warning(f"Не найден token_id для {target_outcomes} в {icao}, автопродажа невозможна.")
         return None
 
+    proxy_addr = wallet.get("proxy_address") or ""
+    sig_type = int(wallet.get("signature_type") or 1)
+
     # Определяем доступный объем контрактов
-    shares = await asyncio.to_thread(get_token_balance, wallet["private_key"], token_id)
+    shares = await asyncio.to_thread(
+        get_token_balance,
+        wallet["private_key"],
+        token_id,
+        proxy_addr,
+    )
     if shares <= 0:
         shares = float(pos.get("shares") or 5.0)
 
@@ -968,6 +976,8 @@ async def check_and_execute_auto_sell(
         token_id,
         shares,
         worst_price=0.001,
+        proxy_address=proxy_addr,
+        signature_type=sig_type,
     )
 
     if success:

@@ -1,11 +1,13 @@
 """
 Модуль исполнения биржевых сделок на Polymarket CLOB (Central Limit Order Book).
 Реализует безопасное подключение, проверку балансов и автоматическую продажу по рынку (Market-Taker).
+Поддерживает прокси-кошельки Polymarket (Proxy/Safe), на которых реально хранятся средства пользователей.
 """
 
 import logging
 import re
 from typing import Any, Dict, Optional, Tuple
+import requests
 from eth_account import Account
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
@@ -21,6 +23,23 @@ logger = logging.getLogger("ClobTrader")
 POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
 
+# Публичные RPC-узлы Polygon для ончейн-проверок баланса
+POLYGON_RPCS = [
+    "https://polygon.gateway.tenderly.co",
+    "https://gateway.tenderly.co/public/polygon",
+    "https://polygon.drpc.org",
+]
+
+# Контракты залоговых валют Polymarket на Polygon
+COLLATERAL_TOKENS = [
+    "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",  # PUSD (Polymarket USD)
+    "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e (Bridged PoS USDC)
+    "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",  # Native USDC
+]
+
+# Контракт условных токенов (Conditional Tokens Framework)
+CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+
 
 def clean_private_key(raw_key: str) -> str:
     """Очищает приватный ключ от пробелов, кавычек и префиксов."""
@@ -30,10 +49,106 @@ def clean_private_key(raw_key: str) -> str:
     return key
 
 
+def resolve_polymarket_proxy(wallet_address: str) -> Optional[str]:
+    """
+    Запрашивает публичный профиль Polymarket для определения торгового прокси-кошелька (Proxy/Safe).
+    На Polymarket средства и контракты хранятся на proxyWallet, 
+    в то время как ключ из Predy/Privy является подписантом (EOA Signer).
+    """
+    if not wallet_address:
+        return None
+    try:
+        url = f"https://gamma-api.polymarket.com/public-profile?address={wallet_address.lower()}"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            proxy = data.get("proxyWallet")
+            if proxy and proxy.startswith("0x") and len(proxy) == 42:
+                return proxy.lower()
+    except Exception as e:
+        logger.warning(f"Не удалось получить proxyWallet для {wallet_address}: {e}")
+    return None
+
+
+def query_onchain_collateral_balance(wallet_address: str) -> float:
+    """Запрашивает ончейн баланс залоговых активов (PUSD / USDC) на Polygon."""
+    if not wallet_address:
+        return 0.0
+    addr_clean = wallet_address[2:].lower().rjust(64, "0")
+    data = "0x70a08231" + addr_clean  # balanceOf(address)
+    total_bal = 0.0
+
+    for tok in COLLATERAL_TOKENS:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": tok, "data": data}, "latest"],
+            "id": 1,
+        }
+        for rpc in POLYGON_RPCS:
+            try:
+                r = requests.post(rpc, json=payload, headers={"User-Agent": "Mozilla/5.0"}, timeout=2)
+                if r.status_code == 200:
+                    res = r.json()
+                    if "result" in res and "error" not in res:
+                        raw = int(res["result"], 16)
+                        total_bal += raw / 1e6
+                        break
+            except Exception:
+                continue
+
+    return round(total_bal, 2)
+
+
+def query_onchain_token_balance(wallet_address: str, token_id: str) -> float:
+    """Запрашивает ончейн количество долей (shares) исхода в контракте CTF на Polygon."""
+    if not wallet_address or not token_id:
+        return 0.0
+    try:
+        asset_int = int(token_id)
+        addr_padded = wallet_address[2:].lower().rjust(64, "0")
+        id_padded = hex(asset_int)[2:].rjust(64, "0")
+        # balanceOf(address,uint256) selector: 0x00fdd58e
+        data = "0x00fdd58e" + addr_padded + id_padded
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": CTF_CONTRACT, "data": data}, "latest"],
+            "id": 1,
+        }
+        for rpc in POLYGON_RPCS:
+            try:
+                r = requests.post(rpc, json=payload, headers={"User-Agent": "Mozilla/5.0"}, timeout=2)
+                if r.status_code == 200:
+                    res = r.json()
+                    if "result" in res and "error" not in res:
+                        raw = int(res["result"], 16)
+                        return round(raw / 1e6, 4)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug(f"Ончейн запрос баланса токена {token_id} завершился с ошибкой: {e}")
+
+    # Fallback на Polymarket Data API
+    try:
+        url = f"https://data-api.polymarket.com/positions?user={wallet_address.lower()}"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
+        if r.status_code == 200:
+            positions = r.json()
+            for p in positions:
+                if str(p.get("asset")) == str(token_id):
+                    return round(float(p.get("size", 0.0)), 4)
+    except Exception:
+        pass
+
+    return 0.0
+
+
 def validate_private_key(raw_key: str) -> Tuple[bool, str, str]:
     """
     Проверяет валидность приватного ключа и способность авторизации на Polymarket CLOB.
-    Возвращает (успех, публичный_адрес, ошибка).
+    Возвращает (успех, публичный_адрес_подписанта, ошибка).
     """
     try:
         key = clean_private_key(raw_key)
@@ -60,50 +175,114 @@ def validate_private_key(raw_key: str) -> Tuple[bool, str, str]:
         return False, "", f"Сбой проверки ключа: {str(e)}"
 
 
-def get_wallet_collateral_balance(raw_key: str) -> float:
-    """Возвращает баланс USDC на счете Polymarket."""
-    try:
-        key = clean_private_key(raw_key)
-        client = ClobClient(
-            host=POLYMARKET_CLOB_HOST,
-            key=key,
-            chain_id=POLYGON_CHAIN_ID,
-            signature_type=0,
-        )
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
+def get_wallet_collateral_balance(
+    raw_key: str = "",
+    wallet_address: str = "",
+    proxy_address: str = "",
+) -> float:
+    """Возвращает баланс USDC/PUSD на счете Polymarket."""
+    # 1. Извлекаем адрес подписанта, если передан ключ
+    if raw_key and not wallet_address:
+        try:
+            key = clean_private_key(raw_key)
+            wallet_address = Account.from_key(key).address
+        except Exception:
+            pass
 
-        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        res = client.get_balance_allowance(params)
-        raw_bal = float(res.get("balance", 0))
-        return round(raw_bal / 1e6, 2)
-    except Exception as e:
-        logger.warning(f"Не удалось получить баланс USDC: {e}")
+    # 2. Если proxy_address не указан, разрешаем его через Polymarket Gamma API
+    if not proxy_address and wallet_address:
+        proxy_address = resolve_polymarket_proxy(wallet_address) or ""
+
+    target_address = proxy_address if proxy_address else wallet_address
+    if not target_address:
         return 0.0
 
+    # 3. Ончейн-проверка баланса на целевом адресе (PUSD / USDC)
+    bal = query_onchain_collateral_balance(target_address)
+    if bal > 0:
+        return bal
 
-def get_token_balance(raw_key: str, token_id: str) -> float:
+    # 4. Если на целевом 0 и есть EOA, проверяем также EOA
+    if proxy_address and wallet_address and proxy_address.lower() != wallet_address.lower():
+        eoa_bal = query_onchain_collateral_balance(wallet_address)
+        if eoa_bal > 0:
+            return eoa_bal
+
+    # 5. Резервная проверка через CLOB API при наличии ключа
+    if raw_key:
+        try:
+            key = clean_private_key(raw_key)
+            sig_type = 1 if (proxy_address and proxy_address.lower() != wallet_address.lower()) else 0
+            client = ClobClient(
+                host=POLYMARKET_CLOB_HOST,
+                key=key,
+                chain_id=POLYGON_CHAIN_ID,
+                signature_type=sig_type,
+                funder=proxy_address if proxy_address else None,
+            )
+            creds = client.create_or_derive_api_creds()
+            if creds:
+                client.set_api_creds(creds)
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=sig_type)
+                res = client.get_balance_allowance(params)
+                raw_bal = float(res.get("balance", 0))
+                return round(raw_bal / 1e6, 2)
+        except Exception as e:
+            logger.warning(f"Не удалось получить баланс через CLOB: {e}")
+
+    return 0.0
+
+
+def get_token_balance(
+    raw_key: str,
+    token_id: str,
+    proxy_address: str = "",
+) -> float:
     """Возвращает количество контрактов (shares) конкретного токена на балансе."""
     if not token_id:
         return 0.0
+
+    # 1. Определяем адреса
+    wallet_address = ""
     try:
         key = clean_private_key(raw_key)
+        wallet_address = Account.from_key(key).address
+    except Exception:
+        pass
+
+    if not proxy_address and wallet_address:
+        proxy_address = resolve_polymarket_proxy(wallet_address) or ""
+
+    target_address = proxy_address if proxy_address else wallet_address
+
+    # 2. Ончейн-проверка баланса долей
+    if target_address:
+        onchain_shares = query_onchain_token_balance(target_address, token_id)
+        if onchain_shares > 0:
+            return onchain_shares
+
+    # 3. Fallback на CLOB API
+    try:
+        key = clean_private_key(raw_key)
+        sig_type = 1 if (proxy_address and wallet_address and proxy_address.lower() != wallet_address.lower()) else 0
         client = ClobClient(
             host=POLYMARKET_CLOB_HOST,
             key=key,
             chain_id=POLYGON_CHAIN_ID,
-            signature_type=0,
+            signature_type=sig_type,
+            funder=proxy_address if proxy_address else None,
         )
         creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
-
-        params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
-        res = client.get_balance_allowance(params)
-        raw_bal = float(res.get("balance", 0))
-        return round(raw_bal / 1e6, 4)
+        if creds:
+            client.set_api_creds(creds)
+            params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id, signature_type=sig_type)
+            res = client.get_balance_allowance(params)
+            raw_bal = float(res.get("balance", 0))
+            return round(raw_bal / 1e6, 4)
     except Exception as e:
-        logger.warning(f"Не удалось получить баланс токена {token_id}: {e}")
-        return 0.0
+        logger.warning(f"Не удалось получить баланс токена {token_id} через CLOB: {e}")
+
+    return 0.0
 
 
 def execute_market_sell(
@@ -111,10 +290,15 @@ def execute_market_sell(
     token_id: str,
     shares: float,
     worst_price: float = 0.01,
+    proxy_address: str = "",
+    signature_type: int = 1,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Выполняет продажу указанного объема контрактов по рынку (Market-Taker).
-    Возвращает (успех, order_id_или_ошибка, детали).
+    Учитывает архитектуру Polymarket Proxy/Safe:
+    - maker: proxy_address (где хранятся токены)
+    - signer: EOA address из приватного ключа
+    - signatureType: 1 (Polymarket Proxy)
     """
     if not token_id:
         return False, "Не указан token_id для продажи", {}
@@ -124,11 +308,27 @@ def execute_market_sell(
 
     try:
         key = clean_private_key(raw_key)
+        signer_acc = Account.from_key(key)
+        signer_addr = signer_acc.address
+
+        if not proxy_address:
+            proxy_address = resolve_polymarket_proxy(signer_addr) or ""
+
+        # Если proxyWallet найден и отличается от адреса ключа -> signature_type = 1, funder = proxy
+        sig_type = signature_type
+        if proxy_address and proxy_address.lower() != signer_addr.lower():
+            sig_type = 1
+            funder_addr = proxy_address
+        else:
+            sig_type = 0
+            funder_addr = signer_addr
+
         client = ClobClient(
             host=POLYMARKET_CLOB_HOST,
             key=key,
             chain_id=POLYGON_CHAIN_ID,
-            signature_type=0,
+            signature_type=sig_type,
+            funder=funder_addr,
         )
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)

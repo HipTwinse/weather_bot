@@ -44,7 +44,11 @@ from database import (
     get_user_wallet,
     delete_user_wallet,
 )
-from clob_trader import validate_private_key, get_wallet_collateral_balance
+from clob_trader import (
+    validate_private_key,
+    get_wallet_collateral_balance,
+    resolve_polymarket_proxy,
+)
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
 from polymarket_service import (
@@ -861,22 +865,46 @@ async def cmd_set_wallet_key(message: Message):
         return
 
     raw_key = args[1].strip()
-    valid, address, err = validate_private_key(raw_key)
-    if not valid:
+
+    # Если пользователь по ошибке отправил публичный EVM-адрес вместо приватного ключа
+    if raw_key.startswith("0x") and len(raw_key) == 42:
         await message.answer(
-            f"❌ <b>Ошибка валидации ключа:</b> {err}\n\n"
-            "Проверь, что скопирован верный приватный ключ из раздела <i>Кошелек ➔ Экспорт ключа</i> в Predy.",
+            "⚠️ <b>Ты отправил публичный адрес (EVM Address), а не приватный ключ!</b>\n\n"
+            "Публичный адрес кошелька видят все, но бот не сможет продавать по нему позиции без закрытого ключа подписи.\n\n"
+            "👉 <b>Где взять приватный ключ в приложении Predy:</b>\n"
+            "1. Зайди в Predy ➔ Настройки / Профиль / Кошелек.\n"
+            "2. Выбери пункт <b>Экспорт ключа (Export Private Key)</b>.\n"
+            "3. Скопируй секретный ключ (64 символа).\n"
+            "4. Отправь команду: <code>/set_key &lt;приватный_ключ&gt;</code>\n\n"
+            "🛡️ <i>Бот мгновенно сотрет твое сообщение из переписки ради безопасности.</i>",
             parse_mode="HTML",
         )
         return
 
-    save_user_wallet(message.from_user.id, raw_key, address)
-    balance = get_wallet_collateral_balance(raw_key)
+    valid, address, err = validate_private_key(raw_key)
+    if not valid:
+        await message.answer(
+            f"❌ <b>Ошибка валидации ключа:</b> {err}\n\n"
+            "Проверь, что скопирован именно секретный приватный ключ из раздела <i>Кошелек ➔ Экспорт ключа</i> в Predy.",
+            parse_mode="HTML",
+        )
+        return
+
+    proxy_address = resolve_polymarket_proxy(address) or address
+    sig_type = 1 if (proxy_address and proxy_address.lower() != address.lower()) else 0
+    save_user_wallet(message.from_user.id, raw_key, address, proxy_address, sig_type)
+    balance = get_wallet_collateral_balance(raw_key, wallet_address=address, proxy_address=proxy_address)
+
+    addr_info = [
+        f"• <b>Ключ подписи (Signer):</b> <code>{address[:6]}...{address[-4:]}</code>",
+    ]
+    if proxy_address and proxy_address.lower() != address.lower():
+        addr_info.append(f"• <b>Торговый сейф Polymarket:</b> <code>{proxy_address[:6]}...{proxy_address[-4:]}</code>")
+    addr_info.append(f"• <b>Баланс средств:</b> <b>${balance:.2f} USDC</b>")
 
     await message.answer(
         "✅ <b>КОШЕЛЕК УСПЕШНО ПОДКЛЮЧЕН К АВТОПРОДАЖЕ!</b>\n\n"
-        f"• <b>Адрес:</b> <code>{address[:6]}...{address[-4:]}</code>\n"
-        f"• <b>Баланс USDC:</b> <b>${balance:.2f}</b>\n\n"
+        + "\n".join(addr_info) + "\n\n"
         "🛡️ <i>Твое сообщение с ключом стерто из истории переписки.</i>\n"
         "🚀 Теперь бот готов автоматически закрывать твои сделки по умному алгоритму:\n"
         "1. <b>Скользящий замок прибыли:</b> выжимает ракеты (+80%...+150%) и продает на первом откате вниз.\n"
@@ -899,9 +927,17 @@ async def cmd_check_wallet(message: Message):
         )
         return
 
-    balance = get_wallet_collateral_balance(wallet["private_key"])
     address = wallet["wallet_address"]
-    short_addr = f"{address[:6]}...{address[-4:]}"
+    proxy_address = wallet.get("proxy_address") or resolve_polymarket_proxy(address) or address
+    balance = get_wallet_collateral_balance(wallet.get("private_key", ""), wallet_address=address, proxy_address=proxy_address)
+
+    addr_info = [
+        f"• <b>Ключ подписи (Signer):</b> <code>{address[:6]}...{address[-4:]}</code>",
+    ]
+    if proxy_address and proxy_address.lower() != address.lower():
+        addr_info.append(f"• <b>Торговый сейф Polymarket:</b> <code>{proxy_address[:6]}...{proxy_address[-4:]}</code>")
+    addr_info.append(f"• <b>Баланс средств:</b> <b>${balance:.2f} USDC</b>")
+    addr_info.append("• <b>Статус автопродажи:</b> 🟢 <b>Активна и готова к исполнению</b>")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[
@@ -910,9 +946,7 @@ async def cmd_check_wallet(message: Message):
     )
     await message.answer(
         f"👛 <b>ПОДКЛЮЧЕННЫЙ КОШЕЛЕК POLYMARKET:</b>\n\n"
-        f"• <b>Адрес:</b> <code>{short_addr}</code>\n"
-        f"• <b>Баланс USDC:</b> <b>${balance:.2f}</b>\n"
-        f"• <b>Статус автопродажи:</b> 🟢 <b>Активна и готова к исполнению</b>",
+        + "\n".join(addr_info),
         parse_mode="HTML",
         reply_markup=kb,
     )
