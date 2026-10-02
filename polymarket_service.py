@@ -182,12 +182,23 @@ def parse_markets_orderbook(markets: List[Dict[str, Any]]) -> List[Dict[str, Any
         temp_val = extract_temp_value(title)
         price_cents = round(yes_price * 100, 1)
 
+        clob_ids_raw = item.get("clobTokenIds")
+        yes_token_id = ""
+        if clob_ids_raw:
+            try:
+                clob_ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+                if clob_ids and len(clob_ids) > 0:
+                    yes_token_id = str(clob_ids[0])
+            except Exception:
+                pass
+
         parsed.append({
             "title": title,
             "temp": temp_val,
             "yes_price": yes_price,
             "price_cents": price_cents,
             "market_id": item.get("id"),
+            "token_id": yes_token_id,
         })
 
     # Сортируем по возрастанию температуры, если есть числовые значения
@@ -206,5 +217,20 @@ def get_current_outcome_price(orderbook: List[Dict[str, Any]], target_outcome_st
     for item in orderbook:
         if item["temp"] is not None and abs(item["temp"] - target_num) < 0.3:
             return item["price_cents"]
+
+    return None
+
+
+def get_outcome_token_id(orderbook: List[Dict[str, Any]], target_outcome_str: str) -> Optional[str]:
+    """
+    Ищет token_id в разобранном стакане для заданного исхода.
+    """
+    target_num = extract_temp_value(target_outcome_str)
+    if target_num is None:
+        return None
+
+    for item in orderbook:
+        if item.get("temp") is not None and abs(item["temp"] - target_num) < 0.3:
+            return item.get("token_id")
 
     return None

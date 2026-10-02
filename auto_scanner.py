@@ -37,10 +37,24 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
 from airport_resolver import resolve_airport
-from database import get_all_active_positions, set_bot_state, get_bot_state
+from database import (
+    get_all_active_positions,
+    set_bot_state,
+    get_bot_state,
+    get_user_wallet,
+    update_position_trailing,
+    close_position_with_exit,
+)
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
-from polymarket_service import find_city_weather_event, parse_markets_orderbook, get_current_outcome_price, extract_temp_value
+from polymarket_service import (
+    find_city_weather_event,
+    parse_markets_orderbook,
+    get_current_outcome_price,
+    extract_temp_value,
+    get_outcome_token_id,
+)
+from clob_trader import execute_market_sell, get_token_balance
 
 logger = logging.getLogger("AutoScanner")
 
@@ -869,6 +883,118 @@ async def _safe_send_digest(
     return False
 
 
+async def check_and_execute_auto_sell(
+    bot: Bot,
+    city_data: Dict[str, Any],
+    pos: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Проверяет триггеры умного выхода (Трейлинг-тейк, Погодный парашют, Тайм-стоп)
+    и при их срабатывании автоматически исполняет продажу на Polymarket CLOB.
+    """
+    user_id = pos.get("user_id")
+    if not user_id:
+        return None
+
+    wallet = await asyncio.to_thread(get_user_wallet, user_id)
+    if not wallet or not wallet.get("private_key"):
+        return None
+
+    orderbook = city_data.get("orderbook", [])
+    target_outcomes = pos.get("outcomes", "")
+    cur_price = get_current_outcome_price(orderbook, target_outcomes)
+    if cur_price is None or cur_price <= 0:
+        return None
+
+    pos_id = pos["id"]
+    entry_price = float(pos.get("entry_price") or 0.0)
+    peak_price = max(float(pos.get("peak_price") or entry_price), cur_price)
+    trailing_active = int(pos.get("trailing_active") or 0)
+    icao = city_data["icao"]
+    city_name = city_data["city_name"]
+    temp_c = city_data["temp_c"]
+    rate_val = city_data["rate_val"]
+    rem_hours = city_data["rem_hours_str"]
+    raw_metar = city_data["raw_metar"]
+    local_dt = city_data["local_dt"]
+    local_time_val = local_dt.hour + local_dt.minute / 60.0
+    heating_cutoff, _ = get_seasonal_heating_cutoff(local_dt.month, icao=icao)
+    target_temp = extract_temp_value(target_outcomes)
+
+    # 1. Активация трейлинга: если цена выросла на >= 50% или достигла >= 55¢
+    if not trailing_active:
+        if (entry_price > 0 and (cur_price - entry_price) / entry_price >= 0.50) or cur_price >= 55.0:
+            trailing_active = 1
+            await asyncio.to_thread(update_position_trailing, pos_id, peak_price, 1)
+
+    if peak_price > float(pos.get("peak_price") or 0.0):
+        await asyncio.to_thread(update_position_trailing, pos_id, peak_price, trailing_active)
+
+    trigger_reason = None
+
+    # Триггер А: Трейлинг-выход (замок прибыли сработал на откате 5–6¢ от пика)
+    if trailing_active and (peak_price - cur_price) >= 5.0 and cur_price > 0:
+        trigger_reason = f"🎉 ТРЕЙЛИНГ-ТЕЙК (ЗАМОК ПРИБЫЛИ): Пик был {peak_price:.0f}¢, выход на откате по {cur_price:.0f}¢"
+
+    # Триггер Б: Сезонный тайм-стоп (окно инсоляции закрыто, цель не пробита)
+    elif (local_time_val >= heating_cutoff or "Окно закрыто" in rem_hours) and (target_temp and temp_c and temp_c < target_temp):
+        cutoff_m = int((heating_cutoff % 1) * 60)
+        trigger_reason = f"⏱️ СЕЗОННЫЙ ТАЙМ-СТОП ({int(heating_cutoff)}:{cutoff_m:02d} LT): Окно инсоляции завершено"
+
+    # Триггер В: Погодный парашют (обложные осадки / плотный Stratus)
+    elif is_blocking_rain_and_clouds(raw_metar):
+        trigger_reason = "🛑 ПОГОДНЫЙ ПАРАШЮТ: Обложные осадки блокируют дневной прогрев"
+    elif 12.5 <= local_time_val <= heating_cutoff and (rate_val < 0.4 and has_real_low_cloud(raw_metar) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
+        trigger_reason = "🛑 ПОГОДНЫЙ ПАРАШЮТ: Затухание темпа под плотной облачностью"
+
+    if not trigger_reason:
+        return None
+
+    # Исполнение сделки
+    token_id = pos.get("token_id") or get_outcome_token_id(orderbook, target_outcomes)
+    if not token_id:
+        logger.warning(f"Не найден token_id для {target_outcomes} в {icao}, автопродажа невозможна.")
+        return None
+
+    # Определяем доступный объем контрактов
+    shares = await asyncio.to_thread(get_token_balance, wallet["private_key"], token_id)
+    if shares <= 0:
+        shares = float(pos.get("shares") or 5.0)
+
+    # Выполняем продажу
+    success, order_id, details = await asyncio.to_thread(
+        execute_market_sell,
+        wallet["private_key"],
+        token_id,
+        shares,
+        worst_price=0.001,
+    )
+
+    if success:
+        await asyncio.to_thread(close_position_with_exit, pos_id, cur_price)
+        pnl_val = round(((cur_price - entry_price) / entry_price) * 100, 1) if entry_price > 0 else 0.0
+        pnl_str = f"{'+' if pnl_val >= 0 else ''}{pnl_val:.0f}%"
+
+        notify_text = (
+            f"⚡ <b>АВТОПРОДАЖА УСПЕШНО ИСПОЛНЕНА!</b>\n\n"
+            f"• <b>Причина:</b> {trigger_reason}\n"
+            f"• <b>Локация:</b> {city_name}\n"
+            f"• <b>Исход:</b> <code>{target_outcomes}</code>\n"
+            f"• <b>Объем:</b> <code>{shares:.2f} контрактов</code>\n"
+            f"• <b>Цена выхода:</b> <b>{cur_price:.0f}¢</b> (Вход: <code>{entry_price:.0f}¢</code> | Результат: <b>{pnl_str}</b>)\n\n"
+            f"💰 <i>Средства возвращены на твой баланс в Predy/Polymarket. Сделка автоматически закрыта.</i>"
+        )
+        try:
+            await bot.send_message(user_id, notify_text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление об автопродаже: {e}")
+
+        return trigger_reason
+    else:
+        logger.error(f"Сбой исполнения автопродажи для позиции {pos_id}: {order_id}")
+        return None
+
+
 async def send_consolidated_digest(
     bot: Bot,
     cities_metrics: List[Dict[str, Any]],
@@ -906,6 +1032,8 @@ async def send_consolidated_digest(
             admin_blocks = []
             for cm in cities_metrics:
                 admin_pos = next((p for p in active_positions if p["icao"] == cm["icao"] and p["user_id"] == admin_id), None)
+                if admin_pos:
+                    await check_and_execute_auto_sell(bot, cm, admin_pos)
                 admin_blocks.append(build_dynamic_city_block(cm, admin_pos))
             full_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(admin_blocks)
 
@@ -920,6 +1048,8 @@ async def send_consolidated_digest(
             user_blocks = []
             for cm in cities_metrics:
                 user_pos = next((p for p in active_positions if p["icao"] == cm["icao"] and p["user_id"] == uid), None)
+                if user_pos:
+                    await check_and_execute_auto_sell(bot, cm, user_pos)
                 user_blocks.append(build_dynamic_city_block(cm, user_pos))
             user_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(user_blocks)
 

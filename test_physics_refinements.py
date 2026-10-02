@@ -317,3 +317,71 @@ def test_orderbook_execution_rules_and_adverse_selection():
     assert "Утренняя лимитка в спред" in early_block
 
 
+def test_auto_trader_and_wallet_management():
+    from eth_account import Account
+    from clob_trader import validate_private_key, clean_private_key
+    from database import (
+        save_user_wallet,
+        get_user_wallet,
+        delete_user_wallet,
+        add_position,
+        get_user_positions,
+        update_position_trailing,
+        close_position_with_exit,
+    )
+
+    # 1. Invalid private key
+    ok, addr, err = validate_private_key("invalid_key_123")
+    assert not ok
+    assert "Неверный формат" in err
+
+    # 2. Valid generated private key
+    acc = Account.create()
+    test_pk = acc.key.hex()
+    ok, addr, err = validate_private_key(test_pk)
+    assert ok
+    assert addr.lower() == acc.address.lower()
+    assert err == ""
+
+    # 3. Database wallet persistence
+    test_uid = 99912345
+    save_user_wallet(test_uid, test_pk, addr)
+    w = get_user_wallet(test_uid)
+    assert w is not None
+    assert w["wallet_address"] == addr
+
+    # 4. Position trailing and auto-exit database tracking
+    pos_id = add_position(
+        user_id=test_uid,
+        icao="LIMC",
+        outcomes="23°C",
+        target_date="2026-10-03",
+        entry_price=35.0,
+        shares=5.0,
+        token_id="123456789",
+    )
+    positions = get_user_positions(test_uid)
+    matching = [p for p in positions if p["id"] == pos_id]
+    assert len(matching) == 1
+    assert matching[0]["token_id"] == "123456789"
+    assert matching[0]["peak_price"] == 35.0
+
+    # Update trailing
+    update_position_trailing(pos_id, peak_price=78.0, trailing_active=1)
+    positions = get_user_positions(test_uid)
+    matching = [p for p in positions if p["id"] == pos_id]
+    assert matching[0]["peak_price"] == 78.0
+    assert matching[0]["trailing_active"] == 1
+
+    # Close with exit
+    close_position_with_exit(pos_id, exit_price=74.0)
+    positions = get_user_positions(test_uid)
+    matching = [p for p in positions if p["id"] == pos_id]
+    assert len(matching) == 0  # Position is now CLOSED
+
+    # Cleanup wallet
+    delete_user_wallet(test_uid)
+    assert get_user_wallet(test_uid) is None
+
+
+

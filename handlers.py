@@ -36,8 +36,15 @@ from aiogram.types import (
 from timezonefinder import TimezoneFinder
 
 import config
-from airport_resolver import resolve_airport
-from database import add_position, delete_position, get_user_positions
+from database import (
+    add_position,
+    delete_position,
+    get_user_positions,
+    save_user_wallet,
+    get_user_wallet,
+    delete_user_wallet,
+)
+from clob_trader import validate_private_key, get_wallet_collateral_balance
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
 from polymarket_service import (
@@ -45,6 +52,7 @@ from polymarket_service import (
     parse_markets_orderbook,
     extract_temp_value,
     get_current_outcome_price,
+    get_outcome_token_id,
     fetch_event_by_id_or_slug,
     POLYMARKET_GAMMA_API,
 )
@@ -829,6 +837,169 @@ async def cmd_my_positions(message: Message, state: FSMContext):
     )
 
 
+# -------------------------------------------------------------
+# АВТОПРОДАЖА И ПОДКЛЮЧЕНИЕ КОШЕЛЬКА POLYMARKET
+# -------------------------------------------------------------
+
+@router.message(Command("set_key"), StateFilter("*"))
+async def cmd_set_wallet_key(message: Message):
+    # Мгновенно удаляем сообщение с приватным ключом ради безопасности пользователя
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "🔒 <b>Подключение торгового кошелька к автопродаже:</b>\n\n"
+            "Отправь команду вместе с ключом из Predy:\n"
+            "<code>/set_key &lt;твой_приватный_ключ&gt;</code>\n\n"
+            "🛡️ <i>Сообщение с ключом будет мгновенно удалено ботом из чата для безопасности.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    raw_key = args[1].strip()
+    valid, address, err = validate_private_key(raw_key)
+    if not valid:
+        await message.answer(
+            f"❌ <b>Ошибка валидации ключа:</b> {err}\n\n"
+            "Проверь, что скопирован верный приватный ключ из раздела <i>Кошелек ➔ Экспорт ключа</i> в Predy.",
+            parse_mode="HTML",
+        )
+        return
+
+    save_user_wallet(message.from_user.id, raw_key, address)
+    balance = get_wallet_collateral_balance(raw_key)
+
+    await message.answer(
+        "✅ <b>КОШЕЛЕК УСПЕШНО ПОДКЛЮЧЕН К АВТОПРОДАЖЕ!</b>\n\n"
+        f"• <b>Адрес:</b> <code>{address[:6]}...{address[-4:]}</code>\n"
+        f"• <b>Баланс USDC:</b> <b>${balance:.2f}</b>\n\n"
+        "🛡️ <i>Твое сообщение с ключом стерто из истории переписки.</i>\n"
+        "🚀 Теперь бот готов автоматически закрывать твои сделки по умному алгоритму:\n"
+        "1. <b>Скользящий замок прибыли:</b> выжимает ракеты (+80%...+150%) и продает на первом откате вниз.\n"
+        "2. <b>Погодный парашют:</b> экстренный сброс в рынок при дожде или плотной облачности.\n"
+        "3. <b>Сезонный таймер:</b> продажа при закрытии солнечного окна в городе.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("wallet"), StateFilter("*"))
+async def cmd_check_wallet(message: Message):
+    wallet = get_user_wallet(message.from_user.id)
+    if not wallet:
+        await message.answer(
+            "👛 <b>Кошелек для автопродажи не подключен.</b>\n\n"
+            "Чтобы бот сам вовремя продавал твои позиции на Polymarket, "
+            "экспортируй ключ из Predy и отправь команду:\n"
+            "<code>/set_key &lt;твой_приватный_ключ&gt;</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    balance = get_wallet_collateral_balance(wallet["private_key"])
+    address = wallet["wallet_address"]
+    short_addr = f"{address[:6]}...{address[-4:]}"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🔌 Отключить кошелек", callback_data="disconnect_wallet_confirm")
+        ]]
+    )
+    await message.answer(
+        f"👛 <b>ПОДКЛЮЧЕННЫЙ КОШЕЛЕК POLYMARKET:</b>\n\n"
+        f"• <b>Адрес:</b> <code>{short_addr}</code>\n"
+        f"• <b>Баланс USDC:</b> <b>${balance:.2f}</b>\n"
+        f"• <b>Статус автопродажи:</b> 🟢 <b>Активна и готова к исполнению</b>",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "disconnect_wallet_confirm")
+async def process_disconnect_wallet_callback(callback: CallbackQuery):
+    delete_user_wallet(callback.from_user.id)
+    await callback.message.edit_text(
+        "🔌 <b>Кошелек успешно отключен.</b> Все данные удалены.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("open"), StateFilter("*"))
+async def cmd_quick_open_position(message: Message):
+    """
+    Быстрое добавление сделки: /open <город> <страйк> <цена_входа>
+    Например: /open Милан 23 35
+    """
+    args = (message.text or "").split()[1:]
+    if len(args) < 2:
+        await message.answer(
+            "📌 <b>Быстрое взятие сделки на автопилот:</b>\n\n"
+            "Формат команды:\n"
+            "<code>/open &lt;город&gt; &lt;градус&gt; &lt;цена_входа_в_центах&gt;</code>\n\n"
+            "<i>Пример:</i> <code>/open Милан 23 35</code>\n"
+            "<i>Пример:</i> <code>/open Лондон 25 18</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    city_raw = args[0].strip().lower()
+    city_map = {
+        "лондон": "EGLC", "london": "EGLC", "eglc": "EGLC",
+        "париж": "LFPB", "paris": "LFPB", "lfpb": "LFPB",
+        "милан": "LIMC", "milan": "LIMC", "limc": "LIMC",
+        "мадрид": "LEMD", "madrid": "LEMD", "lemd": "LEMD",
+    }
+    icao = city_map.get(city_raw, "EGLC")
+    strike_val = extract_temp_value(args[1])
+    if strike_val is None:
+        await message.answer("❌ Не удалось распознать градус. Пример: <code>/open Милан 23 35</code>", parse_mode="HTML")
+        return
+
+    entry_price = float(extract_temp_value(args[2]) or 0.0) if len(args) >= 3 else 35.0
+    outcomes_str = f"{int(strike_val)}°C"
+
+    airport_data = resolve_airport(icao) or {}
+    tz_name = airport_data.get("timezone", "UTC")
+    try:
+        local_date = datetime.now(zoneinfo.ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+    except Exception:
+        local_date = datetime.now().strftime("%Y-%m-%d")
+
+    # Ищем token_id на Polymarket
+    token_id = ""
+    event = await find_city_weather_event(icao, target_date=local_date)
+    if event and event.get("markets"):
+        orderbook = parse_markets_orderbook(event["markets"])
+        token_id = get_outcome_token_id(orderbook, outcomes_str) or ""
+
+    pos_id = add_position(
+        user_id=message.from_user.id,
+        icao=icao,
+        outcomes=outcomes_str,
+        target_date=local_date,
+        entry_price=entry_price,
+        token_id=token_id,
+    )
+
+    wallet = get_user_wallet(message.from_user.id)
+    auto_status = "🟢 <b>АКТИВНА</b> (Трейлинг + Погодный парашют)" if wallet else "⚪ <b>Отключена</b> (отправь /set_key для автовыхода)"
+
+    city_name = ALL_RADAR_CITIES.get(icao, icao)
+    await message.answer(
+        f"✅ <b>СДЕЛКА ВЗЯТА НА АВТОПИЛОТ!</b>\n\n"
+        f"• <b>Город:</b> {city_name}\n"
+        f"• <b>Исход:</b> <code>{outcomes_str}</code> (Вход: <b>{entry_price:.0f}¢</b>)\n"
+        f"• <b>Дата:</b> <code>{local_date}</code>\n"
+        f"• <b>Автопродажа:</b> {auto_status}\n\n"
+        f"🛡️ <i>Спокойно иди на смену. Бот сам продаст токен по рынку на пике разгона (+80%...+150%), "
+        f"либо мгновенно катапультируется при дожде/тучах!</i>",
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(F.data == "add_new_pos")
 async def process_add_pos_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AddPositionStates.waiting_for_city)
@@ -874,25 +1045,36 @@ async def process_pos_outcomes_input(message: Message, state: FSMContext):
 
     outcomes_str = f"{int(temp_val)}°C" if temp_val is not None else user_input
 
+    # Ищем token_id на Polymarket для автопродажи
+    token_id = ""
+    event = await find_city_weather_event(icao, target_date=target_date)
+    if event and event.get("markets"):
+        orderbook = parse_markets_orderbook(event["markets"])
+        token_id = get_outcome_token_id(orderbook, outcomes_str) or ""
+
     add_position(
         user_id=message.from_user.id,
         icao=icao,
         outcomes=outcomes_str,
         target_date=target_date,
-        entry_price=entry_price
+        entry_price=entry_price,
+        token_id=token_id,
     )
 
     await state.clear()
     city_name = ALL_RADAR_CITIES.get(icao, icao)
     entry_info = f" по цене <b>{entry_price:.0f}¢</b>" if entry_price > 0 else ""
+    wallet = get_user_wallet(message.from_user.id)
+    auto_status = "🟢 <b>АКТИВНА</b> (Трейлинг + Погодный парашют)" if wallet else "⚪ <b>Отключена</b> (отправь /set_key для автовыхода)"
 
     await message.answer(
         f"✅ <b>Позиция успешно добавлена под защиту сканера!</b>\n\n"
         f"📍 <b>Город:</b> {city_name}\n"
         f"🎯 <b>Исход:</b> <code>{outcomes_str}</code>{entry_info}\n"
-        f"📅 <b>Дата:</b> <code>{target_date}</code>\n\n"
-        f"🛡️ <i>Каждые 30 минут сканер будет сопоставлять стакан Polymarket, факт METAR и темп инсоляции. "
-        f"При росте на +35% или цене >= 60¢ ты получишь сигнал на немедленный Тейк-Профит!</i>",
+        f"📅 <b>Дата:</b> <code>{target_date}</code>\n"
+        f"🤖 <b>Автопродажа:</b> {auto_status}\n\n"
+        f"🛡️ <i>Каждые 30 минут сканер сопоставляет стакан Polymarket, факт METAR и темп инсоляции. "
+        f"При подключенном кошельке бот сам исполнит продажу на пике разгона (+80%...+150%) или при дожде/тучах!</i>",
         parse_mode="HTML",
         reply_markup=main_keyboard
     )
