@@ -1181,7 +1181,12 @@ async def cmd_quick_open_position(message: Message):
     )
 
     wallet = get_user_wallet(message.from_user.id)
-    auto_status = "🟢 <b>АКТИВНА</b> (Трейлинг + Погодный парашют)" if wallet else "⚪ <b>Отключена</b> (отправь /set_key для автовыхода)"
+    has_pk = bool(wallet and wallet.get("private_key"))
+    auto_status = (
+        "🟢 <b>АКТИВНА</b> (Трейлинг + Погодный парашют)"
+        if has_pk
+        else ("🟡 <b>ТОЛЬКО СИГНАЛЫ</b> (для автопродажи отправь /set_key)" if wallet else "⚪ <b>Отключена</b> (отправь /set_key для автовыхода)")
+    )
 
     city_name = ALL_RADAR_CITIES.get(icao, icao)
     await message.answer(
@@ -1285,7 +1290,12 @@ async def process_quick_pick_pos(callback: CallbackQuery, state: FSMContext):
     )
 
     wallet = get_user_wallet(callback.from_user.id)
-    auto_status = "🟢 <b>АКТИВНА</b> (Трейлинг + Погодный парашют)" if wallet else "⚪ <b>Отключена</b> (отправь /set_key для автовыхода)"
+    has_pk = bool(wallet and wallet.get("private_key"))
+    auto_status = (
+        "🟢 <b>АКТИВНА</b> (Трейлинг + Погодный парашют)"
+        if has_pk
+        else ("🟡 <b>ТОЛЬКО СИГНАЛЫ</b> (для автопродажи отправь /set_key)" if wallet else "⚪ <b>Отключена</b> (отправь /set_key для автовыхода)")
+    )
 
     city_name = ALL_RADAR_CITIES.get(icao, icao)
     await callback.message.edit_text(
@@ -1347,7 +1357,12 @@ async def process_pos_outcomes_input(message: Message, state: FSMContext):
     city_name = ALL_RADAR_CITIES.get(icao, icao)
     entry_info = f" по цене <b>{entry_price:.0f}¢</b>" if entry_price > 0 else ""
     wallet = get_user_wallet(message.from_user.id)
-    auto_status = "🟢 <b>АКТИВНА</b> (Трейлинг + Погодный парашют)" if wallet else "⚪ <b>Отключена</b> (отправь /set_key для автовыхода)"
+    has_pk = bool(wallet and wallet.get("private_key"))
+    auto_status = (
+        "🟢 <b>АКТИВНА</b> (Трейлинг + Погодный парашют)"
+        if has_pk
+        else ("🟡 <b>ТОЛЬКО СИГНАЛЫ</b> (для автопродажи отправь /set_key)" if wallet else "⚪ <b>Отключена</b> (отправь /set_key для автовыхода)")
+    )
 
     await message.answer(
         f"✅ <b>Позиция успешно добавлена под защиту сканера!</b>\n\n"
@@ -1472,17 +1487,33 @@ async def process_quick_pos_save(callback: CallbackQuery):
     outcomes_str = f"{int(temp_val)}°C" if temp_val is not None else outcome_raw
     user_id = callback.from_user.id if callback.from_user else 0
 
+    # Ищем token_id для автопродажи
+    token_id = ""
+    event_data = await find_city_weather_event(icao, target_date)
+    if event_data and event_data.get("markets"):
+        orderbook = parse_markets_orderbook(event_data["markets"])
+        token_id = get_outcome_token_id(orderbook, outcomes_str) or ""
+
     add_position(
         user_id=user_id,
         icao=icao,
         outcomes=outcomes_str,
         target_date=target_date,
-        entry_price=price_val
+        entry_price=price_val,
+        token_id=token_id,
     )
 
     await callback.answer(f"✅ Позиция {outcomes_str} взята на радар!")
 
     city_label = ALL_RADAR_CITIES.get(icao, icao)
+    wallet = get_user_wallet(user_id)
+    has_pk = bool(wallet and wallet.get("private_key"))
+    auto_status = (
+        "🟢 <b>АКТИВНА</b> (Трейлинг + Погодный парашют)"
+        if has_pk
+        else ("🟡 <b>ТОЛЬКО СИГНАЛЫ</b> (для автопродажи отправь /set_key)" if wallet else "⚪ <b>Отключена</b> (отправь /set_key для автовыхода)")
+    )
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"⚡ Посмотреть анализ по {icao}", callback_data=f"express_scan:{icao}")],
@@ -1495,7 +1526,8 @@ async def process_quick_pos_save(callback: CallbackQuery):
         f"📍 <b>Город:</b> {city_label}\n"
         f"🎯 <b>Купленный страйк:</b> <code>{outcomes_str}</code>\n"
         f"💵 <b>Цена входа:</b> <code>{price_val:.0f}¢</code>\n"
-        f"📅 <b>Дата экспирации:</b> <code>{target_date}</code>\n\n"
+        f"📅 <b>Дата экспирации:</b> <code>{target_date}</code>\n"
+        f"🤖 <b>Автопродажа:</b> {auto_status}\n\n"
         f"🛡️ <i>Сканер теперь непрерывно сопоставляет факт METAR, ветер и солнце. "
         f"При признаках слома погоды или при достижении Тейк-Профита (+35% / 60¢) ты получишь персональный сигнал!</i>",
         parse_mode="HTML",
@@ -1534,7 +1566,17 @@ async def process_open_my_positions(callback: CallbackQuery, state: FSMContext):
         )
         return
 
-    text_lines = ["📌 <b>Твои активные сделки под защитой сканера:</b>\n"]
+    wallet = get_user_wallet(callback.from_user.id)
+    has_pk = bool(wallet and wallet.get("private_key"))
+    mode_desc = (
+        "🟢 <b>Автопродажа активна</b> (Трейлинг + Погодный парашют)"
+        if has_pk
+        else ("🟡 <b>Только сигналы</b> (для автопродажи отправь /set_key)" if wallet else "⚪ <b>Кошелек не подключен</b> (отправь /set_key)")
+    )
+    text_lines = [
+        "📌 <b>Твои активные сделки под защитой сканера:</b>",
+        f"🤖 <i>Режим защиты: {mode_desc}</i>\n",
+    ]
     buttons = []
     for pos in positions:
         city_label = ALL_RADAR_CITIES.get(pos["icao"], pos["icao"])
