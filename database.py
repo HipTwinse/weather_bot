@@ -41,6 +41,8 @@ def init_db() -> None:
             cursor.execute("ALTER TABLE user_positions ADD COLUMN trailing_active INTEGER DEFAULT 0")
         if "token_id" not in existing_cols:
             cursor.execute("ALTER TABLE user_positions ADD COLUMN token_id TEXT DEFAULT ''")
+        if "last_alert" not in existing_cols:
+            cursor.execute("ALTER TABLE user_positions ADD COLUMN last_alert TEXT DEFAULT ''")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_wallets (
@@ -67,7 +69,37 @@ def init_db() -> None:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_subscribers (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active INTEGER DEFAULT 1
+            )
+        """)
         conn.commit()
+
+        # Автоматическая регистрация администратора из config, если задан
+        try:
+            import config
+            admin_id = getattr(config, "ADMIN_CHAT_ID", None)
+            if admin_id:
+                cursor.execute("""
+                    INSERT INTO bot_subscribers (user_id, username, is_active)
+                    VALUES (?, 'admin', 1)
+                    ON CONFLICT(user_id) DO UPDATE SET is_active = 1
+                """, (int(admin_id),))
+                wallet_addr = getattr(config, "WALLET_ADDRESS", None)
+                if wallet_addr:
+                    cursor.execute("""
+                        INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, updated_at)
+                        VALUES (?, '', ?, '', 1, CURRENT_TIMESTAMP)
+                        ON CONFLICT(user_id) DO NOTHING
+                    """, (int(admin_id), str(wallet_addr).strip()))
+                conn.commit()
+        except Exception:
+            pass
 
 
 def add_position(
@@ -106,7 +138,7 @@ def get_user_positions(user_id: int) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, user_id, icao, outcomes, target_date, entry_price, status,
-                   shares, peak_price, trailing_active, token_id, created_at
+                   shares, peak_price, trailing_active, token_id, last_alert, created_at
             FROM user_positions
             WHERE user_id = ? AND (status = 'OPEN' OR status IS NULL)
             ORDER BY id DESC
@@ -122,7 +154,7 @@ def get_all_active_positions() -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, user_id, icao, outcomes, target_date, entry_price, status,
-                   shares, peak_price, trailing_active, token_id, created_at
+                   shares, peak_price, trailing_active, token_id, last_alert, created_at
             FROM user_positions
             WHERE status = 'OPEN' OR status IS NULL
         """)
@@ -282,3 +314,47 @@ def get_bot_state(key: str) -> Optional[str]:
         cursor.execute("SELECT value FROM bot_state WHERE key = ?", (key,))
         row = cursor.fetchone()
         return row[0] if row else None
+
+
+def register_subscriber(user_id: int, username: str = "") -> None:
+    """Регистрирует пользователя для получения регулярных 30-минутных дайджестов."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO bot_subscribers (user_id, username, is_active)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id) DO UPDATE SET is_active = 1, username = CASE WHEN excluded.username != '' THEN excluded.username ELSE bot_subscribers.username END
+        """, (user_id, username or ""))
+        conn.commit()
+
+
+def get_all_subscribers() -> List[int]:
+    """Возвращает список user_id всех активных подписчиков на дайджест."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM bot_subscribers WHERE is_active = 1")
+        return [row[0] for row in cursor.fetchall()]
+
+
+def save_user_public_wallet(user_id: int, wallet_address: str, proxy_address: str = "") -> None:
+    """Сохраняет публичный адрес кошелька пользователя для мониторинга баланса и сделок."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        _ensure_wallet_columns(cursor)
+        cursor.execute("""
+            INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, updated_at)
+            VALUES (?, '', ?, ?, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                wallet_address = excluded.wallet_address,
+                proxy_address = excluded.proxy_address,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, wallet_address.strip(), (proxy_address or "").strip()))
+        conn.commit()
+
+
+def update_position_alert(pos_id: int, alert_type: str) -> None:
+    """Обновляет статус последнего отправленного алерта по позиции."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE user_positions SET last_alert = ? WHERE id = ?", (alert_type, pos_id))
+        conn.commit()

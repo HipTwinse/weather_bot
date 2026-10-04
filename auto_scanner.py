@@ -39,10 +39,12 @@ import config
 from airport_resolver import resolve_airport
 from database import (
     get_all_active_positions,
+    get_all_subscribers,
     set_bot_state,
     get_bot_state,
     get_user_wallet,
     update_position_trailing,
+    update_position_alert,
     close_position_with_exit,
 )
 from noaa_service import get_noaa_package
@@ -897,8 +899,6 @@ async def check_and_execute_auto_sell(
         return None
 
     wallet = await asyncio.to_thread(get_user_wallet, user_id)
-    if not wallet or not wallet.get("private_key"):
-        return None
 
     orderbook = city_data.get("orderbook", [])
     target_outcomes = pos.get("outcomes", "")
@@ -936,12 +936,16 @@ async def check_and_execute_auto_sell(
     if trailing_active and (peak_price - cur_price) >= 5.0 and cur_price > 0:
         trigger_reason = f"🎉 ТРЕЙЛИНГ-ТЕЙК (ЗАМОК ПРИБЫЛИ): Пик был {peak_price:.0f}¢, выход на откате по {cur_price:.0f}¢"
 
-    # Триггер Б: Сезонный тайм-стоп (окно инсоляции закрыто, цель не пробита)
+    # Триггер Б: Превышение температуры (цель пробита вверх, исход математически сгорел)
+    elif target_temp is not None and temp_c is not None and temp_c > target_temp:
+        trigger_reason = f"🛑 ЦЕЛЬ ПРОБИТА ВВЕРХ ({temp_c:.1f}°C > {target_temp:.0f}°C): Страйк {target_outcomes} сгорел, спасение остатка"
+
+    # Триггер В: Сезонный тайм-стоп (окно инсоляции закрыто, цель не пробита)
     elif (local_time_val >= heating_cutoff or "Окно закрыто" in rem_hours) and (target_temp and temp_c and temp_c < target_temp):
         cutoff_m = int((heating_cutoff % 1) * 60)
         trigger_reason = f"⏱️ СЕЗОННЫЙ ТАЙМ-СТОП ({int(heating_cutoff)}:{cutoff_m:02d} LT): Окно инсоляции завершено"
 
-    # Триггер В: Погодный парашют (обложные осадки / плотный Stratus)
+    # Триггер Г: Погодный парашют (обложные осадки / плотный Stratus)
     elif is_blocking_rain_and_clouds(raw_metar):
         trigger_reason = "🛑 ПОГОДНЫЙ ПАРАШЮТ: Обложные осадки блокируют дневной прогрев"
     elif 12.5 <= local_time_val <= heating_cutoff and (rate_val < 0.4 and has_real_low_cloud(raw_metar) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
@@ -949,6 +953,31 @@ async def check_and_execute_auto_sell(
 
     if not trigger_reason:
         return None
+
+    # Проверяем наличие приватного ключа
+    has_private_key = bool(wallet and wallet.get("private_key"))
+    last_alert = str(pos.get("last_alert") or "")
+
+    # Если приватного ключа нет — отправляем ЭКСТРЕННЫЙ сигнал на ручной выход
+    if not has_private_key:
+        if last_alert != trigger_reason:
+            pnl_val = round(((cur_price - entry_price) / entry_price) * 100, 1) if entry_price > 0 else 0.0
+            pnl_str = f"{'+' if pnl_val >= 0 else ''}{pnl_val:.0f}%"
+            urgent_msg = (
+                f"🚨 <b>СРОЧНЫЙ СИГНАЛ НА ВЫХОД ИЗ СДЕЛКИ!</b>\n\n"
+                f"• <b>Причина:</b> {trigger_reason}\n"
+                f"• <b>Локация:</b> {city_name}\n"
+                f"• <b>Исход:</b> <code>{target_outcomes}</code>\n"
+                f"• <b>Текущая цена в стакане:</b> <b>{cur_price:.0f}¢</b> (Вход: <code>{entry_price:.0f}¢</code> | Результат: <b>{pnl_str}</b>)\n\n"
+                f"⚠️ <i>Приватный ключ не подключен — бот не может продать за тебя. "
+                f"Срочно открой Polymarket или Predy и сбрось позицию по рынку прямо сейчас!</i>"
+            )
+            try:
+                await bot.send_message(user_id, urgent_msg, parse_mode="HTML")
+                await asyncio.to_thread(update_position_alert, pos_id, trigger_reason)
+            except Exception as e:
+                logger.error(f"Не удалось отправить ручной алерт выхода: {e}")
+        return trigger_reason
 
     # Исполнение сделки
     token_id = pos.get("token_id") or get_outcome_token_id(orderbook, target_outcomes)
@@ -1011,7 +1040,7 @@ async def send_consolidated_digest(
     is_morning_base: bool,
     now_khv: datetime,
 ) -> None:
-    """Собирает все 4 города в единый пост и отправляет админу и активным пользователям."""
+    """Собирает все 4 города в единый пост и отправляет админу и всем подписчикам."""
     today_khv_str = now_khv.strftime("%d.%m.%Y")
     time_khv_str = now_khv.strftime("%H:%M")
 
@@ -1022,86 +1051,67 @@ async def send_consolidated_digest(
             f"━━━━━━━━━━━━━━━━━━━━"
         )
         body_blocks = [build_morning_city_block(cm) for cm in cities_metrics if cm]
+        default_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(body_blocks)
     else:
         header = (
             f"🔄 <b>ОБНОВЛЕНИЕ НА {time_khv_str} ХБР | ДИНАМИКА</b>\n"
             f"<i>Контроль темпа прогрева и статус открытых позиций</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
+        default_blocks = [build_dynamic_city_block(cm, None) for cm in cities_metrics if cm]
+        default_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(default_blocks)
 
-    # Получаем все активные позиции из базы данных
+    # Получаем всех подписчиков и открытые позиции
+    subscribers = await asyncio.to_thread(get_all_subscribers)
     active_positions = await asyncio.to_thread(get_all_active_positions)
     admin_id = getattr(config, "ADMIN_CHAT_ID", None)
 
-    # 1. Отправка администратору
+    recipients = set(subscribers)
     if admin_id:
-        if is_morning_base:
-            full_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(body_blocks)
-        else:
-            # Персонализируем для админа, если у него есть позиции
-            admin_blocks = []
-            for cm in cities_metrics:
-                admin_pos = next((p for p in active_positions if p["icao"] == cm["icao"] and p["user_id"] == admin_id), None)
-                if admin_pos:
-                    await check_and_execute_auto_sell(bot, cm, admin_pos)
-                admin_blocks.append(build_dynamic_city_block(cm, admin_pos))
-            full_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(admin_blocks)
+        try:
+            recipients.add(int(admin_id))
+        except (ValueError, TypeError):
+            pass
+    for p in active_positions:
+        if p.get("user_id"):
+            recipients.add(p["user_id"])
 
-        await _safe_send_digest(bot, admin_id, full_msg, express_scan_keyboard)
-
-    # 2. Отправка пользователям, держащим открытые позиции
-    distinct_user_ids = {p["user_id"] for p in active_positions if p.get("user_id") and p.get("user_id") != admin_id}
-    for uid in distinct_user_ids:
-        if is_morning_base:
-            user_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(body_blocks)
+    for uid in recipients:
+        user_pos_list = [p for p in active_positions if p.get("user_id") == uid]
+        if not user_pos_list or is_morning_base:
+            await _safe_send_digest(bot, uid, default_msg, express_scan_keyboard)
         else:
             user_blocks = []
             for cm in cities_metrics:
-                user_pos = next((p for p in active_positions if p["icao"] == cm["icao"] and p["user_id"] == uid), None)
-                if user_pos:
-                    await check_and_execute_auto_sell(bot, cm, user_pos)
-                user_blocks.append(build_dynamic_city_block(cm, user_pos))
-            user_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(user_blocks)
-
-        await _safe_send_digest(bot, uid, user_msg, express_scan_keyboard)
+                pos = next((p for p in user_pos_list if p["icao"] == cm["icao"]), None)
+                if pos:
+                    await check_and_execute_auto_sell(bot, cm, pos)
+                user_blocks.append(build_dynamic_city_block(cm, pos))
+            custom_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(user_blocks)
+            await _safe_send_digest(bot, uid, custom_msg, express_scan_keyboard)
 
 
 async def run_auto_scanner(bot: Bot) -> None:
     """
     Основной цикл автоматического сканера.
     Синхронизирован со сводками METAR строго 2 раза в час: ровно в :02 и :32 минуты.
-    Работает в активное торговое окно 10:00 - 00:00 по времени Хабаровска (UTC+10).
+    Работает круглосуточно (24/7) для непрерывного контроля европейских, азиатских и американских рынков.
     """
     global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT
-    logger.info("🚀 Единый консолидированный автосканер v7.1 запущен (Расписание METAR: :02 и :32).")
+    logger.info("🚀 Единый консолидированный автосканер v8.0 запущен (Режим 24/7, METAR: :02 и :32).")
 
     while True:
         try:
             now_khv = datetime.now(KHV_TZ)
 
-            # 1. Проверяем ночное окно Хабаровска (вне 10:00 - 00:00 ХБР)
-            if not is_khv_active_hours():
-                # Рассчитываем точное время сна до 10:02 ХБР
-                if now_khv.hour < 10:
-                    wake_target = now_khv.replace(hour=10, minute=2, second=2, microsecond=0)
-                else:
-                    wake_target = (now_khv + timedelta(days=1)).replace(hour=10, minute=2, second=2, microsecond=0)
-                sleep_night = max(10.0, (wake_target - now_khv).total_seconds())
-                logger.info(
-                    f"🌙 Ночное окно Хабаровска ({now_khv.strftime('%H:%M')} ХБР). "
-                    f"Сканер спит до 10:02 ХБР ({int(sleep_night // 3600)}ч {int((sleep_night % 3600) // 60)}м)."
-                )
-                await asyncio.sleep(sleep_night)
-                continue
-
-            # 2. Проверяем, находимся ли мы прямо сейчас в контрольной минуте (:02 или :32)
+            # 1. Проверяем, находимся ли мы прямо сейчас в контрольной минуте (:02 или :32)
             current_checkpoint_slot: Optional[str] = None
             if now_khv.minute in (2, 3):
                 current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:02"
             elif now_khv.minute in (32, 33):
                 current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:32"
 
-            # 3. Если мы в контрольной точке И дайджест для этого слота еще не отправлялся — отправляем!
+            # 2. Если мы в контрольной точке И дайджест для этого слота еще не отправлялся — отправляем!
             if current_checkpoint_slot and current_checkpoint_slot != _LAST_SENT_SLOT:
                 today_khv_str = now_khv.strftime("%Y-%m-%d")
 
@@ -1128,7 +1138,7 @@ async def run_auto_scanner(bot: Bot) -> None:
                 _LAST_SENT_SLOT = current_checkpoint_slot
                 logger.info(f"✅ Дайджест {current_checkpoint_slot} ХБР успешно разослан.")
 
-            # 4. Расчет точного сна до СЛЕДУЮЩЕЙ контрольной точки (:02 или :32)
+            # 3. Расчет точного сна до СЛЕДУЮЩЕЙ контрольной точки (:02 или :32)
             now_after = datetime.now(KHV_TZ)
             sleep_secs, next_target, next_slot_str = get_next_sleep_seconds(now_after)
 

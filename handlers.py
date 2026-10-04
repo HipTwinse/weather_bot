@@ -42,8 +42,10 @@ from database import (
     delete_position,
     get_user_positions,
     save_user_wallet,
+    save_user_public_wallet,
     get_user_wallet,
     delete_user_wallet,
+    register_subscriber,
 )
 from clob_trader import (
     validate_private_key,
@@ -750,6 +752,7 @@ async def process_express_scan_callback(callback: CallbackQuery):
 @router.message(CommandStart(), StateFilter("*"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    register_subscriber(message.from_user.id, message.from_user.username or "")
     welcome_text = (
         "👋 <b>Weather Alpha Engine v8.0 активен!</b>\n\n"
         "🤖 <b>AI-Квант-Синоптик:</b> Нажми <b>«🤖 AI Аналитик»</b> или отправь /ai для полного нейросетевого разбора (Gemini).\n"
@@ -807,17 +810,135 @@ async def cmd_ai_status(message: Message, state: FSMContext):
     await message.answer(text, parse_mode="HTML", reply_markup=ai_cities_inline_keyboard)
 
 
+async def sync_user_polymarket_positions(user_id: int) -> int:
+    """
+    Автоматически сканирует открытые погодные позиции пользователя на Polymarket
+    и синхронизирует их в positions.db для радарного контроля и своевременного выхода.
+    """
+    wallet = get_user_wallet(user_id)
+    if not wallet:
+        return 0
+
+    proxy_addr = wallet.get("proxy_address") or wallet.get("wallet_address") or ""
+    if not proxy_addr:
+        return 0
+
+    url = f"https://data-api.polymarket.com/positions?user={proxy_addr}"
+    synced_count = 0
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    return 0
+                positions_data = await resp.json()
+
+        if not isinstance(positions_data, list):
+            return 0
+
+        existing_positions = get_user_positions(user_id)
+
+        for item in positions_data:
+            title = item.get("title", "")
+            size = float(item.get("size") or 0.0)
+            redeemable = item.get("redeemable", False)
+
+            # Пропускаем уже закрытые рынки или нулевые балансы
+            if redeemable or size <= 0 or "highest temperature" not in title.lower():
+                continue
+
+            detected_icao = _detect_city_icao(title)
+            if not detected_icao:
+                continue
+
+            m_temp = re.search(r"be\s+(\d+)", title, re.IGNORECASE)
+            if not m_temp:
+                continue
+            outcomes_str = f"{m_temp.group(1)}°C"
+
+            target_date = item.get("endDate") or datetime.now().strftime("%Y-%m-%d")
+            entry_price = round(float(item.get("avgPrice") or 0.0) * 100.0, 1)
+            token_id = str(item.get("asset") or "")
+
+            # Проверяем, есть ли уже такая сделка в базе
+            is_already_added = any(
+                p.get("icao") == detected_icao
+                and p.get("target_date") == target_date
+                and str(p.get("outcomes")).replace(" ", "") == outcomes_str
+                for p in existing_positions
+            )
+
+            if not is_already_added:
+                add_position(
+                    user_id=user_id,
+                    icao=detected_icao,
+                    outcomes=outcomes_str,
+                    target_date=target_date,
+                    entry_price=entry_price,
+                    shares=size,
+                    token_id=token_id,
+                )
+                synced_count += 1
+                logger.info(f"✅ Автосинхронизирована позиция {detected_icao} {outcomes_str} для пользователя {user_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при синхронизации позиций Polymarket для {user_id}: {e}")
+
+    return synced_count
+
+
+async def _handle_public_wallet_input(message: Message, address: str) -> None:
+    register_subscriber(message.from_user.id, message.from_user.username or "")
+    clean_addr = address.strip()
+    if not (clean_addr.startswith("0x") and len(clean_addr) == 42):
+        await message.answer("❌ <b>Некорректный адрес кошелька.</b> Адрес должен начинаться с 0x и содержать 42 символа.", parse_mode="HTML")
+        return
+
+    proxy_addr = resolve_polymarket_proxy(clean_addr) or clean_addr
+    save_user_public_wallet(message.from_user.id, clean_addr, proxy_addr)
+    balance = get_wallet_collateral_balance("", wallet_address=clean_addr, proxy_address=proxy_addr)
+    synced_count = await sync_user_polymarket_positions(message.from_user.id)
+
+    info_lines = [
+        f"• <b>Адрес кошелька (EVM):</b> <code>{clean_addr[:6]}...{clean_addr[-4:]}</code>",
+    ]
+    if proxy_addr and proxy_addr.lower() != clean_addr.lower():
+        info_lines.append(f"• <b>Торговый сейф Polymarket:</b> <code>{proxy_addr[:6]}...{proxy_addr[-4:]}</code>")
+    info_lines.append(f"• <b>Баланс средств:</b> <b>${balance:.2f} USDC</b>")
+    info_lines.append("• <b>Режим работы:</b> 🟡 <b>Радарный мониторинг + сигналы на выход</b>")
+
+    sync_note = (
+        f"\n\n🎯 <i>Найдено и взято на радар открытых сделок: {synced_count}.</i>"
+        if synced_count > 0
+        else "\n\n<i>Открытых погодных сделок на сегодня пока не найдено. При открытии позиций на Polymarket/Preddy они автоматически подтянутся в «📌 Мои позиции».</i>"
+    )
+
+    await message.answer(
+        "✅ <b>КОШЕЛЕК УСПЕШНО ПРИВЯЗАН К РАДАРУ!</b>\n\n"
+        + "\n".join(info_lines)
+        + sync_note +
+        "\n\n🛡️ <b>Что делает бот в этом режиме:</b>\n"
+        "1. Каждые 30 минут сопоставляет твои открытые позиции с фактом погоды METAR и графиком солнца.\n"
+        "2. При достижении Тейк-Профита (+35% / 60¢), закрытии солнечного окна или дожде бот пришлет тебе <b>🚨 Срочный сигнал на продажу</b> прямо в Telegram.\n\n"
+        "💡 <i>Если в будущем захочешь, чтобы бот сам автоматически закрывал сделки на бирже без твоего участия, отправь приватный ключ через /set_key.</i>",
+        parse_mode="HTML"
+    )
+
+
 @router.message(F.text == "📌 Мои позиции", StateFilter("*"))
 @router.message(Command("positions"), StateFilter("*"))
 async def cmd_my_positions(message: Message, state: FSMContext):
     await state.clear()
+    register_subscriber(message.from_user.id, message.from_user.username or "")
+    await sync_user_polymarket_positions(message.from_user.id)
     positions = get_user_positions(message.from_user.id)
 
     if not positions:
         text = (
             "📌 <b>У тебя пока нет активных сделок на контроле.</b>\n\n"
             "Нажми <b>«➕ Добавить сделку»</b>, чтобы сканер каждые 30 минут отслеживал PnL, "
-            "сигнализировал о Тейк-Профите (+35% / 60¢) и тайм-стопе 13:30 LT!"
+            "сигнализировал о Тейк-Профите (+35% / 60¢) и тайм-стопе!\n\n"
+            "💡 <i>Или привяжи свой кошелек командой /set_wallet &lt;адрес&gt;, и бот сам найдет твои сделки с биржи!</i>"
         )
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_new_pos")]]
@@ -866,12 +987,14 @@ async def cmd_set_wallet_key(message: Message):
     except Exception:
         pass
 
+    register_subscriber(message.from_user.id, message.from_user.username or "")
     args = (message.text or "").split(maxsplit=1)
     if len(args) < 2:
         await message.answer(
             "🔒 <b>Подключение торгового кошелька к автопродаже:</b>\n\n"
             "Отправь команду вместе с ключом из Predy:\n"
             "<code>/set_key &lt;твой_приватный_ключ&gt;</code>\n\n"
+            "<i>(Или отправь /set_wallet &lt;адрес&gt; для мониторинга без приватного ключа)</i>\n\n"
             "🛡️ <i>Сообщение с ключом будет мгновенно удалено ботом из чата для безопасности.</i>",
             parse_mode="HTML",
         )
@@ -879,19 +1002,9 @@ async def cmd_set_wallet_key(message: Message):
 
     raw_key = args[1].strip()
 
-    # Если пользователь по ошибке отправил публичный EVM-адрес вместо приватного ключа
+    # Если пользователь отправил публичный EVM-адрес вместо приватного ключа
     if raw_key.startswith("0x") and len(raw_key) == 42:
-        await message.answer(
-            "⚠️ <b>Ты отправил публичный адрес (EVM Address), а не приватный ключ!</b>\n\n"
-            "Публичный адрес кошелька видят все, но бот не сможет продавать по нему позиции без закрытого ключа подписи.\n\n"
-            "👉 <b>Где взять приватный ключ в приложении Predy:</b>\n"
-            "1. Зайди в Predy ➔ Настройки / Профиль / Кошелек.\n"
-            "2. Выбери пункт <b>Экспорт ключа (Export Private Key)</b>.\n"
-            "3. Скопируй секретный ключ (64 символа).\n"
-            "4. Отправь команду: <code>/set_key &lt;приватный_ключ&gt;</code>\n\n"
-            "🛡️ <i>Бот мгновенно сотрет твое сообщение из переписки ради безопасности.</i>",
-            parse_mode="HTML",
-        )
+        await _handle_public_wallet_input(message, raw_key)
         return
 
     valid, address, err = validate_private_key(raw_key)
@@ -907,6 +1020,7 @@ async def cmd_set_wallet_key(message: Message):
     sig_type = 1 if (proxy_address and proxy_address.lower() != address.lower()) else 0
     save_user_wallet(message.from_user.id, raw_key, address, proxy_address, sig_type)
     balance = get_wallet_collateral_balance(raw_key, wallet_address=address, proxy_address=proxy_address)
+    await sync_user_polymarket_positions(message.from_user.id)
 
     addr_info = [
         f"• <b>Ключ подписи (Signer):</b> <code>{address[:6]}...{address[-4:]}</code>",
@@ -914,6 +1028,7 @@ async def cmd_set_wallet_key(message: Message):
     if proxy_address and proxy_address.lower() != address.lower():
         addr_info.append(f"• <b>Торговый сейф Polymarket:</b> <code>{proxy_address[:6]}...{proxy_address[-4:]}</code>")
     addr_info.append(f"• <b>Баланс средств:</b> <b>${balance:.2f} USDC</b>")
+    addr_info.append("• <b>Статус:</b> 🟢 <b>Полный автопилот (автопродажа включена)</b>")
 
     await message.answer(
         "✅ <b>КОШЕЛЕК УСПЕШНО ПОДКЛЮЧЕН К АВТОПРОДАЖЕ!</b>\n\n"
@@ -927,30 +1042,64 @@ async def cmd_set_wallet_key(message: Message):
     )
 
 
+@router.message(Command("set_wallet"), StateFilter("*"))
+async def cmd_set_wallet(message: Message):
+    register_subscriber(message.from_user.id, message.from_user.username or "")
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "👛 <b>Привязка публичного кошелька:</b>\n\n"
+            "Отправь команду вместе с EVM-адресом:\n"
+            "<code>/set_wallet 0x...</code>\n\n"
+            "<i>Бот автоматически найдет твой профиль Polymarket/Preddy, подтянет баланс и возьмет на радар все открытые погодные позиции!</i>",
+            parse_mode="HTML"
+        )
+        return
+    await _handle_public_wallet_input(message, args[1].strip())
+
+
+@router.message(Command("sync"), StateFilter("*"))
+async def cmd_sync(message: Message):
+    register_subscriber(message.from_user.id, message.from_user.username or "")
+    status_msg = await message.answer("🔄 <i>Синхронизирую открытые позиции с Polymarket...</i>", parse_mode="HTML")
+    count = await sync_user_polymarket_positions(message.from_user.id)
+    if count > 0:
+        await status_msg.edit_text(f"✅ <b>Синхронизация завершена!</b> Добавлено на радар новых сделок: <b>{count}</b>.\nНажми «📌 Мои позиции», чтобы увидеть их.", parse_mode="HTML")
+    else:
+        await status_msg.edit_text("✅ <b>Синхронизация завершена.</b> Все открытые сделки уже под защитой сканера.", parse_mode="HTML")
+
+
 @router.message(Command("wallet"), StateFilter("*"))
 async def cmd_check_wallet(message: Message):
+    register_subscriber(message.from_user.id, message.from_user.username or "")
+    await sync_user_polymarket_positions(message.from_user.id)
     wallet = get_user_wallet(message.from_user.id)
     if not wallet:
         await message.answer(
-            "👛 <b>Кошелек для автопродажи не подключен.</b>\n\n"
-            "Чтобы бот сам вовремя продавал твои позиции на Polymarket, "
-            "экспортируй ключ из Predy и отправь команду:\n"
-            "<code>/set_key &lt;твой_приватный_ключ&gt;</code>",
+            "👛 <b>Кошелек не подключен.</b>\n\n"
+            "• Чтобы бот отслеживал твои позиции и присылал сигналы на продажу:\n"
+            "  <code>/set_wallet &lt;твой_публичный_EVM_адрес&gt;</code>\n\n"
+            "• Чтобы бот сам автоматически закрывал сделки на бирже:\n"
+            "  <code>/set_key &lt;твой_приватный_ключ_из_Predy&gt;</code>",
             parse_mode="HTML",
         )
         return
 
     address = wallet["wallet_address"]
     proxy_address = wallet.get("proxy_address") or resolve_polymarket_proxy(address) or address
+    has_pk = bool(wallet.get("private_key"))
     balance = get_wallet_collateral_balance(wallet.get("private_key", ""), wallet_address=address, proxy_address=proxy_address)
 
     addr_info = [
-        f"• <b>Ключ подписи (Signer):</b> <code>{address[:6]}...{address[-4:]}</code>",
+        f"• <b>Кошелек:</b> <code>{address[:6]}...{address[-4:]}</code>",
     ]
     if proxy_address and proxy_address.lower() != address.lower():
         addr_info.append(f"• <b>Торговый сейф Polymarket:</b> <code>{proxy_address[:6]}...{proxy_address[-4:]}</code>")
     addr_info.append(f"• <b>Баланс средств:</b> <b>${balance:.2f} USDC</b>")
-    addr_info.append("• <b>Статус автопродажи:</b> 🟢 <b>Активна и готова к исполнению</b>")
+    if has_pk:
+        addr_info.append("• <b>Статус:</b> 🟢 <b>Полный автопилот (автопродажа активна)</b>")
+    else:
+        addr_info.append("• <b>Статус:</b> 🟡 <b>Радарный мониторинг (сигналы на продажу в Telegram)</b>")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[
@@ -1371,6 +1520,8 @@ async def process_quick_pos_close(callback: CallbackQuery):
 @router.callback_query(F.data == "open_my_positions")
 async def process_open_my_positions(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    register_subscriber(callback.from_user.id, callback.from_user.username or "")
+    await sync_user_polymarket_positions(callback.from_user.id)
     positions = get_user_positions(callback.from_user.id)
     if not positions:
         await callback.message.edit_text(
@@ -1658,6 +1809,13 @@ async def _execute_weather_pipeline(user_query: str, target_message: Message):
 @router.message(F.text)
 async def process_weather_request(message: Message):
     user_text = message.text.strip()
+    register_subscriber(message.from_user.id, message.from_user.username or "")
+
+    # Если отправлен публичный EVM-адрес кошелька (0x...)
+    if user_text.startswith("0x") and len(user_text) == 42:
+        await _handle_public_wallet_input(message, user_text)
+        return
+
     coords = _parse_coordinates(user_text)
 
     if coords:
