@@ -33,6 +33,9 @@ ADMIN_CHAT_ID = int(admin_id_raw) if admin_id_raw.isdigit() else None
 # Публичный адрес кошелька Polygon для чтения баланса Preddy / Polymarket
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "").strip() or None
 
+# Секретный приватный ключ кошелька для постоянного сохранения автопродажи на сервере
+WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "").strip() or os.getenv("PRIVATE_KEY", "").strip() or None
+
 # Прокси (если переменная не задана в облаке — бот подключится напрямую)
 PROXY_URL = os.getenv("TELEGRAM_PROXY", "").strip() or None
 

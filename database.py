@@ -90,8 +90,29 @@ def init_db() -> None:
                     VALUES (?, 'admin', 1)
                     ON CONFLICT(user_id) DO UPDATE SET is_active = 1
                 """, (int(admin_id),))
+                wallet_key = getattr(config, "WALLET_PRIVATE_KEY", None)
                 wallet_addr = getattr(config, "WALLET_ADDRESS", None)
-                if wallet_addr:
+                if wallet_key:
+                    try:
+                        from clob_trader import validate_private_key, resolve_polymarket_proxy
+                        valid, derived_addr, _ = validate_private_key(wallet_key)
+                        if valid:
+                            use_addr = derived_addr or (wallet_addr or "")
+                            proxy = resolve_polymarket_proxy(use_addr) or use_addr
+                            sig = 1 if (proxy and proxy.lower() != use_addr.lower()) else 0
+                            cursor.execute("""
+                                INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, updated_at)
+                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                ON CONFLICT(user_id) DO UPDATE SET
+                                    private_key = excluded.private_key,
+                                    wallet_address = excluded.wallet_address,
+                                    proxy_address = excluded.proxy_address,
+                                    signature_type = excluded.signature_type,
+                                    updated_at = CURRENT_TIMESTAMP
+                            """, (int(admin_id), wallet_key, use_addr, proxy, sig))
+                    except Exception:
+                        pass
+                elif wallet_addr:
                     cursor.execute("""
                         INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, updated_at)
                         VALUES (?, '', ?, '', 1, CURRENT_TIMESTAMP)

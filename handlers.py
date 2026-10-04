@@ -981,7 +981,7 @@ async def cmd_my_positions(message: Message, state: FSMContext):
 
 @router.message(Command("set_key"), StateFilter("*"))
 async def cmd_set_wallet_key(message: Message):
-    # Мгновенно удаляем сообщение с приватным ключом ради безопасности пользователя
+    status_msg = await message.answer("⏳ <i>Проверяю ключ и подключаюсь к Polymarket...</i>", parse_mode="HTML")
     try:
         await message.delete()
     except Exception:
@@ -990,7 +990,7 @@ async def cmd_set_wallet_key(message: Message):
     register_subscriber(message.from_user.id, message.from_user.username or "")
     args = (message.text or "").split(maxsplit=1)
     if len(args) < 2:
-        await message.answer(
+        await status_msg.edit_text(
             "🔒 <b>Подключение торгового кошелька к автопродаже:</b>\n\n"
             "Отправь команду вместе с ключом из Predy:\n"
             "<code>/set_key &lt;твой_приватный_ключ&gt;</code>\n\n"
@@ -1004,23 +1004,39 @@ async def cmd_set_wallet_key(message: Message):
 
     # Если пользователь отправил публичный EVM-адрес вместо приватного ключа
     if raw_key.startswith("0x") and len(raw_key) == 42:
+        await status_msg.delete()
         await _handle_public_wallet_input(message, raw_key)
         return
 
     valid, address, err = validate_private_key(raw_key)
     if not valid:
-        await message.answer(
+        await status_msg.edit_text(
             f"❌ <b>Ошибка валидации ключа:</b> {err}\n\n"
             "Проверь, что скопирован именно секретный приватный ключ из раздела <i>Кошелек ➔ Экспорт ключа</i> в Predy.",
             parse_mode="HTML",
         )
         return
 
-    proxy_address = resolve_polymarket_proxy(address) or address
-    sig_type = 1 if (proxy_address and proxy_address.lower() != address.lower()) else 0
-    save_user_wallet(message.from_user.id, raw_key, address, proxy_address, sig_type)
-    balance = get_wallet_collateral_balance(raw_key, wallet_address=address, proxy_address=proxy_address)
-    await sync_user_polymarket_positions(message.from_user.id)
+    try:
+        proxy_address = resolve_polymarket_proxy(address) or address
+        sig_type = 1 if (proxy_address and proxy_address.lower() != address.lower()) else 0
+        save_user_wallet(message.from_user.id, raw_key, address, proxy_address, sig_type)
+    except Exception as e_save:
+        logger.error(f"Ошибка сохранения кошелька: {e_save}")
+        proxy_address = address
+        sig_type = 0
+        save_user_wallet(message.from_user.id, raw_key, address, address, 0)
+
+    balance = 0.0
+    try:
+        balance = get_wallet_collateral_balance(raw_key, wallet_address=address, proxy_address=proxy_address)
+    except Exception as e_bal:
+        logger.warning(f"Ошибка получения баланса: {e_bal}")
+
+    try:
+        await sync_user_polymarket_positions(message.from_user.id)
+    except Exception as e_sync:
+        logger.warning(f"Ошибка синхронизации позиций: {e_sync}")
 
     addr_info = [
         f"• <b>Ключ подписи (Signer):</b> <code>{address[:6]}...{address[-4:]}</code>",
@@ -1030,14 +1046,16 @@ async def cmd_set_wallet_key(message: Message):
     addr_info.append(f"• <b>Баланс средств:</b> <b>${balance:.2f} USDC</b>")
     addr_info.append("• <b>Статус:</b> 🟢 <b>Полный автопилот (автопродажа включена)</b>")
 
-    await message.answer(
+    await status_msg.edit_text(
         "✅ <b>КОШЕЛЕК УСПЕШНО ПОДКЛЮЧЕН К АВТОПРОДАЖЕ!</b>\n\n"
         + "\n".join(addr_info) + "\n\n"
-        "🛡️ <i>Твое сообщение с ключом стерто из истории переписки.</i>\n"
+        "🛡️ <i>Твое сообщение с ключом стерто из истории чата ради безопасности.</i>\n"
         "🚀 Теперь бот готов автоматически закрывать твои сделки по умному алгоритму:\n"
         "1. <b>Скользящий замок прибыли:</b> выжимает ракеты (+80%...+150%) и продает на первом откате вниз.\n"
         "2. <b>Погодный парашют:</b> экстренный сброс в рынок при дожде или плотной облачности.\n"
-        "3. <b>Сезонный таймер:</b> продажа при закрытии солнечного окна в городе.",
+        "3. <b>Сезонный таймер:</b> продажа при закрытии солнечного окна в городе.\n\n"
+        "💡 <i>Чтобы ключ никогда не сбрасывался при плановых обновлениях сервера, "
+        "добавь переменную <code>WALLET_PRIVATE_KEY</code> в настройках хостинга (Environment).</i>",
         parse_mode="HTML",
     )
 
