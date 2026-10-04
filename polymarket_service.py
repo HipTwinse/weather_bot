@@ -24,6 +24,8 @@ CITY_SEARCH_KEYWORDS = {
     "EDDM": ["munich", "мюнхен", "eddm"],
     "KJFK": ["new york", "нью-йорк", "jfk", "kjfk", "nyc"],
     "RKSI": ["seoul", "сеул", "incheon", "rksi"],
+    "RJTT": ["tokyo", "токио", "rjtt", "haneda"],
+    "UHHH": ["khabarovsk", "хабаровск", "uhhh"],
     "LTAC": ["ankara", "анкара", "ltac"],
 }
 
@@ -35,6 +37,8 @@ CITY_POLYMARKET_SLUGS = {
     "EDDM": ["munich"],
     "KJFK": ["nyc", "new-york"],
     "RKSI": ["seoul", "incheon"],
+    "RJTT": ["tokyo"],
+    "UHHH": ["khabarovsk"],
     "LTAC": ["ankara"],
 }
 

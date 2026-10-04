@@ -36,6 +36,7 @@ from aiogram.types import (
 from timezonefinder import TimezoneFinder
 
 import config
+from airport_resolver import resolve_airport
 from database import (
     add_position,
     delete_position,
@@ -149,29 +150,32 @@ ai_cities_inline_keyboard = InlineKeyboardMarkup(
             InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="express_scan:RJTT"),
             InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="express_scan:RKSI"),
         ],
+        [
+            InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="express_scan:UHHH"),
+        ],
     ]
 )
 
 cities_inline_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [
-            InlineKeyboardButton(text="🇬🇧 Лондон (EGLC)", callback_data="icao:EGLC"),
-            InlineKeyboardButton(text="🇫🇷 Париж (LFPB)", callback_data="icao:LFPB"),
+            InlineKeyboardButton(text="🇬🇧 Лондон (EGLC)", callback_data="express_scan:EGLC"),
+            InlineKeyboardButton(text="🇫🇷 Париж (LFPB)", callback_data="express_scan:LFPB"),
         ],
         [
-            InlineKeyboardButton(text="🇮🇹 Милан (LIMC)", callback_data="icao:LIMC"),
-            InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="icao:LEMD"),
+            InlineKeyboardButton(text="🇮🇹 Милан (LIMC)", callback_data="express_scan:LIMC"),
+            InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="express_scan:LEMD"),
         ],
         [
-            InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="icao:EDDM"),
-            InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="icao:KJFK"),
+            InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="express_scan:EDDM"),
+            InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="express_scan:KJFK"),
         ],
         [
-            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="icao:RJTT"),
-            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="icao:RKSI"),
+            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="express_scan:RJTT"),
+            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="express_scan:RKSI"),
         ],
         [
-            InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="icao:UHHH"),
+            InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="express_scan:UHHH"),
         ],
     ]
 )
@@ -382,10 +386,16 @@ async def process_express_scan_callback(callback: CallbackQuery):
 
     target_date = local_dt.strftime("%Y-%m-%d")
 
-    status_msg = await callback.message.reply(
-        f"⚡ <i>Считываю маркет Polymarket и метеомодели для {city_label}...</i>",
-        parse_mode="HTML"
-    )
+    try:
+        status_msg = await callback.message.reply(
+            f"⚡ <i>Считываю маркет Polymarket и метеомодели для {city_label}...</i>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        status_msg = await callback.message.answer(
+            f"⚡ <i>Считываю маркет Polymarket и метеомодели для {city_label}...</i>",
+            parse_mode="HTML"
+        )
 
     # 1. Запрашиваем модели и METAR
     lat, lon = airport["lat"], airport["lon"]
@@ -424,7 +434,7 @@ async def process_express_scan_callback(callback: CallbackQuery):
     target_strike = get_strike_for_temp(target_val)
 
     # Расчет темпа прогрева и остатка инсоляции по сезонному окну
-    current_ts = asyncio.get_event_loop().time()
+    current_ts = time.time()
     rate_str, rem_hours_str, rate_val = _calculate_dynamics(icao, temp_c, local_dt, current_ts)
     local_hour = local_dt.hour + local_dt.minute / 60.0
     heating_cutoff, season_label = get_seasonal_heating_cutoff(local_dt.month, icao=icao)
@@ -689,7 +699,10 @@ async def process_express_scan_callback(callback: CallbackQuery):
         }
         try:
             scenario_code = "G" if prev_snapshot else ("B" if pos_info else "A")
-            ai_verdict = await analyze_city_weather_ai(city_pack, scenario=scenario_code)
+            ai_verdict = await asyncio.wait_for(
+                analyze_city_weather_ai(city_pack, scenario=scenario_code),
+                timeout=18.0
+            )
             if ai_verdict:
                 response_text = ai_verdict
         except Exception as e:
@@ -1396,7 +1409,7 @@ async def process_open_my_positions(callback: CallbackQuery, state: FSMContext):
 async def cmd_cities_menu(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "🌍 <b>Выбери город для моментального метеопакета:</b>",
+        "🌍 <b>Выбери город для моментального квант-анализа:</b>",
         parse_mode="HTML",
         reply_markup=cities_inline_keyboard,
     )
@@ -1406,8 +1419,8 @@ async def cmd_cities_menu(message: Message, state: FSMContext):
 async def process_city_callback(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     icao_code = callback.data.split(":")[1]
-    await callback.answer(f"Сбор данных для {icao_code}...")
-    await _execute_weather_pipeline(icao_code, callback.message)
+    callback.data = f"express_scan:{icao_code}"
+    await process_express_scan_callback(callback)
 
 
 @router.message(F.text == "🔍 Сканировать маркет", StateFilter("*"))

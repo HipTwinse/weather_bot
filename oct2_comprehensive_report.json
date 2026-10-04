@@ -1,0 +1,918 @@
+{
+  "EGLC": {
+    "city": "London",
+    "polymarket": {
+      "event_title": "Highest temperature in London on October 2?",
+      "slug": "highest-temperature-in-london-on-october-2-2026",
+      "winner": null,
+      "markets": [
+        {
+          "outcome": "16°C or below",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "17°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "18°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "19°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "20°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "21°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "22°C",
+          "lastPrice": 0.0,
+          "bestBid": 0.999,
+          "bestAsk": 1,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "23°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "24°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "25°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "26°C or higher",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        }
+      ]
+    },
+    "metar": {
+      "error": "argument of type 'int' is not a container or iterable"
+    },
+    "models": {
+      "ecmwf_ifs025": 20.6,
+      "gfs_seamless": 21.2,
+      "icon_seamless": 20.7,
+      "gem_seamless": 21.3
+    }
+  },
+  "LFPB": {
+    "city": "Paris",
+    "polymarket": {
+      "event_title": "Highest temperature in Paris on October 2?",
+      "slug": "highest-temperature-in-paris-on-october-2-2026",
+      "winner": null,
+      "markets": [
+        {
+          "outcome": "15°C or below",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "16°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "17°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "18°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "19°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "20°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "21°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "22°C",
+          "lastPrice": 0.0,
+          "bestBid": 0.999,
+          "bestAsk": 1,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "23°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "24°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "25°C or higher",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        }
+      ]
+    },
+    "metar": {
+      "error": "argument of type 'int' is not a container or iterable"
+    },
+    "models": {
+      "ecmwf_ifs025": 20.7,
+      "gfs_seamless": 21.5,
+      "icon_seamless": 21.6,
+      "gem_seamless": 20.9
+    }
+  },
+  "LIMC": {
+    "city": "Milan",
+    "polymarket": {
+      "event_title": "Highest temperature in Milan on October 2?",
+      "slug": "highest-temperature-in-milan-on-october-2-2026",
+      "winner": null,
+      "markets": [
+        {
+          "outcome": "18°C or below",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "19°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "20°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "21°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "22°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "23°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "24°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "25°C",
+          "lastPrice": 0.0,
+          "bestBid": 0.999,
+          "bestAsk": 1,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "26°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "27°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "28°C or higher",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        }
+      ]
+    },
+    "metar": {
+      "error": "argument of type 'int' is not a container or iterable"
+    },
+    "models": {
+      "ecmwf_ifs025": 24.6,
+      "gfs_seamless": 25.7,
+      "icon_seamless": 24.3,
+      "gem_seamless": 24.7
+    }
+  },
+  "LEMD": {
+    "city": "Madrid",
+    "polymarket": {
+      "event_title": "Highest temperature in Madrid on October 2?",
+      "slug": "highest-temperature-in-madrid-on-october-2-2026",
+      "winner": null,
+      "markets": [
+        {
+          "outcome": "16°C or below",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "17°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "18°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "19°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "20°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "21°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "22°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "23°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "24°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "25°C",
+          "lastPrice": 0.0,
+          "bestBid": 0.999,
+          "bestAsk": 1,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "26°C or higher",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        }
+      ]
+    },
+    "metar": {
+      "error": "argument of type 'int' is not a container or iterable"
+    },
+    "models": {
+      "ecmwf_ifs025": 23.7,
+      "gfs_seamless": 24.6,
+      "icon_seamless": 23.8,
+      "gem_seamless": 25.4
+    }
+  },
+  "EDDM": {
+    "city": "Munich",
+    "polymarket": {
+      "event_title": "Highest temperature in Munich on October 2?",
+      "slug": "highest-temperature-in-munich-on-october-2-2026",
+      "winner": null,
+      "markets": [
+        {
+          "outcome": "14°C or below",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "15°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "16°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "17°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "18°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "19°C",
+          "lastPrice": 0.0,
+          "bestBid": 0.999,
+          "bestAsk": 1,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "20°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "21°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "22°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "23°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "24°C or higher",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": false,
+          "resolved": null,
+          "token_id": ""
+        }
+      ]
+    },
+    "metar": {
+      "error": "argument of type 'int' is not a container or iterable"
+    },
+    "models": {
+      "ecmwf_ifs025": 17.7,
+      "gfs_seamless": 16.5,
+      "icon_seamless": 18.6,
+      "gem_seamless": 19.8
+    }
+  },
+  "KJFK": {
+    "city": "New York",
+    "polymarket": null,
+    "metar": {
+      "error": "argument of type 'int' is not a container or iterable"
+    },
+    "models": {
+      "ecmwf_ifs025": 28.0,
+      "gfs_seamless": 28.5,
+      "icon_seamless": 25.6,
+      "gem_seamless": 30.1
+    }
+  },
+  "RJTT": {
+    "city": "Tokyo",
+    "polymarket": {
+      "event_title": "Highest temperature in Tokyo on October 2?",
+      "slug": "highest-temperature-in-tokyo-on-october-2-2026",
+      "winner": null,
+      "markets": [
+        {
+          "outcome": "17°C or below",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "18°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "19°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "20°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "21°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "22°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "23°C",
+          "lastPrice": 0.0,
+          "bestBid": 0.999,
+          "bestAsk": 1,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "24°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "25°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "26°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "27°C or higher",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        }
+      ]
+    },
+    "metar": {
+      "error": "argument of type 'int' is not a container or iterable"
+    },
+    "models": {
+      "ecmwf_ifs025": 22.2,
+      "gfs_seamless": 23.7,
+      "icon_seamless": 23.3,
+      "gem_seamless": 21.6
+    }
+  },
+  "RKSI": {
+    "city": "Seoul",
+    "polymarket": {
+      "event_title": "Highest temperature in Seoul (Incheon) on October 2?",
+      "slug": "highest-temperature-in-seoul-on-october-2-2026",
+      "winner": null,
+      "markets": [
+        {
+          "outcome": "16°C or below",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "17°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "18°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "19°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "20°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "21°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "22°C",
+          "lastPrice": 0.0,
+          "bestBid": 0.999,
+          "bestAsk": 1,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "23°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "24°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "25°C",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        },
+        {
+          "outcome": "26°C or higher",
+          "lastPrice": 0.0,
+          "bestBid": null,
+          "bestAsk": 0.001,
+          "winner": null,
+          "closed": true,
+          "resolved": null,
+          "token_id": ""
+        }
+      ]
+    },
+    "metar": {
+      "error": "argument of type 'int' is not a container or iterable"
+    },
+    "models": {
+      "ecmwf_ifs025": 21.0,
+      "gfs_seamless": 20.3,
+      "icon_seamless": 21.6,
+      "gem_seamless": 21.0
+    }
+  }
+}

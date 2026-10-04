@@ -386,7 +386,7 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
 
     local_dt = datetime.now(local_tz)
     target_date_local = local_dt.strftime("%Y-%m-%d")
-    current_ts = asyncio.get_event_loop().time()
+    current_ts = time.time()
 
     forecast_task = asyncio.to_thread(fetch_openmeteo_forecast, lat, lon, tz_name, target_date_local)
     noaa_task = asyncio.to_thread(get_noaa_package, icao)

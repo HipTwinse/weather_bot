@@ -444,14 +444,14 @@ def get_gemini_status() -> Dict[str, Any]:
     текущую активную/приоритетную модель и цепочку отказоустойчивости.
     """
     configured = is_gemini_configured()
-    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-3.8-flash")
+    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-flash-latest")
     cascade = [
+        "gemini-flash-latest",
         "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
         "gemini-3.5-flash",
+        "gemini-flash-lite-latest",
         "gemini-3.5-flash-lite",
-        "gemini-flash-latest"
+        "gemini-2.5-pro",
     ]
     models_to_try = list(dict.fromkeys([preferred_model] + cascade))
     active_model = _LAST_SUCCESSFUL_MODEL or preferred_model
@@ -512,14 +512,14 @@ async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[st
         logger.warning("GEMINI_API_KEY не задан в конфигурации.")
         return None
 
-    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-3.8-flash")
+    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-flash-latest")
     default_cascade = [
+        "gemini-flash-latest",
         "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
         "gemini-3.5-flash",
+        "gemini-flash-lite-latest",
         "gemini-3.5-flash-lite",
-        "gemini-flash-latest"
+        "gemini-2.5-pro",
     ]
     # Убираем дубликаты, сохраняя приоритет
     models_to_try = list(dict.fromkeys([preferred_model] + default_cascade))
@@ -548,7 +548,7 @@ async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[st
         for model_name in models_to_try:
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
             try:
-                async with session.post(endpoint, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=35.0)) as resp:
+                async with session.post(endpoint, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15.0)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         candidates = data.get("candidates", [])
