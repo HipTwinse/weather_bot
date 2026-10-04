@@ -42,27 +42,29 @@ def test_express_scan_callback_success():
 
     asyncio.run(_test())
 
-def test_icao_callback_reroutes_to_express_scan():
+def test_icao_callback_runs_weather_pipeline():
     async def _test():
         cb = MagicMock()
         cb.data = "icao:EGLC"
         cb.from_user.id = 9999
+        cb.from_user.username = "test_user"
         cb.answer = AsyncMock()
+        cb.message = MagicMock()
 
-        with patch("handlers.process_express_scan_callback", new_callable=AsyncMock) as mock_express:
+        with patch("handlers._execute_weather_pipeline", new_callable=AsyncMock) as mock_pipe:
             mock_state = MagicMock()
             mock_state.clear = AsyncMock()
             await process_city_callback(cb, mock_state)
-            assert cb.data == "express_scan:EGLC"
-            mock_express.assert_called_once_with(cb)
+            cb.answer.assert_called_once()
+            mock_pipe.assert_called_once_with("EGLC", cb.message)
 
     asyncio.run(_test())
 
-def test_keyboards_use_express_scan():
+def test_keyboards_callback_routes():
     for row in ai_cities_inline_keyboard.inline_keyboard:
         for btn in row:
             assert btn.callback_data.startswith("express_scan:"), f"Button {btn.text} has unexpected callback {btn.callback_data}"
 
     for row in cities_inline_keyboard.inline_keyboard:
         for btn in row:
-            assert btn.callback_data.startswith("express_scan:"), f"Button {btn.text} has unexpected callback {btn.callback_data}"
+            assert btn.callback_data.startswith("icao:"), f"Button {btn.text} has unexpected callback {btn.callback_data}"

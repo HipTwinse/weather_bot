@@ -161,23 +161,23 @@ ai_cities_inline_keyboard = InlineKeyboardMarkup(
 cities_inline_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [
-            InlineKeyboardButton(text="🇬🇧 Лондон (EGLC)", callback_data="express_scan:EGLC"),
-            InlineKeyboardButton(text="🇫🇷 Париж (LFPB)", callback_data="express_scan:LFPB"),
+            InlineKeyboardButton(text="🇬🇧 Лондон (EGLC)", callback_data="icao:EGLC"),
+            InlineKeyboardButton(text="🇫🇷 Париж (LFPB)", callback_data="icao:LFPB"),
         ],
         [
-            InlineKeyboardButton(text="🇮🇹 Милан (LIMC)", callback_data="express_scan:LIMC"),
-            InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="express_scan:LEMD"),
+            InlineKeyboardButton(text="🇮🇹 Милан (LIMC)", callback_data="icao:LIMC"),
+            InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="icao:LEMD"),
         ],
         [
-            InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="express_scan:EDDM"),
-            InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="express_scan:KJFK"),
+            InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="icao:EDDM"),
+            InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="icao:KJFK"),
         ],
         [
-            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="express_scan:RJTT"),
-            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="express_scan:RKSI"),
+            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="icao:RJTT"),
+            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="icao:RKSI"),
         ],
         [
-            InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="express_scan:UHHH"),
+            InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="icao:UHHH"),
         ],
     ]
 )
@@ -1559,8 +1559,9 @@ async def process_open_my_positions(callback: CallbackQuery, state: FSMContext):
 @router.message(Command("cities"), StateFilter("*"))
 async def cmd_cities_menu(message: Message, state: FSMContext):
     await state.clear()
+    register_subscriber(message.from_user.id, message.from_user.username or "")
     await message.answer(
-        "🌍 <b>Выбери город для моментального квант-анализа:</b>",
+        "🌍 <b>Выбери город для полного синоптического анализа (4 модели + METAR):</b>",
         parse_mode="HTML",
         reply_markup=cities_inline_keyboard,
     )
@@ -1569,9 +1570,10 @@ async def cmd_cities_menu(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("icao:"))
 async def process_city_callback(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    register_subscriber(callback.from_user.id, callback.from_user.username or "")
     icao_code = callback.data.split(":")[1]
-    callback.data = f"express_scan:{icao_code}"
-    await process_express_scan_callback(callback)
+    await callback.answer(f"Сбор метеоданных для {icao_code}...")
+    await _execute_weather_pipeline(icao_code, callback.message)
 
 
 @router.message(F.text == "🔍 Сканировать маркет", StateFilter("*"))
