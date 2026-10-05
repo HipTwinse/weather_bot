@@ -63,7 +63,7 @@ def test_icao_callback_runs_weather_pipeline():
 def test_keyboards_callback_routes():
     for row in ai_cities_inline_keyboard.inline_keyboard:
         for btn in row:
-            assert btn.callback_data.startswith("express_scan:"), f"Button {btn.text} has unexpected callback {btn.callback_data}"
+            assert btn.callback_data.startswith("icao:"), f"Button {btn.text} has unexpected callback {btn.callback_data}"
 
     for row in cities_inline_keyboard.inline_keyboard:
         for btn in row:

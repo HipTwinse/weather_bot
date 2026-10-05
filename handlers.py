@@ -133,27 +133,27 @@ main_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# Инлайн-клавиатура для команды /ai — запускает экспресс-скан с Gemini AI анализом
+# Инлайн-клавиатура для команды /ai — запускает полный синоптический анализ
 ai_cities_inline_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [
-            InlineKeyboardButton(text="🇬🇧 Лондон (EGLC)", callback_data="express_scan:EGLC"),
-            InlineKeyboardButton(text="🇫🇷 Париж (LFPB)", callback_data="express_scan:LFPB"),
+            InlineKeyboardButton(text="🇬🇧 Лондон (EGLC)", callback_data="icao:EGLC"),
+            InlineKeyboardButton(text="🇫🇷 Париж (LFPB)", callback_data="icao:LFPB"),
         ],
         [
-            InlineKeyboardButton(text="🇮🇹 Милан (LIMC)", callback_data="express_scan:LIMC"),
-            InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="express_scan:LEMD"),
+            InlineKeyboardButton(text="🇮🇹 Милан (LIMC)", callback_data="icao:LIMC"),
+            InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="icao:LEMD"),
         ],
         [
-            InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="express_scan:EDDM"),
-            InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="express_scan:KJFK"),
+            InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="icao:EDDM"),
+            InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="icao:KJFK"),
         ],
         [
-            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="express_scan:RJTT"),
-            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="express_scan:RKSI"),
+            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="icao:RJTT"),
+            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="icao:RKSI"),
         ],
         [
-            InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="express_scan:UHHH"),
+            InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="icao:UHHH"),
         ],
     ]
 )
