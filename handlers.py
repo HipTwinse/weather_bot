@@ -975,6 +975,50 @@ async def cmd_my_positions(message: Message, state: FSMContext):
     )
 
 
+@router.message(Command("digest"), StateFilter("*"))
+async def cmd_force_digest(message: Message, state: FSMContext):
+    """Выдает свежий 30-минутный сводный дайджест по 4 городам по прямому запросу пользователя."""
+    await state.clear()
+    register_subscriber(message.from_user.id, message.from_user.username or "")
+    status_msg = await message.answer("🔄 <i>Считываю актуальные сводки METAR и моделей по 4 городам...</i>", parse_mode="HTML")
+    try:
+        from auto_scanner import (
+            collect_city_metrics,
+            build_dynamic_city_block,
+            TARGET_CITIES,
+            express_scan_keyboard,
+            check_and_execute_auto_sell,
+            sanitize_telegram_html,
+        )
+        now_khv = datetime.now(zoneinfo.ZoneInfo("Asia/Vladivostok"))
+        time_khv_str = now_khv.strftime("%H:%M")
+        header = (
+            f"🔄 <b>ОБНОВЛЕНИЕ НА {time_khv_str} ХБР | ДИНАМИКА</b>\n"
+            f"<i>Контроль темпа прогрева и статус открытых позиций</i>\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        cities_metrics = []
+        for icao in TARGET_CITIES.keys():
+            cm = await collect_city_metrics(icao)
+            cities_metrics.append(cm)
+            await asyncio.sleep(0.2)
+
+        positions = get_user_positions(message.from_user.id)
+        user_blocks = []
+        for cm in cities_metrics:
+            pos = next((p for p in positions if p["icao"] == cm["icao"]), None)
+            if pos:
+                await check_and_execute_auto_sell(message.bot, cm, pos)
+            user_blocks.append(build_dynamic_city_block(cm, pos))
+
+        digest_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(user_blocks)
+        safe_text = sanitize_telegram_html(digest_msg)
+        await status_msg.edit_text(safe_text, parse_mode="HTML", reply_markup=express_scan_keyboard)
+    except Exception as e:
+        logger.error(f"Ошибка ручного вызова дайджеста: {e}", exc_info=True)
+        await status_msg.edit_text(f"⚠️ Не удалось собрать дайджест: {e}")
+
+
 # -------------------------------------------------------------
 # АВТОПРОДАЖА И ПОДКЛЮЧЕНИЕ КОШЕЛЬКА POLYMARKET
 # -------------------------------------------------------------

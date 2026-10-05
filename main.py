@@ -48,6 +48,7 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="scan", description="🔍 Сканировать маркет (Preddy / Polymarket)"),
         BotCommand(command="ai", description="🤖 AI-анализ погоды (Gemini v7.4)"),
         BotCommand(command="positions", description="📌 Мои открытые сделки"),
+        BotCommand(command="digest", description="🔄 Свежий сводный дайджест (4 города)"),
         BotCommand(command="cities", description="🌍 Быстрый выбор избранных городов"),
         BotCommand(command="help", description="📖 Справка и регламент v7.1"),
     ]
@@ -84,8 +85,10 @@ async def render_keepalive_loop() -> None:
     Предотвращает засыпание бесплатного инстанса Render (15-минутный таймаут).
     """
     external_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_URL")
+    if not external_url and os.getenv("RENDER_EXTERNAL_HOSTNAME"):
+        external_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
     if not external_url:
-        logger.info("ℹ️ RENDER_EXTERNAL_URL не задан (Keep-Alive активен только на Render).")
+        logger.info("ℹ️ RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME не задан (Keep-Alive активен только на Render).")
         return
 
     health_url = f"{external_url.rstrip('/')}/healthz"
