@@ -1,78 +1,84 @@
-# PROJECT CONTEXT — Weather Data Package Bot
+# Weather Alpha Bot — Контекст проекта и актуальное состояние
 
-## 1. Цель проекта
-Telegram-бот принимает ICAO код аэропорта → автоматически собирает погодные данные → возвращает единый WEATHER DATA PACKAGE → данные передаются в отдельный Gemini Weather Analyzer.
+Документ предназначен для быстрой синхронизации контекста в новых сессиях разработки. Содержит текущий статус, архитектурную схему, используемые переменные и список задач.
 
-## 2. Что НЕ входит в текущие Phase 1–3
-- Polymarket API
-- Order book
-- Цены Polymarket
-- Автоматические сделки
-- Торговые решения
-- EV engine
+---
 
-## 3. Основные источники данных
-- **NOAA Aviation Weather:** METAR / TAF
-- **Open-Meteo Multi-Model API:**
-  - ECMWF IFS 0.25° (Primary Model)
-  - GFS Global 13 km (Primary Model)
-  - ICON Global 11 km (Primary Model)
-  - GEM Global 15 km (Secondary Model, hourly-interpolated)
-*Дополнительные источники будут добавляться только после проверки их необходимости.*
+## 1. Текущий статус проекта и недавние изменения
 
-## 4. Главный принцип
-Парсер собирает и структурирует фактические данные. Он НЕ является торговым аналитиком.
+Проект находится в активной фазе эксплуатации на сервере Render (деплой из ветки `main`). Бот круглосуточно отслеживает погоду, проводит физико-синоптический анализ и мониторит рынки Polymarket/Preddy.
 
-## 5. Принятые правила и архитектурные требования
-- **Airport Resolution:** ICAO должен резолвиться в конкретный аэропорт.
-- **Coordinates:** Координаты должны быть точными.
-- **Timezone:** Используется IANA timezone (`Asia/Vladivostok`, `America/New_York`).
-- **Local Date:** Локальная календарная дата аэропорта критична.
-- **Primary Models:** ECMWF / GFS / ICON.
-- **Secondary Model:** GEM.
-- **Model Metadata:** Model Run / Reference Time нужно сохранять.
-- **Hourly Dynamics:** Hourly profile должен показывать реальную динамику и определять Peak Hour.
-- **Data Isolation:** RAW DATA / MODEL COMPARISON / DERIVED METRICS четко разделены.
+### Что было реализовано за последнее время:
+1. **Автопродажа и сохранение кошелька (Auto-Sell & Wallet Persistence):**
+   - Добавлена поддержка переменной окружения `WALLET_PRIVATE_KEY` в `config.py` и `database.py`. Теперь приватный ключ кошелька не слетает при перезапусках и пересборках контейнера на Render.
+   - Настроена генерация адресов: EOA (`0x4353...73aa`) и прокси Polymarket (`0xa7ed...3688`).
+   - Реализован торговый модуль `clob_trader.py`: проверка баланса токенов и сброс позиций по рынку (Market Sell) через CLOB API.
+   - Внедрена триггерная сетка выхода в `auto_scanner.py`:
+     - **Тейк-профит:** фиксация при PnL ≥ +35% или цене страйка ≥ 60¢.
+     - **Тайм-стоп:** сброс позиции по достижении сезонного часа отсечки инсоляции (Heating Cutoff).
+     - **Инвалидация погоды:** аварийный сброс при обложном дожде (+RA) или плотном низком Stratus.
+     - **Защита от утренней паники:** до 12:30 LT временные замедления прогрева не сбрасывают позицию.
+   - Статус автопродажи в интерфейсе корректно отображается зеленым («АКТИВНА»), только если ключ реально подключен.
 
-## 6. Формат WEATHER DATA PACKAGE
-Единый структурированный JSON/Text пакет, содержащий:
-1. **Metadata:** ICAO, Coordinates, Timezone, Local Date, Elevation, City.
-2. **Raw Data:** METAR / TAF (от NOAA Aviation Weather).
-3. **Model Comparison:** ECMWF, GFS, ICON, GEM.
-4. **Derived Metrics & Consensus:** Peak Hour, Temp Trends, Total Precip, Rain Probability %, Confidence Score.
+2. **30-минутный регулярный дайджест и Keepalive:**
+   - Исправлен критический сбой фонового цикла `auto_scanner.py` (ошибка ненайденной переменной времени), из-за которого дайджест засыпал.
+   - Добавлен фоновый цикл самопрозвона (Keepalive) в `main.py` по адресу `RENDER_EXTERNAL_HOSTNAME`, предотвращающий засыпание бесплатного инстанса Render.
+   - Добавлена ручная команда `/digest` для вызова свежей 30-минутной сводки по запросу.
 
-## 7. Текущая структура проекта
-weather_bot/
-├── PROJECT_CONTEXT.md
-├── requirements.txt
-├── .env
-├── airport_resolver.py
-├── noaa_service.py
-├── openmeteo_service.py
-├── weather_synthesizer.py
-├── test_openmeteo.py
-└── test_synthesis.py
+3. **Синоптический AI-анализ городов без лишних файлов:**
+   - Полностью отключена отправка сырых технических JSON-файлов в чат (`weather_package_...json`). Чат больше не захламляется.
+   - Выбор городов в меню `/ai` переведен на маршрут `ai_city:<ICAO>`.
+   - Вывод отдельного города теперь строго соответствует структуре 30-минутного дайджеста:
+     - Фактическая температура с метеостанции (METAR) и темп прогрева (°C/ч).
+     - Окно солнечной инсоляции и ожидаемый дневной пик.
+     - Консенсус 4 метеомоделей (ECMWF, GFS, ICON, GEM).
+     - Физические драйверы (ветер, облачность, радиация, адвекция).
+     - Блок открытой позиции пользователя: цена входа, живая цена в стакане, PnL (%) и торговый вердикт.
+     - Полный стакан котировок Polymarket с отметкой целевого страйка (🎯 ЦЕЛЬ).
+     - Быстрые кнопки: переход в Preddy / Polymarket, фиксация/закрытие сделки, обновление данных и возврат к списку городов.
 
-## 8. Этапы разработки (Status Board)
-- **PHASE 0 — Environment Setup**: COMPLETED ✅
-- **PHASE 1 — Airport Resolver**: COMPLETED ✅
-- **PHASE 2 — Weather APIs & METAR/TAF Integration**: COMPLETED ✅
-- **PHASE 3 — Data Aggregation & Package Generator**: COMPLETED ✅
-- **PHASE 4 — Telegram Bot Interface & Package Formatter**: IN PROGRESS ⏳
-- **PHASE 5 — Security, Rate Limiting & Deployment**: NOT STARTED 🛑
+4. **Тестирование:**
+   - 69 автоматических тестов (`pytest`) успешно проходят, покрывая физику, сантехнику HTML, колбэки городов, автопродажу и синтез моделей.
 
-## 9. Журнал изменений (Log)
-- Created PROJECT_CONTEXT.md
-- Python 3.14 & pip verified
-- VS Code environment set up
-- Virtual environment (venv) created and activated
-- Created `airport_resolver.py` module using `airportsdata` library
-- Expanded `airport_resolver.py` metadata (IATA, City, Elevation in meters)
-- Tested KJFK, UHHH, XXXX (PASSED)
-- Updated `requirements.txt` with full dependencies
-- Created `noaa_service.py` module for NOAA Aviation Weather API (METAR / TAF)
-- Fixed observation_time_utc precision (obsTime priority) and HTTP 204 error handling
-- Diagnosed UHHH METAR timeout and implemented retry-mechanism (2 retries, 1s delay for timeouts and 5xx errors)
-- Re-tested NOAA integration with KJFK, UHHH, XXXX (ALL PASSED)
-- Created `openmeteo_service.py` fetching 4 global forecast models (ECMWF, GFS, ICON, GEM) with full IANA timezone support, hourly precision, and DevSecOps retries with custom User-Agent headers.
-- Created `weather_synthesizer.py` for model consensus calculation, temperature spread analysis, rain probability calculation, and Confidence Level determination (HIGH / MEDIUM / LOW).
+---
+
+## 2. Архитектура проекта
+
+### Ключевые модули:
+- **`main.py`**: Точка входа приложения. Инициализация Telegram-бота (Aiogram 3), запуск фонового веб-сервера aiohttp (для Render port binding), запуск фонового сканера `run_auto_scanner` и фонового keepalive-цикла.
+- **`handlers.py`**: Пользовательский интерфейс и обработчики команд (`/start`, `/ai`, `/positions`, `/scan`, `/digest`, `/set_key`, `/wallet`, `/cities`). Роутинг инлайн-кнопок, диалоги добавления позиций (FSM).
+- **`auto_scanner.py`**: Аналитическое ядро. Работает по расписанию (:02 и :32 минут каждого часа). Запрашивает METAR, метеомодели и стаканы, вычисляет физические законы (KB v8.1), проверяет триггеры автопродажи и отправляет дайджесты подписчикам.
+- **`clob_trader.py`**: Взаимодействие с Polymarket CLOB API (py-clob-client). Инициализация торгового клиента по приватному ключу, получение API-ключей, чтение балансов условных токенов (CTF) и выставление ордеров на продажу.
+- **`gemini_analyzer.py`**: Интеграция с нейросетью Google Gemini. Каскад моделей (`gemini-2.5-flash`, `gemini-1.5-flash` и др.) для расширенного квант-разбора и отслеживания динамики внутри дня (сценарии А, Б, В, Г).
+- **`database.py`**: Локальная база данных SQLite (`positions.db`). Хранение открытых позиций, подписчиков, состояния кошельков, трейлинг-параметров.
+- **`noaa_service.py`**: Получение и декодирование авиационных метеосводок METAR и прогнозов TAF.
+- **`openmeteo_service.py`**: Загрузка почасовых данных ведущих мировых моделей: ICON (DWD), ECMWF (IFS), GFS (NOAA), GEM (CMC).
+- **`polymarket_service.py`**: Поиск контрактов на Polymarket по городам и датам через Gamma API, парсинг стакана котировок, расчет цен и сопоставление исходов.
+- **`airport_resolver.py`**: База метаданных аэропортов: координаты (lat/lon), таймзоны, ICAO-коды.
+- **`config.py`**: Загрузка конфигурации из переменных окружения и файла `.env`.
+
+### Используемые переменные окружения:
+| Переменная | Описание | Обязательность |
+|---|---|---|
+| `BOT_TOKEN` | Токен Telegram-бота от @BotFather | Да |
+| `ADMIN_CHAT_ID` | Telegram ID администратора для системных алертов | Да |
+| `WALLET_PRIVATE_KEY` | Hex-ключ Polygon-кошелька для автопродажи на Polymarket | Рекомендуется (для постоянной автопродажи) |
+| `GEMINI_API_KEY` | Ключ Google AI Studio для нейросетевого анализа | Опционально |
+| `RENDER_EXTERNAL_HOSTNAME` | Домен сервиса на Render для фонового самопрозвона | Автоматически на Render |
+| `PORT` | Порт веб-сервера (по умолчанию 10000) | Задается платформой Render |
+
+---
+
+## 3. Актуальные задачи, планы и известные нюансы
+
+### Нерешённые задачи и планы:
+1. **Боевое тестирование автопродажи на реальной сделке:**
+   - Проверить полное исполнение транзакции продажи при наступлении тейк-профита или тайм-стопа в реальных торгах (убедиться в наличии необходимых Approve/Allowance для смарт-контрактов Polymarket CTF Exchange на адресе прокси).
+2. **Расширение списка городов в автоматическом дайджесте:**
+   - Сейчас в 30-минутный дайджест включены основные европейские хабы: Лондон (`EGLC`), Париж (`LFPB`), Милан (`LIMC`), Мадрид (`LEMD`).
+   - Города Нью-Йорк (`KJFK`), Мюнхен (`EDDM`), Токио (`RJTT`), Сеул (`RKSI`), Хабаровск (`UHHH`) доступны по кнопкам и командам, но не спамят в общий дайджест. При необходимости можно сделать настраиваемую подписку по городам.
+3. **Сохранность `positions.db` при полной пересборке контейнера:**
+   - На бесплатном тарифе Render файловая система эфемерна (сбрасывается при новом деплое). Приватный ключ защищен через переменную окружения `WALLET_PRIVATE_KEY`.
+   - Задача на будущее: подключить постоянный диск (Persistent Disk) на Render или вынести `positions.db` в облачную базу (PostgreSQL / Supabase), чтобы открытые сделки не требовали ручного повторного ввода после передеплоя.
+4. **Трейлинг-тейк:**
+   - Дальнейшая тонкая настройка шага подтягивания стопа при резких пампах стакана толпой (+80%...+150%).
