@@ -82,6 +82,9 @@ from auto_scanner import (
     is_blocking_rain_and_clouds,
     get_strike_for_temp,
     get_seasonal_heating_cutoff,
+    _get_city_physics_note,
+    build_dynamic_city_block,
+    collect_city_metrics,
 )
 
 logger = logging.getLogger(__name__)
@@ -137,23 +140,23 @@ main_keyboard = ReplyKeyboardMarkup(
 ai_cities_inline_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [
-            InlineKeyboardButton(text="🇬🇧 Лондон (EGLC)", callback_data="icao:EGLC"),
-            InlineKeyboardButton(text="🇫🇷 Париж (LFPB)", callback_data="icao:LFPB"),
+            InlineKeyboardButton(text="🇬🇧 Лондон (EGLC)", callback_data="ai_city:EGLC"),
+            InlineKeyboardButton(text="🇫🇷 Париж (LFPB)", callback_data="ai_city:LFPB"),
         ],
         [
-            InlineKeyboardButton(text="🇮🇹 Милан (LIMC)", callback_data="icao:LIMC"),
-            InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="icao:LEMD"),
+            InlineKeyboardButton(text="🇮🇹 Милан (LIMC)", callback_data="ai_city:LIMC"),
+            InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="ai_city:LEMD"),
         ],
         [
-            InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="icao:EDDM"),
-            InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="icao:KJFK"),
+            InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="ai_city:EDDM"),
+            InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="ai_city:KJFK"),
         ],
         [
-            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="icao:RJTT"),
-            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="icao:RKSI"),
+            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="ai_city:RJTT"),
+            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="ai_city:RKSI"),
         ],
         [
-            InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="icao:UHHH"),
+            InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="ai_city:UHHH"),
         ],
     ]
 )
@@ -364,13 +367,16 @@ async def _collect_weather_data(user_query: str, explicit_date: Optional[str] = 
 
 
 # -------------------------------------------------------------
-# КНОПКИ ЭКСПРЕСС-АНАЛИЗА (EXPRESS SCAN ИЗ ДАЙДЖЕСТА)
+# КНОПКИ AI-АНАЛИЗА И СИНОПТИЧЕСКОГО СКАНИРОВАНИЯ
 # -------------------------------------------------------------
 
+@router.callback_query(F.data.startswith("ai_city:"))
 @router.callback_query(F.data.startswith("express_scan:"))
-async def process_express_scan_callback(callback: CallbackQuery):
+async def process_ai_city_callback(callback: CallbackQuery, state: FSMContext = None):
+    if state:
+        await state.clear()
     icao = callback.data.split(":")[1]
-    await callback.answer(f"Запрос стакана и физики: {icao}...")
+    await callback.answer(f"AI-синоптик: {icao}...")
 
     airport = resolve_airport(icao)
     if not airport:
@@ -390,12 +396,12 @@ async def process_express_scan_callback(callback: CallbackQuery):
 
     try:
         status_msg = await callback.message.reply(
-            f"⚡ <i>Считываю маркет Polymarket и метеомодели для {city_label}...</i>",
+            f"🤖 <i>Считываю маркет Polymarket и метеомодели для {city_label}...</i>",
             parse_mode="HTML"
         )
     except Exception:
         status_msg = await callback.message.answer(
-            f"⚡ <i>Считываю маркет Polymarket и метеомодели для {city_label}...</i>",
+            f"🤖 <i>Считываю маркет Polymarket и метеомодели для {city_label}...</i>",
             parse_mode="HTML"
         )
 
@@ -631,17 +637,37 @@ async def process_express_scan_callback(callback: CallbackQuery):
             "━━━━━━━━━━━━━━━━━━━━\n\n"
         )
 
+    physics_note = _get_city_physics_note(icao, raw_metar, temp_c, local_dt)
+    peaks = list(models_max.values())
+    peak_str = f"{avg_peak}°C ({min(peaks):.1f}–{max(peaks):.1f}°C)" if peaks else f"{avg_peak}°C"
+
+    city_pack_dynamic = {
+        "icao": icao,
+        "city_name": city_label,
+        "local_dt": local_dt,
+        "temp_c": temp_c,
+        "raw_metar": raw_metar,
+        "models_max": models_max,
+        "rate_str": rate_str,
+        "rate_val": rate_val,
+        "rem_hours_str": rem_hours_str,
+        "physics_note": physics_note,
+        "peak_str": peak_str,
+        "avg_peak": avg_peak,
+        "orderbook": orderbook,
+    }
+    digest_block = build_dynamic_city_block(city_pack_dynamic, user_position)
+
+    header = (
+        f"🤖 <b>AI СИНОПТИЧЕСКИЙ АНАЛИЗ</b>\n"
+        f"<i>Физический консенсус KB v8.1 + Стакан Polymarket</i>\n\n"
+    )
     response_text = (
         update_banner
-        + (pos_header if pos_header else "")
-        + f"⚡ <b>ЭКСПРЕСС-АНАЛИЗ: {city_label}</b>\n"
-        + f"🕒 <i>Время: {local_dt.strftime('%H:%M')} LT | Дата: {target_date}</i>\n\n"
-        + f"🌡️ <b>Факт METAR:</b> <code>{temp_c if temp_c is not None else 'Н/Д'}°C</code>\n"
-        + f"📊 <b>Модели:</b> ECMWF: {models_max.get('ecmwf_hres', 'Н/Д')}°C | GFS: {models_max.get('gfs_global', 'Н/Д')}°C | ICON: {models_max.get('icon_global', 'Н/Д')}°C\n"
-        + f"🎯 <b>Расчетный пик:</b> <b>{avg_peak}°C</b> (Опора: <i>{priority_model}</i>)\n\n"
-        + "\n".join(orderbook_lines) + "\n\n"
-        + "━━━━━━━━━━━━━━━━━━━━\n"
-        + strategy_block
+        + header
+        + digest_block
+        + "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(orderbook_lines)
     )
 
     # 4. Формируем 1-Click кнопки перехода на Preddy и Polymarket (Вариант А)
@@ -674,7 +700,8 @@ async def process_express_scan_callback(callback: CallbackQuery):
         ])
 
     trade_buttons.append([
-        InlineKeyboardButton(text=f"🔄 Обновить ({icao})", callback_data=f"express_scan:{icao}")
+        InlineKeyboardButton(text=f"🔄 Обновить ({icao})", callback_data=f"ai_city:{icao}"),
+        InlineKeyboardButton(text="◀️ Все города", callback_data="show_ai_cities"),
     ])
     trade_markup = InlineKeyboardMarkup(inline_keyboard=trade_buttons)
 
@@ -743,6 +770,21 @@ async def process_express_scan_callback(callback: CallbackQuery):
             logger.error(f"Ошибка при edit_text fallback: {err2}")
             # Fallback 2: Отправка новым сообщением
             await callback.message.answer(response_text, parse_mode=None, reply_markup=trade_markup)
+
+
+# Обратная совместимость с вызовами и тестами
+process_express_scan_callback = process_ai_city_callback
+
+
+@router.callback_query(F.data == "show_ai_cities")
+async def process_show_ai_cities(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "🤖 <b>AI Квант-Синоптик Weather Alpha</b>\n\n"
+        "👇 <b>Выбери город для мгновенного AI-анализа:</b>",
+        parse_mode="HTML",
+        reply_markup=ai_cities_inline_keyboard,
+    )
 
 
 # -------------------------------------------------------------
@@ -1868,12 +1910,6 @@ async def _render_final_scan_report(event_data: Dict[str, Any], user_balance: fl
                 logger.warning(f"Ошибка edit_text с HTML: {e_edit}, пробуем plain-text")
                 plain_report = html.unescape(re.sub(r"<[^>]+>", "", unified_report))
                 await status_msg.edit_text(plain_report, parse_mode=None, reply_markup=trade_markup)
-
-            await target_message.answer_document(
-                document=document_file,
-                caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{document_file.filename}</code>",
-                parse_mode="HTML",
-            )
             return
 
     try:
@@ -1902,11 +1938,6 @@ async def _execute_weather_pipeline(user_query: str, target_message: Message):
 
         await status_msg.delete()
         await target_message.answer(summary_text, parse_mode="HTML")
-        await target_message.answer_document(
-            document=document_file,
-            caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{document_file.filename}</code>",
-            parse_mode="HTML",
-        )
     except Exception as e:
         logger.error(f"Ошибка при обработке запроса: {e}", exc_info=True)
         await status_msg.edit_text("❌ <b>Произошла ошибка при обработке запроса.</b>", parse_mode="HTML")
@@ -1963,11 +1994,6 @@ async def process_weather_request(message: Message):
             document_file = BufferedInputFile(file=json_bytes, filename=clean_filename)
 
             await message.answer(summary_text, parse_mode="HTML")
-            await message.answer_document(
-                document=document_file,
-                caption=f"📦 <b>RAW DATA PACKAGE:</b> <code>{clean_filename}</code>",
-                parse_mode="HTML",
-            )
             return
         except Exception as e:
             logger.error(f"Ошибка координат: {e}")

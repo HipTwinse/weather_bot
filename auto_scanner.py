@@ -374,6 +374,19 @@ def _get_city_physics_note(icao: str, raw_metar: str, temp_c: Optional[float], l
     return "Синтез эмпирических физических законов KB v8.0."
 
 
+ALL_RADAR_CITIES_MAP = {
+    "EGLC": "🇬🇧 Лондон (EGLC)",
+    "LFPB": "🇫🇷 Париж (LFPB)",
+    "LIMC": "🇮🇹 Милан (LIMC)",
+    "LEMD": "🇪🇸 Мадрид (LEMD)",
+    "EDDM": "🇩🇪 Мюнхен (EDDM)",
+    "KJFK": "🇺🇸 Нью-Йорк (KJFK)",
+    "RJTT": "🇯🇵 Токио (RJTT)",
+    "RKSI": "🇰🇷 Сеул (RKSI)",
+    "UHHH": "🇷🇺 Хабаровск (UHHH)",
+}
+
+
 async def collect_city_metrics(icao: str) -> Dict[str, Any]:
     """Собирает полный набор метеометрик и моделей по одному городу."""
     airport = resolve_airport(icao)
@@ -426,6 +439,7 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
 
     # Получение текущего стакана Polymarket для сопоставления цен
     orderbook = []
+    poly_event = None
     try:
         poly_event = await find_city_weather_event(icao, target_date_local)
         if poly_event:
@@ -433,9 +447,11 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
     except Exception:
         orderbook = []
 
+    city_label = ALL_RADAR_CITIES_MAP.get(icao) or TARGET_CITIES.get(icao, f"Локация {icao}")
+
     return {
         "icao": icao,
-        "city_name": TARGET_CITIES.get(icao, icao),
+        "city_name": city_label,
         "local_dt": local_dt,
         "temp_c": temp_c,
         "raw_metar": raw_metar,
@@ -447,6 +463,7 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
         "peak_str": peak_str,
         "avg_peak": avg_peak,
         "orderbook": orderbook,
+        "event": poly_event,
     }
 
 
@@ -646,11 +663,21 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
     local_time_val = local_hour + local_min / 60.0
     heating_cutoff, season_label = get_seasonal_heating_cutoff(local_dt.month, icao=icao)
 
+    models_line = None
+    if models:
+        ecmwf_s = f"{models.get('ecmwf_hres', 'Н/Д')}°C"
+        gfs_s = f"{models.get('gfs_global', 'Н/Д')}°C"
+        icon_s = f"{models.get('icon_global', 'Н/Д')}°C"
+        gem_s = f"{models.get('gem_global', 'Н/Д')}°C"
+        models_line = f"• Модели: ECMWF: {ecmwf_s} | GFS: {gfs_s} | ICON: {icon_s} | GEM: {gem_s}"
+
     lines = [
         f"📍 <b>{city_name}</b> (<code>{local_dt.strftime('%H:%M')} LT</code> | Инсоляция: <b>{rem_hours}</b>)",
         f"• Факт METAR: <code>{temp_c if temp_c is not None else 'Н/Д'}°C</code> (Темп: <b>{rate_str}</b>) | Ожидаемый пик: <b>{peak_str}</b>",
-        f"• Физика: <i>{physics_note}</i>",
     ]
+    if models_line:
+        lines.append(models_line)
+    lines.append(f"• Физика: <i>{physics_note}</i>")
 
     # СЦЕНАРИЙ 1: У пользователя есть открытая сделка по этому городу
     if user_position:
