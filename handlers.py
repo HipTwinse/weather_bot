@@ -641,32 +641,88 @@ async def process_ai_city_callback(callback: CallbackQuery, state: FSMContext = 
     peaks = list(models_max.values())
     peak_str = f"{avg_peak}°C ({min(peaks):.1f}–{max(peaks):.1f}°C)" if peaks else f"{avg_peak}°C"
 
-    city_pack_dynamic = {
-        "icao": icao,
-        "city_name": city_label,
-        "local_dt": local_dt,
-        "temp_c": temp_c,
-        "raw_metar": raw_metar,
-        "models_max": models_max,
-        "rate_str": rate_str,
-        "rate_val": rate_val,
-        "rem_hours_str": rem_hours_str,
-        "physics_note": physics_note,
-        "peak_str": peak_str,
-        "avg_peak": avg_peak,
-        "orderbook": orderbook,
-    }
-    digest_block = build_dynamic_city_block(city_pack_dynamic, user_position)
+    # 3.1. Формирование полноформатного резервного анализа (KB v8.1) на случай недоступности AI
+    pro_tips = []
+    if is_afternoon_cutoff:
+        pro_tips.append(
+            f"• <b>Окно инсоляции закрыто:</b> Время {local_dt.strftime('%H:%M')} LT превышает сезонный cutoff ({season_label}). "
+            f"Покупки страйков выше текущего факта ({temp_c if temp_c is not None else 'Н/Д'}°C) лишены математического ожидания."
+        )
+    elif is_rain:
+        pro_tips.append(
+            f"• <b>Энтальпийный замок:</b> Обложные осадки / низкий Stratus блокируют радиацию. "
+            f"Рынок инерционен и переоценивает страйки выше факта ({temp_c if temp_c is not None else 'Н/Д'}°C)."
+        )
+    elif favorite_candidate:
+        fav_t = favorite_candidate.get("temp")
+        fav_t_str = f"{fav_t:.0f}°C" if fav_t is not None else str(favorite_candidate.get("title"))
+        fav_p = favorite_candidate.get("price_cents", 0.0)
+        fav_status = (
+            "Рынок запрайсил фаворита (≥50¢), покупка маркетом не дает перекоса Risk/Reward — вход только лимиткой на откате."
+            if fav_p >= 50.0
+            else "Фундаментально привлекательная оценка (<48¢) с высоким математическим ожиданием при текущем прогреве."
+        )
+        pro_tips.append(f"• <b>Базовый фаворит:</b> Страйк <b>{fav_t_str}</b> котируется по <b>{fav_p:.1f}¢</b>. {fav_status}")
+        if fav_t is not None:
+            hedge_item = next(
+                (it for it in orderbook if it.get("temp") == fav_t + 1 or it.get("title") == f"{int(fav_t+1)}°C"),
+                None
+            )
+            if hedge_item:
+                h_p = hedge_item.get("price_cents", 0.0)
+                pro_tips.append(
+                    f"• <b>Асимметричный хэдж ({fav_t+1:.0f}°C):</b> Торгуется по <b>{h_p:.1f}¢</b>. "
+                    f"При дневном разгоне токен способен дать импульс (+50%...+100%), но базовый физический ориентир — {fav_t_str}."
+                )
+    else:
+        pro_tips.append("• <b>Дисбаланс стакана:</b> Ликвидность распределена равномерно. Оптимален вход корзиной связки смежных страйков.")
+    pro_tips_text = "\n".join(pro_tips)
 
-    header = (
-        f"🤖 <b>AI СИНОПТИЧЕСКИЙ АНАЛИЗ</b>\n"
-        f"<i>Физический консенсус KB v8.1 + Стакан Polymarket</i>\n\n"
-    )
+    plan_lines = []
+    if user_position:
+        plan_lines.append(f"• <b>Открытая позиция:</b> {user_position.get('outcomes')} (вход {user_position.get('entry_price', 0):.0f}¢ | PnL {user_position.get('pnl_str', '+0%')}).")
+        plan_lines.append(f"• <b>Действие:</b> {pos_verdict}")
+        plan_lines.append("• <b>Тейк-профит:</b> Выставить лимитный ордер на продажу по 60¢–75¢ в стакан покупателей на пике дневного ажиотажа.")
+        plan_lines.append("• <b>Золотое окно кэшаута:</b> С 11:30 до 13:30 LT. Не пересиживать до вечера!")
+    else:
+        if favorite_candidate and 25.0 <= favorite_candidate["price_cents"] <= 48.0 and not is_afternoon_cutoff:
+            plan_lines.append(f"• <b>Основной вход:</b> Страйк <code>{favorite_candidate.get('title')}</code> (Limit Bid по {favorite_candidate['price_cents']:.0f}¢).")
+            plan_lines.append("• <b>Тейк-профит:</b> Сброс лимиткой при росте на +30%...+50% (цена продажи: 60¢–70¢).")
+            plan_lines.append("• <b>Золотое окно кэшаута:</b> С 11:30 до 13:30 LT прямо в стакан покупателей.")
+        elif is_afternoon_cutoff or is_rain:
+            plan_lines.append("• <b>План:</b> Без новых позиций (Skip Market). Сохранение банкролла.")
+        else:
+            plan_lines.append(f"• <b>Связка корзиной:</b> Страйк <code>{target_strike}°C</code> + опцион <code>{target_strike+1}°C</code> (сумма связки ≤ 70¢).")
+            plan_lines.append("• <b>Тейк-профит:</b> Сброс корзины лимитками при общем профите +25%...+40%.")
+    plan_text = "\n".join(plan_lines)
+
+    stop_lines = [
+        "• <b>Слом погоды:</b> Натекание плотного Stratus / обложной дождь или темп прогрева к 12:30 LT ниже +0.3°C/ч.",
+        "• <b>Тайм-стоп:</b> Наступление 13:30 LT при отставании фактической температуры от страйка более чем на 1.5°C.",
+        "• <b>Ветер:</b> Резкий разворот на холодный румб или шквалистые порывы с турбулентным перемешиванием.",
+    ]
+    stop_text = "\n".join(stop_lines)
+
+    pos_banner = pos_header if pos_header else (strategy_block + "\n\n")
     response_text = (
         update_banner
-        + header
-        + digest_block
-        + "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+        + (f"🤖 <b>AI СИНОПТИЧЕСКИЙ АНАЛИЗ: {city_label}</b>\n\n")
+        + pos_banner
+        + f"🎯 <b>РАСЧЕТНЫЙ ПИК ТЕМПЕРАТУРЫ:</b> <b>{peak_str}</b>\n"
+        + f"🏆 <b>АЛЬФА-МОДЕЛЬ ГОРОДА:</b> <i>{priority_model}</i> | <b>Окно инсоляции:</b> до {int(heating_cutoff)}:00 LT ({season_label})\n\n"
+        + f"1. 📊 <b>СИНТАКСИС МОДЕЛЕЙ И ФАКТ METAR:</b>\n"
+        + f"• ICON: {models_max.get('icon_global', 'Н/Д')}°C | ECMWF: {models_max.get('ecmwf_hres', 'Н/Д')}°C | GFS: {models_max.get('gfs_global', 'Н/Д')}°C | GEM: {models_max.get('gem_global', 'Н/Д')}°C\n"
+        + f"• Текущий факт: <code>{temp_c if temp_c is not None else 'Н/Д'}°C</code> | Темп: <b>{rate_str}</b> | METAR: <code>{raw_metar if raw_metar else 'Н/Д'}</code>\n\n"
+        + f"2. 🔬 <b>СИНОПТИЧЕСКИЙ РАСКЛАД (МИКРОФИЗИКА):</b>\n"
+        + f"• {physics_note}\n\n"
+        + f"3. 💡 <b>ТАКТИЧЕСКИЙ АНАЛИЗ СТАКАНА (PRO-TIPS):</b>\n"
+        + f"{pro_tips_text}\n\n"
+        + f"4. 💰 <b>ТОРГОВЫЙ ПЛАН (ЭКЗЕКЬЮШЕН):</b>\n"
+        + f"{plan_text}\n\n"
+        + f"5. 🛑 <b>СТОП-ТРИГГЕРЫ:</b>\n"
+        + f"{stop_text}\n\n"
+        + "━━━━━━━━━━━━━━━━━━━━\n"
+        + "<b>Котировки стакана Polymarket:</b>\n"
         + "\n".join(orderbook_lines)
     )
 
@@ -727,10 +783,18 @@ async def process_ai_city_callback(callback: CallbackQuery, state: FSMContext = 
             "analysis_delta": analysis_delta,
         }
         try:
+            try:
+                await status_msg.edit_text(
+                    f"🤖 <i>Генерирую квант-синоптический AI-анализ для {city_label}...</i>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
             scenario_code = "G" if prev_snapshot else ("B" if pos_info else "A")
             ai_verdict = await asyncio.wait_for(
                 analyze_city_weather_ai(city_pack, scenario=scenario_code),
-                timeout=18.0
+                timeout=28.0
             )
             if ai_verdict:
                 response_text = ai_verdict
