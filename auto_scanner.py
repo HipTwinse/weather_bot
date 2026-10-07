@@ -1157,6 +1157,30 @@ async def run_auto_scanner(bot: Bot) -> None:
                 for icao in TARGET_CITIES.keys():
                     cm = await collect_city_metrics(icao)
                     cities_metrics.append(cm)
+                    try:
+                        from gemini_analyzer import daily_tracker
+                        cm_dt = cm.get("local_dt")
+                        if cm_dt:
+                            cm_date = cm_dt.strftime("%Y-%m-%d")
+                            daily_tracker.record(
+                                0,
+                                icao,
+                                cm_date,
+                                {
+                                    "timestamp": time.time(),
+                                    "time_str": cm_dt.strftime("%H:%M LT"),
+                                    "target_date": cm_date,
+                                    "temp_c": cm.get("temp_c"),
+                                    "raw_metar": cm.get("raw_metar", ""),
+                                    "rate_str": cm.get("rate_str", "Н/Д"),
+                                    "rate_val": cm.get("rate_val", 0.0),
+                                    "rem_hours_str": cm.get("rem_hours_str", "Н/Д"),
+                                    "orderbook": cm.get("orderbook", []),
+                                    "user_position": None,
+                                },
+                            )
+                    except Exception as trk_err:
+                        logger.debug(f"Не удалось зафиксировать срез в daily_tracker: {trk_err}")
                     await asyncio.sleep(0.25)
 
                 # Отправка дайджеста

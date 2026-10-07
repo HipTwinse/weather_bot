@@ -628,10 +628,12 @@ async def process_ai_city_callback(callback: CallbackQuery, state: FSMContext = 
         analysis_delta = compute_weather_delta(prev_snapshot, current_snapshot)
         elapsed_min_val = analysis_delta.get("elapsed_min", 0)
         elapsed_str = f"{elapsed_min_val} мин" if elapsed_min_val >= 1 else "менее 1 мин"
+        progression_line = f"🌅 <b>Прогрессия дня:</b> {analysis_delta['progression_str']}\n" if analysis_delta.get("progression_str") else ""
         pos_delta_line = f"\n💼 <b>Сделка:</b> {analysis_delta['pos_delta_str']}" if analysis_delta.get("pos_delta_str") else ""
         update_banner = (
             f"🔄 <b>ОБНОВЛЕНИЕ АНАЛИЗА: {city_label}</b>\n"
             f"🕒 <i>Срез {analysis_delta['time_curr']} относительно {analysis_delta['time_prev']} (прошло {elapsed_str})</i>\n"
+            f"{progression_line}"
             f"📊 <b>Динамика:</b> {analysis_delta['temp_prev']}°C ➔ {analysis_delta['temp_curr']}°C ({analysis_delta['temp_diff_str']}) | Темп: {analysis_delta['interval_rate_str']}\n"
             f"📈 <b>Стакан:</b> {analysis_delta['orderbook_shifts_str']}{pos_delta_line}\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -797,7 +799,10 @@ async def process_ai_city_callback(callback: CallbackQuery, state: FSMContext = 
                 timeout=28.0
             )
             if ai_verdict:
-                response_text = ai_verdict
+                if prev_snapshot and "ОБНОВЛЕНИЕ АНАЛИЗА" not in ai_verdict and "ОБНОВЛЕНИЕ" not in ai_verdict[:120]:
+                    response_text = update_banner + ai_verdict
+                else:
+                    response_text = ai_verdict
         except Exception as e:
             logger.warning(f"Ошибка вызова Gemini AI: {e}")
 

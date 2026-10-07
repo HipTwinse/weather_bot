@@ -78,6 +78,18 @@ def init_db() -> None:
                 is_active INTEGER DEFAULT 1
             )
         """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daily_snapshots (
+                user_id INTEGER NOT NULL,
+                icao TEXT NOT NULL,
+                target_date TEXT NOT NULL,
+                baseline_json TEXT,
+                latest_json TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, icao, target_date)
+            )
+        """)
         conn.commit()
 
         # Автоматическая регистрация администратора из config, если задан
@@ -378,4 +390,92 @@ def update_position_alert(pos_id: int, alert_type: str) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE user_positions SET last_alert = ? WHERE id = ?", (alert_type, pos_id))
+        conn.commit()
+
+
+def save_daily_snapshot_db(user_id: int, icao: str, target_date: str, snapshot: Dict[str, Any]) -> None:
+    """
+    Сохраняет дневной срез анализа в базу данных.
+    Автоматически фиксирует утренний срез (baseline) и обновляет актуальный.
+    """
+    import json
+    snap_json = json.dumps(snapshot, ensure_ascii=False)
+    icao_clean = icao.upper().strip()
+    uid = int(user_id or 0)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT baseline_json, latest_json FROM daily_snapshots
+            WHERE user_id = ? AND icao = ? AND target_date = ?
+        """, (uid, icao_clean, target_date))
+        row = cursor.fetchone()
+
+        if not row:
+            cursor.execute("""
+                INSERT INTO daily_snapshots (user_id, icao, target_date, baseline_json, latest_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (uid, icao_clean, target_date, snap_json, snap_json))
+        else:
+            baseline_json = row[0] or snap_json
+            cursor.execute("""
+                UPDATE daily_snapshots
+                SET baseline_json = ?, latest_json = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND icao = ? AND target_date = ?
+            """, (baseline_json, snap_json, uid, icao_clean, target_date))
+        conn.commit()
+
+
+def get_daily_snapshot_db(user_id: int, icao: str, target_date: str) -> Optional[Dict[str, Any]]:
+    """Возвращает последний сохраненный дневной срез анализа из базы данных вместе с утренней базой."""
+    import json
+    icao_clean = icao.upper().strip()
+    uid = int(user_id or 0)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        # 1. Персональный поиск
+        cursor.execute("""
+            SELECT latest_json, baseline_json FROM daily_snapshots
+            WHERE user_id = ? AND icao = ? AND target_date = ?
+        """, (uid, icao_clean, target_date))
+        row = cursor.fetchone()
+
+        # 2. Поиск общего среза (user_id = 0), если персонального еще нет
+        if not row and uid != 0:
+            cursor.execute("""
+                SELECT latest_json, baseline_json FROM daily_snapshots
+                WHERE user_id = 0 AND icao = ? AND target_date = ?
+            """, (icao_clean, target_date))
+            row = cursor.fetchone()
+
+        if row and row[0]:
+            try:
+                data = json.loads(row[0])
+                if row[1]:
+                    try:
+                        data["baseline"] = json.loads(row[1])
+                    except Exception:
+                        pass
+                return data
+            except Exception:
+                return None
+        return None
+
+
+def cleanup_old_daily_snapshots_db(current_date: str) -> None:
+    """Сбрасывает историю за предыдущие дни (сброс в конце дня / на новый день)."""
+    if not current_date:
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM daily_snapshots WHERE target_date != ?", (current_date,))
+        conn.commit()
+
+
+def clear_all_daily_snapshots_db() -> None:
+    """Очищает все дневные срезы (для тестов)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM daily_snapshots")
         conn.commit()

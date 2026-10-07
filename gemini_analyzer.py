@@ -274,35 +274,64 @@ class DailyAnalysisTracker:
     """
     Хранит историю анализов в течение текущего дня в разрезе (user_id, icao, date_str).
     Обеспечивает контекст повторного запроса в один и тот же день (Сценарий Г)
-    и автоматически сбрасывает историю при наступлении нового дня.
+    с персистентным хранением в SQLite (positions.db) и автоматическим сбросом на новый день.
     """
     def __init__(self):
         # Ключ: (user_id, icao, date_str) -> snapshot dict
         self._history: Dict[tuple, Dict[str, Any]] = {}
 
     def cleanup_old_dates(self, current_date_str: str) -> None:
-        """Сбрасывает историю за предыдущие дни."""
+        """Сбрасывает историю за предыдущие дни в оперативной памяти и в базе данных."""
         if not current_date_str:
             return
         keys_to_delete = [k for k in self._history if k[2] != current_date_str]
         for k in keys_to_delete:
             del self._history[k]
+        try:
+            from database import cleanup_old_daily_snapshots_db
+            cleanup_old_daily_snapshots_db(current_date_str)
+        except Exception as e:
+            logger.warning(f"Ошибка очистки старых срезов в БД: {e}")
 
     def record(self, user_id: int, icao: str, date_str: str, snapshot: Dict[str, Any]) -> None:
-        """Сохраняет актуальный срез анализа по городу."""
+        """Сохраняет актуальный срез анализа по городу с фиксацией утренней базы."""
         if not icao or not date_str:
             return
         self.cleanup_old_dates(date_str)
         uid = int(user_id or 0)
         icao_clean = icao.upper().strip()
+
+        # Ищем существующий снимок для сохранения утренней базы (baseline)
+        existing = self.get_latest(uid, icao_clean, date_str)
+        if existing:
+            # Сохраняем исходную утреннюю базу
+            snapshot["baseline"] = existing.get("baseline") or dict(existing)
+            t_curr = snapshot.get("timestamp", time.time())
+            t_exist = existing.get("timestamp", 0)
+            # Если между замерами прошло менее 3 минут (180 сек), не смещаем интервальный срез,
+            # чтобы случайные частые клики не стирали значимую динамику
+            if 0 <= (t_curr - t_exist) < 180:
+                self._history[(uid, icao_clean, date_str)] = snapshot
+                return
+        else:
+            # Первый срез дня — он же становится утренней базой
+            snapshot["baseline"] = dict(snapshot)
+
         self._history[(uid, icao_clean, date_str)] = snapshot
         if uid != 0:
             self._history[(0, icao_clean, date_str)] = snapshot
 
+        try:
+            from database import save_daily_snapshot_db
+            save_daily_snapshot_db(uid, icao_clean, date_str, snapshot)
+        except Exception as e:
+            logger.warning(f"Ошибка сохранения дневного среза в БД: {e}")
+
     def get_latest(self, user_id: int, icao: str, date_str: str) -> Optional[Dict[str, Any]]:
         """
         Возвращает предыдущий срез анализа для пользователя в этот же день.
-        Если персонального среза нет, пробует взять общий срез.
+        Если в оперативной памяти срез отсутствует (например, после рестарта контейнера Render),
+        автоматически загружает его из базы данных positions.db.
         """
         if not icao or not date_str:
             return None
@@ -310,22 +339,37 @@ class DailyAnalysisTracker:
         uid = int(user_id or 0)
         icao_clean = icao.upper().strip()
 
-        # 1. Персональный поиск
+        # 1. Персональный поиск в памяти
         key = (uid, icao_clean, date_str)
         if key in self._history:
             return self._history[key]
 
-        # 2. Поиск общего среза
+        # 2. Поиск общего среза в памяти
         if uid != 0:
             gen_key = (0, icao_clean, date_str)
             if gen_key in self._history:
                 return self._history[gen_key]
+
+        # 3. Загрузка из базы данных
+        try:
+            from database import get_daily_snapshot_db
+            db_snap = get_daily_snapshot_db(uid, icao_clean, date_str)
+            if db_snap:
+                self._history[key] = db_snap
+                return db_snap
+        except Exception as e:
+            logger.warning(f"Ошибка чтения дневного среза из БД: {e}")
 
         return None
 
     def clear_all(self) -> None:
         """Сброс всей истории (для тестов)."""
         self._history.clear()
+        try:
+            from database import clear_all_daily_snapshots_db
+            clear_all_daily_snapshots_db()
+        except Exception:
+            pass
 
 
 daily_tracker = DailyAnalysisTracker()
@@ -395,6 +439,15 @@ def compute_weather_delta(prev_snap: Dict[str, Any], curr_snap: Dict[str, Any]) 
     else:
         interval_rate_str = curr_snap.get("rate_str", "Н/Д")
 
+    # Прогрессия развития погоды от утреннего среза (baseline)
+    progression_str = ""
+    baseline = prev_snap.get("baseline") or prev_snap
+    base_temp = baseline.get("temp_c")
+    base_time = baseline.get("time_str", "утро")
+    if base_temp is not None and temp_curr is not None:
+        base_diff = round(float(temp_curr) - float(base_temp), 1)
+        progression_str = f"с утренних {base_temp}°C ({base_time}) ➔ {temp_curr}°C ({base_diff:+.1f}°C к утру)"
+
     # Сдвиги стакана
     prev_ob = prev_snap.get("orderbook", [])
     curr_ob = curr_snap.get("orderbook", [])
@@ -424,6 +477,7 @@ def compute_weather_delta(prev_snap: Dict[str, Any], curr_snap: Dict[str, Any]) 
         "rate_prev": prev_snap.get("rate_str", "Н/Д"),
         "rate_curr": curr_snap.get("rate_str", "Н/Д"),
         "interval_rate_str": interval_rate_str,
+        "progression_str": progression_str,
         "orderbook_shifts_str": ob_shifts_str,
         "pos_delta_str": pos_delta_str,
     }
@@ -721,10 +775,13 @@ async def analyze_city_weather_ai(city_data: Dict[str, Any], scenario: str = "A"
         elapsed_min_val = delta_info.get("elapsed_min", 0)
         elapsed_display = f"{elapsed_min_val} мин" if elapsed_min_val >= 1 else "менее 1 мин"
 
+        progression_line = f"• Прогрессия развития погоды за день: {delta_info['progression_str']}\n" if delta_info.get("progression_str") else ""
+        progression_banner_line = f"🌅 <b>ПРОГРЕССИЯ ДНЯ:</b> {delta_info['progression_str']}\n" if delta_info.get("progression_str") else ""
+
         update_prompt_block = f"""
 🔄 ДНЕВНОЕ ОБНОВЛЕНИЕ / СРАВНЕНИЕ С ПРОШЛЫМ АНАЛИЗОМ:
 • Это ПОВТОРНЫЙ запрос анализа по городу {city_name} за сегодня ({target_date}).
-• Прошлый анализ был сделан в {delta_info['time_prev']} ({elapsed_display} назад). Сейчас: {delta_info['time_curr']}.
+{progression_line}• Прошлый анализ был сделан в {delta_info['time_prev']} ({elapsed_display} назад). Сейчас: {delta_info['time_curr']}.
 • Динамика температуры METAR: с {delta_info['temp_prev']}°C до {delta_info['temp_curr']}°C ({delta_info['temp_diff_str']}).
 • Темп прогрева на интервале: {delta_info['interval_rate_str']} (ранее общий темп был: {delta_info['rate_prev']}, сейчас: {delta_info['rate_curr']}).
 • Сдвиги в стакане цен Polymarket: {delta_info['orderbook_shifts_str']}.
@@ -734,7 +791,7 @@ async def analyze_city_weather_ai(city_data: Dict[str, Any], scenario: str = "A"
 1. Выполни анализ по СЦЕНАРИЮ Г (ПОВТОРНЫЙ ЗАПРОС / ДНЕВНОЕ ОБНОВЛЕНИЕ).
 2. Начни ответ СТРОГО с плашки обновления:
 🔄 <b>ОБНОВЛЕНИЕ АНАЛИЗА: {city_name}</b> (срез {delta_info['time_curr']} относительно {delta_info['time_prev']}, прошло {elapsed_display})
-📊 <b>ДИНАМИКА ЗА {elapsed_display.upper()}:</b> Факт: {delta_info['temp_prev']}°C ➔ {delta_info['temp_curr']}°C ({delta_info['temp_diff_str']}) | Темп: {delta_info['interval_rate_str']} | Стакан: {delta_info['orderbook_shifts_str']}
+{progression_banner_line}📊 <b>ДИНАМИКА ЗА {elapsed_display.upper()}:</b> Факт: {delta_info['temp_prev']}°C ➔ {delta_info['temp_curr']}°C ({delta_info['temp_diff_str']}) | Темп: {delta_info['interval_rate_str']} | Стакан: {delta_info['orderbook_shifts_str']}
 3. Если у трейдера есть открытая позиция — сразу следующими строками выводи блок «💼 ВАША ПОЗИЦИЯ: ...» и «👉 ВЕРДИКТ ПОЗИЦИИ: ...».
 4. Сравни текущую ситуацию с утренней: прогрев идет с опережением или затухает? Подтверждается ли утренний страйк, или рынок начал переоценивать другой исход? Что делать с позицией (если открыта)?
 """

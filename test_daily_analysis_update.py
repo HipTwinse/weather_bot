@@ -174,5 +174,83 @@ def test_analyze_city_weather_ai_first_and_second_call():
             assert "12.0°C до 14.0°C (+2.0°C)" in prompt2
             assert "16°C: 35¢ ➔ 52¢ (+17¢)" in prompt2
             assert "СЦЕНАРИЮ Г" in prompt2
+            assert "ПРОГРЕССИЯ ДНЯ" in prompt2
 
     asyncio.run(_run())
+
+
+def test_tracker_sqlite_persistence_across_restarts():
+    """Проверяет, что срез сохраняется в SQLite positions.db и восстанавливается после рестарта (очистки RAM)."""
+    tracker = DailyAnalysisTracker()
+    tracker.clear_all()
+
+    snap = {
+        "timestamp": 1000.0,
+        "time_str": "09:30 LT",
+        "target_date": "2026-09-29",
+        "temp_c": 11.5,
+        "raw_metar": "EGLC 290830Z 24008KT CAVOK 11/07 Q1015",
+    }
+    tracker.record(user_id=777, icao="EGLC", date_str="2026-09-29", snapshot=snap)
+
+    # Симулируем рестарт контейнера (полная очистка оперативной памяти _history)
+    tracker._history.clear()
+    assert len(tracker._history) == 0
+
+    # Проверяем, что get_latest подгружает данные из SQLite базы данных
+    loaded = tracker.get_latest(user_id=777, icao="EGLC", date_str="2026-09-29")
+    assert loaded is not None
+    assert loaded["temp_c"] == 11.5
+    assert loaded["time_str"] == "09:30 LT"
+    assert loaded.get("baseline") is not None
+    assert loaded["baseline"]["temp_c"] == 11.5
+
+
+def test_daytime_progression_from_morning_baseline():
+    """Проверяет вычисление дневной прогрессии от утренней базы к дневному срезу."""
+    t0 = 1700000000.0
+    t1 = t0 + 7200.0  # +2 часа
+
+    snap_morning = {
+        "timestamp": t0,
+        "time_str": "09:30 LT",
+        "temp_c": 12.0,
+        "baseline": {
+            "temp_c": 12.0,
+            "time_str": "09:30 LT",
+        },
+    }
+
+    snap_afternoon = {
+        "timestamp": t1,
+        "time_str": "11:30 LT",
+        "temp_c": 16.5,
+    }
+
+    delta = compute_weather_delta(snap_morning, snap_afternoon)
+    assert delta["progression_str"] == "с утренних 12.0°C (09:30 LT) ➔ 16.5°C (+4.5°C к утру)"
+    assert delta["temp_diff_str"] == "+4.5°C"
+    assert delta["elapsed_min"] == 120
+
+
+def test_end_of_day_reset_clears_db():
+    """Проверяет, что при смене даты старые срезы очищаются и из памяти, и из БД."""
+    tracker = DailyAnalysisTracker()
+    tracker.clear_all()
+
+    snap_yesterday = {
+        "timestamp": 1000.0,
+        "time_str": "15:00 LT",
+        "target_date": "2026-09-28",
+        "temp_c": 18.0,
+    }
+    tracker.record(user_id=123, icao="EGLC", date_str="2026-09-28", snapshot=snap_yesterday)
+
+    # Наступил новый день 2026-09-29
+    res_today = tracker.get_latest(user_id=123, icao="EGLC", date_str="2026-09-29")
+    assert res_today is None
+
+    # Очищаем память и проверяем, что в SQLite за вчера ничего не осталось
+    tracker._history.clear()
+    assert tracker.get_latest(user_id=123, icao="EGLC", date_str="2026-09-28") is None
+
