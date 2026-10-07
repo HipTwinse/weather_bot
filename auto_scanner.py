@@ -387,8 +387,12 @@ ALL_RADAR_CITIES_MAP = {
 }
 
 
+# Кэш метеоданных для защиты NOAA и Open-Meteo от частых опросов: icao -> {"ts": float, "noaa_data": dict, "forecast_data": dict}
+_WEATHER_METRICS_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
 async def collect_city_metrics(icao: str) -> Dict[str, Any]:
-    """Собирает полный набор метеометрик и моделей по одному городу."""
+    """Собирает полный набор метеометрик и моделей по одному городу с кэшированием погоды."""
     airport = resolve_airport(icao)
     if not airport:
         return {}
@@ -404,15 +408,26 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
     target_date_local = local_dt.strftime("%Y-%m-%d")
     current_ts = time.time()
 
-    forecast_task = asyncio.to_thread(fetch_openmeteo_forecast, lat, lon, tz_name, target_date_local)
-    noaa_task = asyncio.to_thread(get_noaa_package, icao)
+    # Защитный кэш метеоданных (60 сек): погода меняется 2 раза в час, модели — раз в 6 часов
+    cached_weather = _WEATHER_METRICS_CACHE.get(icao)
+    if cached_weather and (current_ts - cached_weather["ts"] < 60.0):
+        forecast_data = cached_weather["forecast_data"]
+        noaa_data = cached_weather["noaa_data"]
+    else:
+        forecast_task = asyncio.to_thread(fetch_openmeteo_forecast, lat, lon, tz_name, target_date_local)
+        noaa_task = asyncio.to_thread(get_noaa_package, icao)
+        forecast_data, noaa_data = await asyncio.gather(forecast_task, noaa_task, return_exceptions=True)
 
-    forecast_data, noaa_data = await asyncio.gather(forecast_task, noaa_task, return_exceptions=True)
+        if isinstance(noaa_data, Exception) or not isinstance(noaa_data, dict):
+            noaa_data = {}
+        if isinstance(forecast_data, Exception) or not isinstance(forecast_data, dict):
+            forecast_data = {}
 
-    if isinstance(noaa_data, Exception) or not isinstance(noaa_data, dict):
-        noaa_data = {}
-    if isinstance(forecast_data, Exception) or not isinstance(forecast_data, dict):
-        forecast_data = {}
+        _WEATHER_METRICS_CACHE[icao] = {
+            "ts": current_ts,
+            "forecast_data": forecast_data,
+            "noaa_data": noaa_data,
+        }
 
     metar = noaa_data.get("metar", {})
     temp_c = metar.get("temp_c")
@@ -1107,15 +1122,19 @@ async def sync_all_subscribers_polymarket_positions() -> None:
 
 async def run_position_monitor(bot: Bot) -> None:
     """
-    Высокочастотный фоновый мониторинг открытых позиций (интервал: 60 сек).
+    Высокочастотный фоновый мониторинг открытых позиций (интервал: 15 сек при открытых сделках).
     Обеспечивает мгновенную реакцию автопродажи (Take-Profit, Trailing, Time-Stop, Weather Shock)
     без ожидания 30-минутного планового дайджеста.
     """
-    logger.info("🛡️ Фоновый монитор открытых сделок и автопродажи запущен (интервал: 60 сек).")
+    logger.info("🛡️ Фоновый монитор открытых сделок и автопродажи запущен (интервал: 15 сек).")
+    last_wallet_sync_ts = 0.0
     while True:
         try:
-            # 1. Автосинхронизация с Polymarket (раз в минуту подхватывает новые сделки)
-            await sync_all_subscribers_polymarket_positions()
+            current_ts = time.time()
+            # 1. Фоновая автосинхронизация с Polymarket (раз в минуту подхватывает новые сделки)
+            if current_ts - last_wallet_sync_ts >= 60.0:
+                await sync_all_subscribers_polymarket_positions()
+                last_wallet_sync_ts = current_ts
 
             # 2. Получаем все открытые позиции
             active_positions = await asyncio.to_thread(get_all_active_positions)
@@ -1130,15 +1149,20 @@ async def run_position_monitor(bot: Bot) -> None:
                             await check_and_execute_auto_sell(bot, cm, pos)
                     except Exception as err:
                         logger.warning(f"Ошибка проверки позиции {pos.get('id')} ({icao}): {err}")
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
+
+                # При наличии активных сделок проверяем каждые 15 секунд (сверхбыстрая реакция на откат)
+                await asyncio.sleep(15)
+            else:
+                # Если сделок нет — спокойный дежурный режим (30 секунд)
+                await asyncio.sleep(30)
 
         except asyncio.CancelledError:
             logger.info("🛑 Фоновый монитор открытых сделок остановлен.")
             break
         except Exception as e:
             logger.error(f"Сбой в цикле монитора сделок: {e}", exc_info=True)
-
-        await asyncio.sleep(60)
+            await asyncio.sleep(15)
 
 
 async def send_consolidated_digest(
