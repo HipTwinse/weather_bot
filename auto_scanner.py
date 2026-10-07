@@ -570,7 +570,7 @@ def get_priority_target(
 _get_priority_target = get_priority_target
 
 
-def build_morning_city_block(city_data: Dict[str, Any]) -> str:
+def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[Dict[str, Any]] = None) -> str:
     """Формирует блок города для утреннего базового прогноза (10:02 ХБР)."""
     icao = city_data["icao"]
     city_name = city_data["city_name"]
@@ -631,6 +631,22 @@ def build_morning_city_block(city_data: Dict[str, Any]) -> str:
         )
     else:
         status_line = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Ориентир корзины ≤ 75¢, одиночный Sniper 25¢–48¢)."
+
+    if user_position:
+        target_outcomes = user_position.get("outcomes", "Н/Д")
+        entry_price = float(user_position.get("entry_price") or 0.0)
+        cur_price = get_current_outcome_price(orderbook, target_outcomes)
+        if cur_price is None:
+            cur_price = entry_price if entry_price > 0 else 35.0
+        pnl_val = round(((cur_price - entry_price) / entry_price) * 100, 1) if entry_price > 0 else 0.0
+        pnl_str = f"{'+' if pnl_val >= 0 else ''}{pnl_val:.0f}%"
+        safe_outcomes = html.escape(str(target_outcomes))
+        pos_line = (
+            f"💼 <b>ВАША ПОЗИЦИЯ:</b> <code>{safe_outcomes}</code> "
+            f"(вход: <code>{entry_price:.0f}¢</code> | сейчас в стакане: <code>{cur_price:.0f}¢</code> | PnL: <b>{pnl_str}</b>)\n"
+            f"👉 <b>ВЕРДИКТ:</b> 🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> (Утренний план в силе, ожидание старта инсоляции)"
+        )
+        status_line = f"{pos_line}\n\n{status_line}"
 
     return (
         f"📍 <b>{city_name}</b> (Время: <code>{local_dt.strftime('%H:%M')} LT</code>)\n"
@@ -960,8 +976,12 @@ async def check_and_execute_auto_sell(
 
     trigger_reason = None
 
+    # Триггер А-0: Абсолютный Тейк-Профит (фиксация при супер-цене >= 75¢)
+    if cur_price >= 75.0:
+        trigger_reason = f"🚨 ТЕЙК-ПРОФИТ (ЦЕЛЬ ВЫШЕ 75¢): Цена в стакане {cur_price:.0f}¢, фиксация сверхприбыли"
+
     # Триггер А: Трейлинг-выход (замок прибыли сработал на откате 5–6¢ от пика)
-    if trailing_active and (peak_price - cur_price) >= 5.0 and cur_price > 0:
+    elif trailing_active and (peak_price - cur_price) >= 5.0 and cur_price > 0:
         trigger_reason = f"🎉 ТРЕЙЛИНГ-ТЕЙК (ЗАМОК ПРИБЫЛИ): Пик был {peak_price:.0f}¢, выход на откате по {cur_price:.0f}¢"
 
     # Триггер Б: Превышение температуры (цель пробита вверх, исход математически сгорел)
@@ -1062,15 +1082,77 @@ async def check_and_execute_auto_sell(
         return None
 
 
+async def sync_all_subscribers_polymarket_positions() -> None:
+    """Синхронизирует открытые сделки с Polymarket для всех пользователей с кошельками."""
+    try:
+        from handlers import sync_user_polymarket_positions
+        subscribers = await asyncio.to_thread(get_all_subscribers)
+        admin_id = getattr(config, "ADMIN_CHAT_ID", None)
+        all_uids = set(subscribers)
+        if admin_id:
+            try:
+                all_uids.add(int(admin_id))
+            except (ValueError, TypeError):
+                pass
+        for uid in all_uids:
+            wallet = await asyncio.to_thread(get_user_wallet, uid)
+            if wallet and (wallet.get("proxy_address") or wallet.get("wallet_address")):
+                try:
+                    await sync_user_polymarket_positions(uid)
+                except Exception as e:
+                    logger.debug(f"Ошибка синхронизации Polymarket для {uid}: {e}")
+    except Exception as err:
+        logger.warning(f"Ошибка в sync_all_subscribers_polymarket_positions: {err}")
+
+
+async def run_position_monitor(bot: Bot) -> None:
+    """
+    Высокочастотный фоновый мониторинг открытых позиций (интервал: 60 сек).
+    Обеспечивает мгновенную реакцию автопродажи (Take-Profit, Trailing, Time-Stop, Weather Shock)
+    без ожидания 30-минутного планового дайджеста.
+    """
+    logger.info("🛡️ Фоновый монитор открытых сделок и автопродажи запущен (интервал: 60 сек).")
+    while True:
+        try:
+            # 1. Автосинхронизация с Polymarket (раз в минуту подхватывает новые сделки)
+            await sync_all_subscribers_polymarket_positions()
+
+            # 2. Получаем все открытые позиции
+            active_positions = await asyncio.to_thread(get_all_active_positions)
+            if active_positions:
+                for pos in active_positions:
+                    icao = (pos.get("icao") or "").strip().upper()
+                    if not icao:
+                        continue
+                    try:
+                        cm = await collect_city_metrics(icao)
+                        if cm:
+                            await check_and_execute_auto_sell(bot, cm, pos)
+                    except Exception as err:
+                        logger.warning(f"Ошибка проверки позиции {pos.get('id')} ({icao}): {err}")
+                    await asyncio.sleep(0.5)
+
+        except asyncio.CancelledError:
+            logger.info("🛑 Фоновый монитор открытых сделок остановлен.")
+            break
+        except Exception as e:
+            logger.error(f"Сбой в цикле монитора сделок: {e}", exc_info=True)
+
+        await asyncio.sleep(60)
+
+
 async def send_consolidated_digest(
     bot: Bot,
     cities_metrics: List[Dict[str, Any]],
     is_morning_base: bool,
     now_khv: datetime,
 ) -> None:
-    """Собирает все 4 города в единый пост и отправляет админу и всем подписчикам."""
+    """Собирает все города в единый пост с персональным блоком открытых позиций для каждого трейдера."""
     today_khv_str = now_khv.strftime("%d.%m.%Y")
     time_khv_str = now_khv.strftime("%H:%M")
+
+    # Автоматически синхронизируем сделки с Polymarket перед отправкой дайджеста
+    await sync_all_subscribers_polymarket_positions()
 
     if is_morning_base:
         header = (
@@ -1106,16 +1188,63 @@ async def send_consolidated_digest(
 
     for uid in recipients:
         user_pos_list = [p for p in active_positions if p.get("user_id") == uid]
-        if not user_pos_list or is_morning_base:
+        if not user_pos_list:
             await _safe_send_digest(bot, uid, default_msg, express_scan_keyboard)
         else:
+            wallet = await asyncio.to_thread(get_user_wallet, uid)
+            has_pk = bool(wallet and wallet.get("private_key"))
+            auto_icon = "🟢 АКТИВНА" if has_pk else "⚠️ РУЧНОЙ ВЫХОД"
+
+            pos_summary_lines = ["💼 <b>ВАШИ ОТКРЫТЫЕ ПОЗИЦИИ НА КОНТРОЛЕ:</b>"]
+            for pos in user_pos_list:
+                p_icao = pos["icao"].strip().upper()
+                p_city = ALL_RADAR_CITIES_MAP.get(p_icao) or TARGET_CITIES.get(p_icao, f"Локация {p_icao}")
+                p_out = pos["outcomes"]
+                p_entry = float(pos.get("entry_price") or 0.0)
+
+                cm_match = next((c for c in cities_metrics if c["icao"].strip().upper() == p_icao), None)
+                p_cur = None
+                if cm_match:
+                    p_cur = get_current_outcome_price(cm_match.get("orderbook", []), p_out)
+                if p_cur is None:
+                    p_cur = p_entry if p_entry > 0 else 0.0
+
+                pnl_v = round(((p_cur - p_entry) / p_entry) * 100, 1) if p_entry > 0 else 0.0
+                pnl_s = f"{'+' if pnl_v >= 0 else ''}{pnl_v:.0f}%"
+
+                pos_summary_lines.append(
+                    f"• <b>{p_city}</b>: <code>{p_out}</code> "
+                    f"(вход: <code>{p_entry:.0f}¢</code> | сейчас: <code>{p_cur:.0f}¢</code> | PnL: <b>{pnl_s}</b>) | "
+                    f"🛡️ Автопродажа: <b>{auto_icon}</b>"
+                )
+            pos_summary_block = "\n".join(pos_summary_lines) + "\n━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            # Формируем блоки городов с учетом сделок
             user_blocks = []
             for cm in cities_metrics:
-                pos = next((p for p in user_pos_list if p["icao"] == cm["icao"]), None)
+                pos = next((p for p in user_pos_list if p["icao"].strip().upper() == cm["icao"].strip().upper()), None)
                 if pos:
                     await check_and_execute_auto_sell(bot, cm, pos)
-                user_blocks.append(build_dynamic_city_block(cm, pos))
-            custom_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(user_blocks)
+                if is_morning_base:
+                    user_blocks.append(build_morning_city_block(cm, pos))
+                else:
+                    user_blocks.append(build_dynamic_city_block(cm, pos))
+
+            # Если у пользователя есть позиции в городах вне TARGET_CITIES (например, LFPG, KJFK, RKSI):
+            processed_icaos = {cm["icao"].strip().upper() for cm in cities_metrics}
+            for pos in user_pos_list:
+                p_icao = pos["icao"].strip().upper()
+                if p_icao not in processed_icaos:
+                    processed_icaos.add(p_icao)
+                    extra_cm = await collect_city_metrics(p_icao)
+                    if extra_cm:
+                        await check_and_execute_auto_sell(bot, extra_cm, pos)
+                        if is_morning_base:
+                            user_blocks.append(build_morning_city_block(extra_cm, pos))
+                        else:
+                            user_blocks.append(build_dynamic_city_block(extra_cm, pos))
+
+            custom_msg = f"{header}\n\n{pos_summary_block}" + "\n\n──────────────\n\n".join(user_blocks)
             await _safe_send_digest(bot, uid, custom_msg, express_scan_keyboard)
 
 
@@ -1127,6 +1256,9 @@ async def run_auto_scanner(bot: Bot) -> None:
     """
     global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT
     logger.info("🚀 Единый консолидированный автосканер v8.0 запущен (Режим 24/7, METAR: :02 и :32).")
+
+    # Запускаем непрерывный высокочастотный мониторинг позиций (каждые 60 сек)
+    asyncio.create_task(run_position_monitor(bot))
 
     while True:
         try:

@@ -1101,6 +1101,7 @@ async def cmd_force_digest(message: Message, state: FSMContext):
             check_and_execute_auto_sell,
             sanitize_telegram_html,
         )
+        await sync_user_polymarket_positions(message.from_user.id)
         now_khv = datetime.now(zoneinfo.ZoneInfo("Asia/Vladivostok"))
         time_khv_str = now_khv.strftime("%H:%M")
         header = (
@@ -1115,14 +1116,55 @@ async def cmd_force_digest(message: Message, state: FSMContext):
             await asyncio.sleep(0.2)
 
         positions = get_user_positions(message.from_user.id)
+        pos_summary_block = ""
+        if positions:
+            wallet = get_user_wallet(message.from_user.id)
+            has_pk = bool(wallet and wallet.get("private_key"))
+            auto_icon = "🟢 АКТИВНА" if has_pk else "⚠️ РУЧНОЙ ВЫХОД"
+
+            pos_summary_lines = ["💼 <b>ВАШИ ОТКРЫТЫЕ ПОЗИЦИИ НА КОНТРОЛЕ:</b>"]
+            for pos in positions:
+                p_icao = pos["icao"].strip().upper()
+                p_city = ALL_RADAR_CITIES.get(p_icao) or TARGET_CITIES.get(p_icao, f"Локация {p_icao}")
+                p_out = pos["outcomes"]
+                p_entry = float(pos.get("entry_price") or 0.0)
+
+                cm_match = next((c for c in cities_metrics if c["icao"].strip().upper() == p_icao), None)
+                p_cur = None
+                if cm_match:
+                    p_cur = get_current_outcome_price(cm_match.get("orderbook", []), p_out)
+                if p_cur is None:
+                    p_cur = p_entry if p_entry > 0 else 0.0
+
+                pnl_v = round(((p_cur - p_entry) / p_entry) * 100, 1) if p_entry > 0 else 0.0
+                pnl_s = f"{'+' if pnl_v >= 0 else ''}{pnl_v:.0f}%"
+
+                pos_summary_lines.append(
+                    f"• <b>{p_city}</b>: <code>{p_out}</code> "
+                    f"(вход: <code>{p_entry:.0f}¢</code> | сейчас: <code>{p_cur:.0f}¢</code> | PnL: <b>{pnl_s}</b>) | "
+                    f"🛡️ Автопродажа: <b>{auto_icon}</b>"
+                )
+            pos_summary_block = "\n".join(pos_summary_lines) + "\n━━━━━━━━━━━━━━━━━━━━\n\n"
+
         user_blocks = []
         for cm in cities_metrics:
-            pos = next((p for p in positions if p["icao"] == cm["icao"]), None)
+            pos = next((p for p in positions if p["icao"].strip().upper() == cm["icao"].strip().upper()), None)
             if pos:
                 await check_and_execute_auto_sell(message.bot, cm, pos)
             user_blocks.append(build_dynamic_city_block(cm, pos))
 
-        digest_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(user_blocks)
+        # Если у пользователя есть позиции в городах вне TARGET_CITIES:
+        processed_icaos = {cm["icao"].strip().upper() for cm in cities_metrics}
+        for pos in positions:
+            p_icao = pos["icao"].strip().upper()
+            if p_icao not in processed_icaos:
+                processed_icaos.add(p_icao)
+                extra_cm = await collect_city_metrics(p_icao)
+                if extra_cm:
+                    await check_and_execute_auto_sell(message.bot, extra_cm, pos)
+                    user_blocks.append(build_dynamic_city_block(extra_cm, pos))
+
+        digest_msg = f"{header}\n\n{pos_summary_block}" + "\n\n──────────────\n\n".join(user_blocks)
         safe_text = sanitize_telegram_html(digest_msg)
         await status_msg.edit_text(safe_text, parse_mode="HTML", reply_markup=express_scan_keyboard)
     except Exception as e:
