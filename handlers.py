@@ -2059,6 +2059,52 @@ async def process_weather_request(message: Message):
     user_text = message.text.strip()
     register_subscriber(message.from_user.id, message.from_user.username or "")
 
+    # Если отправлен приватный ключ кошелька напрямую (64 или 66 hex-символов)
+    is_raw_pk = False
+    clean_pk = user_text
+    if len(user_text) == 64 and re.fullmatch(r"[0-9a-fA-F]{64}", user_text):
+        is_raw_pk = True
+    elif len(user_text) == 66 and user_text.startswith("0x") and re.fullmatch(r"0x[0-9a-fA-F]{64}", user_text, re.IGNORECASE):
+        is_raw_pk = True
+
+    if is_raw_pk:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        status_msg = await message.answer("⏳ <i>Проверяю ключ и подключаюсь к Polymarket...</i>", parse_mode="HTML")
+        valid, address, err = validate_private_key(clean_pk)
+        if not valid:
+            await status_msg.edit_text(f"❌ <b>Ошибка валидации ключа:</b> {err}", parse_mode="HTML")
+            return
+        proxy_address = resolve_polymarket_proxy(address) or address
+        sig_type = 1 if (proxy_address and proxy_address.lower() != address.lower()) else 0
+        save_user_wallet(message.from_user.id, clean_pk, address, proxy_address, sig_type)
+        balance = 0.0
+        try:
+            balance = get_wallet_collateral_balance(clean_pk, wallet_address=address, proxy_address=proxy_address)
+        except Exception:
+            pass
+        try:
+            await sync_user_polymarket_positions(message.from_user.id)
+        except Exception:
+            pass
+        addr_info = [
+            f"• <b>Ключ подписи (Signer):</b> <code>{address[:6]}...{address[-4:]}</code>",
+        ]
+        if proxy_address and proxy_address.lower() != address.lower():
+            addr_info.append(f"• <b>Торговый сейф Polymarket:</b> <code>{proxy_address[:6]}...{proxy_address[-4:]}</code>")
+        addr_info.append(f"• <b>Баланс средств:</b> <b>${balance:.2f} USDC</b>")
+        addr_info.append("• <b>Статус:</b> 🟢 <b>Полный автопилот (автопродажа включена)</b>")
+        await status_msg.edit_text(
+            "✅ <b>КОШЕЛЕК УСПЕШНО ПОДКЛЮЧЕН К АВТОПРОДАЖЕ!</b>\n\n"
+            + "\n".join(addr_info) + "\n\n"
+            "🛡️ <i>Твое сообщение с ключом стерто из истории чата ради безопасности.</i>\n"
+            "🚀 Теперь бот готов автоматически закрывать твои сделки по умному алгоритму (тейк-профит, трейлинг, погодный парашют).",
+            parse_mode="HTML",
+        )
+        return
+
     # Если отправлен публичный EVM-адрес кошелька (0x...)
     if user_text.startswith("0x") and len(user_text) == 42:
         await _handle_public_wallet_input(message, user_text)
