@@ -180,6 +180,32 @@ def get_user_positions(user_id: int) -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+def get_position_by_id(pos_id: int) -> Optional[Dict[str, Any]]:
+    """Возвращает сделку по ее идентификатору."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, user_id, icao, outcomes, target_date, entry_price, status,
+                   shares, peak_price, trailing_active, token_id, last_alert, created_at
+            FROM user_positions WHERE id = ?
+        """, (pos_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def is_position_closed_today(user_id: int, icao: str, outcomes: str, target_date: str) -> bool:
+    """Проверяет, была ли данная сделка уже закрыта пользователем сегодня."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 1 FROM user_positions
+            WHERE user_id = ? AND icao = ? AND outcomes = ? AND target_date = ? AND status = 'CLOSED'
+            LIMIT 1
+        """, (user_id, icao.strip().upper(), outcomes.strip(), target_date.strip()))
+        return cursor.fetchone() is not None
+
+
 def get_all_active_positions() -> List[Dict[str, Any]]:
     """Возвращает все активные позиции (status = 'OPEN') для фонового сканирования радаром."""
     with sqlite3.connect(DB_PATH) as conn:

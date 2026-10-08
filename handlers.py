@@ -41,6 +41,8 @@ from database import (
     add_position,
     delete_position,
     get_user_positions,
+    get_position_by_id,
+    is_position_closed_today,
     save_user_wallet,
     save_user_public_wallet,
     get_user_wallet,
@@ -51,6 +53,8 @@ from clob_trader import (
     validate_private_key,
     get_wallet_collateral_balance,
     resolve_polymarket_proxy,
+    execute_market_sell,
+    get_token_balance,
 )
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
@@ -574,14 +578,30 @@ async def process_ai_city_callback(callback: CallbackQuery, state: FSMContext = 
     # 3. Выработка стратегии по правилам KB v8.0
     is_rain = is_blocking_rain_and_clouds(raw_metar)
     is_afternoon_cutoff = (local_hour >= heating_cutoff)
+    local_time_val = local_dt.hour + local_dt.minute / 60.0
+    is_cloud_stall = (
+        local_time_val >= 11.5
+        and rate_val < 0.4
+        and has_real_low_cloud(raw_metar)
+        and target_val is not None
+        and temp_c is not None
+        and (target_val - temp_c) >= 1.5
+    )
 
-    if is_rain or is_overheated or is_afternoon_cutoff:
+    if is_rain or is_overheated or is_afternoon_cutoff or is_cloud_stall:
         if is_afternoon_cutoff:
             cutoff_m = int((heating_cutoff % 1) * 60)
             strategy_block = (
                 "⛔ <b>ВЕРДИКТ: СКИП МАРКЕТА (ОКНО ПРОГРЕВА ЗАКРЫТО)</b>\n"
                 f"⚠️ <b>Время {local_dt.strftime('%H:%M')} LT: Активная дневная инсоляция угасла ({season_label}, закрытие в {int(heating_cutoff)}:{cutoff_m:02d} LT).</b> "
                 f"Покупка страйков выше текущего факта ({temp_c if temp_c is not None else 'Н/Д'}°C) — гарантированный слив депозита."
+            )
+        elif is_cloud_stall:
+            strategy_block = (
+                "⛔ <b>ВЕРДИКТ: СКИП МАРКЕТА (ФИЗИЧЕСКИЙ СЛОМ ПРОГРЕВА)</b>\n"
+                f"⚠️ <b>Низкая слоистая облачность (Stratus/BKN < 1500 ft) заблокировала дневную инсоляцию.</b> "
+                f"Темп прогрева затух ({rate_str}), текущий факт ({temp_c if temp_c is not None else 'Н/Д'}°C) критически отстает от модельной цели ({target_val:.1f}°C). "
+                f"Покупка страйка {target_strike}°C здесь — гарантированный слив депозита."
             )
         else:
             strategy_block = (
@@ -971,15 +991,16 @@ async def sync_user_polymarket_positions(user_id: int) -> int:
             entry_price = round(float(item.get("avgPrice") or 0.0) * 100.0, 1)
             token_id = str(item.get("asset") or "")
 
-            # Проверяем, есть ли уже такая сделка в базе
+            # Проверяем, есть ли уже такая активная сделка в базе или она была закрыта сегодня
             is_already_added = any(
                 p.get("icao") == detected_icao
                 and p.get("target_date") == target_date
                 and str(p.get("outcomes")).replace(" ", "") == outcomes_str
                 for p in existing_positions
             )
+            was_closed_today = is_position_closed_today(user_id, detected_icao, outcomes_str, target_date)
 
-            if not is_already_added:
+            if not is_already_added and not was_closed_today:
                 add_position(
                     user_id=user_id,
                     icao=detected_icao,
@@ -1595,8 +1616,52 @@ async def process_pos_outcomes_input(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("del_pos:"))
 async def process_del_pos_callback(callback: CallbackQuery):
     pos_id = int(callback.data.split(":")[1])
+    wallet = get_user_wallet(callback.from_user.id)
+    has_pk = bool(wallet and wallet.get("private_key"))
+
+    pos_item = get_position_by_id(pos_id)
+    sold_on_exchange = False
+
+    if pos_item and has_pk:
+        token_id = pos_item.get("token_id")
+        shares = float(pos_item.get("shares") or 0.0)
+        proxy_addr = wallet.get("proxy_address") or ""
+        sig_type = int(wallet.get("signature_type") or 1)
+        if token_id:
+            try:
+                token_balance = await asyncio.to_thread(
+                    get_token_balance,
+                    wallet["private_key"],
+                    token_id,
+                    proxy_addr,
+                )
+                sell_amount = token_balance if token_balance > 0 else shares
+                if sell_amount > 0:
+                    success, order_id, _ = await asyncio.to_thread(
+                        execute_market_sell,
+                        wallet["private_key"],
+                        token_id,
+                        sell_amount,
+                        0.001,
+                        proxy_addr,
+                        sig_type,
+                    )
+                    if success:
+                        sold_on_exchange = True
+            except Exception as e_sell:
+                logger.error(f"Ошибка ручного сброса позиции на бирже: {e_sell}")
+
     delete_position(pos_id, callback.from_user.id)
-    await callback.answer("✅ Сделка закрыта.")
+
+    if sold_on_exchange:
+        await callback.answer("⚡ Позиция успешно продана на Polymarket!", show_alert=True)
+    elif has_pk:
+        await callback.answer("✅ Сделка закрыта.", show_alert=False)
+    else:
+        await callback.answer(
+            "✅ Сделка снята с радара.\n⚠️ Не забудь продать контракт в Preddy руками, так как приватный ключ не подключен!",
+            show_alert=True
+        )
 
     positions = get_user_positions(callback.from_user.id)
     if not positions:
