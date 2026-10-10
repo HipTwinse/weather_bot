@@ -1642,7 +1642,7 @@ async def process_del_pos_callback(callback: CallbackQuery):
                         wallet["private_key"],
                         token_id,
                         sell_amount,
-                        0.001,
+                        0.01,
                         proxy_addr,
                         sig_type,
                     )
@@ -1656,7 +1656,7 @@ async def process_del_pos_callback(callback: CallbackQuery):
     if sold_on_exchange:
         await callback.answer("⚡ Позиция успешно продана на Polymarket!", show_alert=True)
     elif has_pk:
-        await callback.answer("✅ Сделка закрыта.", show_alert=False)
+        await callback.answer("⚠️ Не удалось продать на бирже (проверь ликвидность). Сделка закрыта в боте.", show_alert=True)
     else:
         await callback.answer(
             "✅ Сделка снята с радара.\n⚠️ Не забудь продать контракт в Preddy руками, так как приватный ключ не подключен!",

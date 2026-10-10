@@ -1014,6 +1014,12 @@ async def check_and_execute_auto_sell(
     elif 12.5 <= local_time_val <= heating_cutoff and (rate_val < 0.4 and has_real_low_cloud(raw_metar) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
         trigger_reason = "🛑 ПОГОДНЫЙ ПАРАШЮТ: Затухание темпа под плотной облачностью"
 
+    # Триггер Д: Стоп-лосс / Защита от неблагоприятного отбора (обвал стакана на >= 8¢ или >= 35% от цены входа после 10:00 LT)
+    elif entry_price > 0 and ((entry_price - cur_price) >= 8.0 or ((entry_price - cur_price) / entry_price >= 0.35 and (entry_price - cur_price) >= 5.0)) and local_time_val >= 10.0:
+        drop_cents = entry_price - cur_price
+        drop_pct = (drop_cents / entry_price) * 100
+        trigger_reason = f"🛑 СТОП-ЛОСС (ОБВАЛ СТАКАНА НА -{drop_cents:.0f}¢ / -{drop_pct:.0f}%): Сброс позиции для спасения депозита (вход: {entry_price:.0f}¢, сейчас: {cur_price:.0f}¢)"
+
     if not trigger_reason:
         return None
 
@@ -1067,7 +1073,7 @@ async def check_and_execute_auto_sell(
         wallet["private_key"],
         token_id,
         shares,
-        worst_price=0.001,
+        worst_price=0.01,
         proxy_address=proxy_addr,
         signature_type=sig_type,
     )
@@ -1139,7 +1145,14 @@ async def run_position_monitor(bot: Bot) -> None:
             # 2. Получаем все открытые позиции
             active_positions = await asyncio.to_thread(get_all_active_positions)
             if active_positions:
+                today_str = datetime.now().strftime("%Y-%m-%d")
                 for pos in active_positions:
+                    # Проверяем не истекла ли дата сделки
+                    target_date = str(pos.get("target_date") or "").strip()
+                    if target_date and target_date < today_str:
+                        await asyncio.to_thread(close_position_with_exit, pos["id"], 0.0)
+                        continue
+
                     icao = (pos.get("icao") or "").strip().upper()
                     if not icao:
                         continue

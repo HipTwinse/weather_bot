@@ -333,13 +333,23 @@ def execute_market_sell(
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
 
+        # Получаем реальный минимальный шаг цены (tick_size) рынка (обычно 0.01 на Polymarket)
+        try:
+            tick_size = float(client.get_tick_size(token_id))
+        except Exception:
+            tick_size = 0.01
+
+        safe_worst_price = max(float(worst_price), tick_size)
+        safe_worst_price = min(safe_worst_price, 1.0 - tick_size)
+        safe_worst_price = round(safe_worst_price, 4)
+
         # Способ 1: Прямой рыночный ордер через SDK
         try:
             market_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=shares,
                 side="SELL",
-                price=worst_price,
+                price=safe_worst_price,
                 order_type=OrderType.FOK,
             )
             signed_order = client.create_market_order(market_args)
@@ -354,7 +364,7 @@ def execute_market_sell(
 
         # Способ 2: Агрессивный FAK-ордер на продажу в существующий бид
         order_args = OrderArgs(
-            price=max(0.001, worst_price),
+            price=safe_worst_price,
             size=shares,
             side="SELL",
             token_id=token_id,
