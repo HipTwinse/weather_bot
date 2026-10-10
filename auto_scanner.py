@@ -758,9 +758,16 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
             )
         # 4. Триггер Неблагоприятного отбора (обвал стакана днем >= 8¢ при открытом рынке):
         elif entry_price > 0 and (entry_price - cur_price) >= 8.0 and local_time_val >= 10.0:
-            verdict = (
-                f"⚠️ <b>ТРЕВОГА (ПАДЕНИЕ СТАКАНА: -{entry_price - cur_price:.0f}¢)</b> — Дневной обвал цены (в 75% случаев сигнал слома погоды / adverse selection). Проверь METAR, держи палец на выходе!"
-            )
+            is_on_target = (target_temp is not None and temp_c is not None and int(round(temp_c)) == int(round(target_temp)))
+            near_finish = (heating_cutoff - local_time_val) <= 1.5
+            if is_on_target and near_finish:
+                verdict = (
+                    f"🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ (ТОЧНОЕ ПОПАДАНИЕ)</b> — Факт METAR уже на страйке ({temp_c:.0f}°C), до финиша окна считанные минуты. Паника в стакане игнорируется: сидим до победы или реального пробоя вверх!"
+                )
+            else:
+                verdict = (
+                    f"⚠️ <b>ТРЕВОГА (ПАДЕНИЕ СТАКАНА: -{entry_price - cur_price:.0f}¢)</b> — Дневной обвал цены (в 75% случаев сигнал слома погоды / adverse selection). Проверь METAR, держи палец на выходе!"
+                )
         # 5. Утреннее развитие и удержание:
         # ВАЖНО: До 12:30 LT утреннее замедление или высокая облачность НЕ инвалидируют позицию!
         elif local_time_val < 12.5:
@@ -1016,9 +1023,12 @@ async def check_and_execute_auto_sell(
 
     # Триггер Д: Стоп-лосс / Защита от неблагоприятного отбора (обвал стакана на >= 8¢ или >= 35% от цены входа после 10:00 LT)
     elif entry_price > 0 and ((entry_price - cur_price) >= 8.0 or ((entry_price - cur_price) / entry_price >= 0.35 and (entry_price - cur_price) >= 5.0)) and local_time_val >= 10.0:
-        drop_cents = entry_price - cur_price
-        drop_pct = (drop_cents / entry_price) * 100
-        trigger_reason = f"🛑 СТОП-ЛОСС (ОБВАЛ СТАКАНА НА -{drop_cents:.0f}¢ / -{drop_pct:.0f}%): Сброс позиции для спасения депозита (вход: {entry_price:.0f}¢, сейчас: {cur_price:.0f}¢)"
+        is_on_target = (target_temp is not None and temp_c is not None and int(round(temp_c)) == int(round(target_temp)))
+        near_finish = (heating_cutoff - local_time_val) <= 1.5
+        if not (is_on_target and near_finish):
+            drop_cents = entry_price - cur_price
+            drop_pct = (drop_cents / entry_price) * 100
+            trigger_reason = f"🛑 СТОП-ЛОСС (ОБВАЛ СТАКАНА НА -{drop_cents:.0f}¢ / -{drop_pct:.0f}%): Сброс позиции для спасения депозита (вход: {entry_price:.0f}¢, сейчас: {cur_price:.0f}¢)"
 
     if not trigger_reason:
         return None
