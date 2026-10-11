@@ -238,3 +238,26 @@ def get_outcome_token_id(orderbook: List[Dict[str, Any]], target_outcome_str: st
             return item.get("token_id")
 
     return None
+
+
+async def fetch_clob_token_price(token_id: str) -> Optional[float]:
+    """
+    Запрашивает актуальную цену продажи (Best Bid / Sell Price) токена напрямую с Polymarket CLOB.
+    Возвращает цену в центах (0.0..100.0) или None при недоступности.
+    """
+    if not token_id:
+        return None
+    url = f"https://clob.polymarket.com/price?token_id={token_id}&side=sell"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    raw_price = data.get("price")
+                    if raw_price is not None:
+                        return round(float(raw_price) * 100.0, 1)
+    except Exception as e:
+        logger.debug(f"Ошибка получения прямой цены CLOB для {token_id}: {e}")
+    return None
+

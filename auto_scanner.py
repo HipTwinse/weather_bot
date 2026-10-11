@@ -56,6 +56,7 @@ from polymarket_service import (
     get_current_outcome_price,
     extract_temp_value,
     get_outcome_token_id,
+    fetch_clob_token_price,
 )
 from clob_trader import execute_market_sell, get_token_balance
 
@@ -756,18 +757,13 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
             verdict = (
                 f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — После полудня темп затух под низкой облачностью, отставание от цели {target_temp - temp_c:.1f}°C критично!"
             )
-        # 4. Триггер Неблагоприятного отбора (обвал стакана днем >= 8¢ при открытом рынке):
-        elif entry_price > 0 and (entry_price - cur_price) >= 8.0 and local_time_val >= 10.0:
-            is_on_target = (target_temp is not None and temp_c is not None and int(round(temp_c)) == int(round(target_temp)))
-            near_finish = (heating_cutoff - local_time_val) <= 1.5
-            if is_on_target and near_finish:
-                verdict = (
-                    f"🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ (ТОЧНОЕ ПОПАДАНИЕ)</b> — Факт METAR уже на страйке ({temp_c:.0f}°C), до финиша окна считанные минуты. Паника в стакане игнорируется: сидим до победы или реального пробоя вверх!"
-                )
-            else:
-                verdict = (
-                    f"⚠️ <b>ТРЕВОГА (ПАДЕНИЕ СТАКАНА: -{entry_price - cur_price:.0f}¢)</b> — Дневной обвал цены (в 75% случаев сигнал слома погоды / adverse selection). Проверь METAR, держи палец на выходе!"
-                )
+        # 4. Триггер Неблагоприятного отбора / Стоп-лосс (обвал стакана днем >= 8¢ или >= 30%):
+        elif entry_price > 0 and ((entry_price - cur_price) >= 8.0 or ((entry_price - cur_price) / entry_price >= 0.30 and (entry_price - cur_price) >= 5.0)) and local_time_val >= 10.0:
+            drop_cents = entry_price - cur_price
+            drop_pct = (drop_cents / entry_price) * 100
+            verdict = (
+                f"🛑 <b>ТРЕВОГА (ПАДЕНИЕ СТАКАНА: -{drop_cents:.0f}¢)</b> — Дневной обвал цены (сигнал слома погоды / adverse selection). Срочный сброс для спасения депозита!"
+            )
         # 5. Утреннее развитие и удержание:
         # ВАЖНО: До 12:30 LT утреннее замедление или высокая облачность НЕ инвалидируют позицию!
         elif local_time_val < 12.5:
@@ -969,6 +965,14 @@ async def check_and_execute_auto_sell(
     orderbook = city_data.get("orderbook", [])
     target_outcomes = pos.get("outcomes", "")
     cur_price = get_current_outcome_price(orderbook, target_outcomes)
+    token_id = pos.get("token_id") or get_outcome_token_id(orderbook, target_outcomes)
+
+    # Резервный опрос прямой цены с Polymarket CLOB при отсутствии данных в стакане
+    if (cur_price is None or cur_price <= 0) and token_id:
+        clob_price = await fetch_clob_token_price(token_id)
+        if clob_price is not None and clob_price > 0:
+            cur_price = clob_price
+
     if cur_price is None or cur_price <= 0:
         return None
 
@@ -1021,14 +1025,11 @@ async def check_and_execute_auto_sell(
     elif 12.5 <= local_time_val <= heating_cutoff and (rate_val < 0.4 and has_real_low_cloud(raw_metar) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
         trigger_reason = "🛑 ПОГОДНЫЙ ПАРАШЮТ: Затухание темпа под плотной облачностью"
 
-    # Триггер Д: Стоп-лосс / Защита от неблагоприятного отбора (обвал стакана на >= 8¢ или >= 35% от цены входа после 10:00 LT)
-    elif entry_price > 0 and ((entry_price - cur_price) >= 8.0 or ((entry_price - cur_price) / entry_price >= 0.35 and (entry_price - cur_price) >= 5.0)) and local_time_val >= 10.0:
-        is_on_target = (target_temp is not None and temp_c is not None and int(round(temp_c)) == int(round(target_temp)))
-        near_finish = (heating_cutoff - local_time_val) <= 1.5
-        if not (is_on_target and near_finish):
-            drop_cents = entry_price - cur_price
-            drop_pct = (drop_cents / entry_price) * 100
-            trigger_reason = f"🛑 СТОП-ЛОСС (ОБВАЛ СТАКАНА НА -{drop_cents:.0f}¢ / -{drop_pct:.0f}%): Сброс позиции для спасения депозита (вход: {entry_price:.0f}¢, сейчас: {cur_price:.0f}¢)"
+    # Триггер Д: Стоп-лосс / Защита от неблагоприятного отбора (обвал стакана на >= 8¢ или >= 30% от цены входа после 10:00 LT)
+    elif entry_price > 0 and ((entry_price - cur_price) >= 8.0 or ((entry_price - cur_price) / entry_price >= 0.30 and (entry_price - cur_price) >= 5.0)) and local_time_val >= 10.0:
+        drop_cents = entry_price - cur_price
+        drop_pct = (drop_cents / entry_price) * 100
+        trigger_reason = f"🛑 СТОП-ЛОСС (ОБВАЛ СТАКАНА НА -{drop_cents:.0f}¢ / -{drop_pct:.0f}%): Сброс позиции для спасения депозита (вход: {entry_price:.0f}¢, сейчас: {cur_price:.0f}¢)"
 
     if not trigger_reason:
         return None
@@ -1155,20 +1156,37 @@ async def run_position_monitor(bot: Bot) -> None:
             # 2. Получаем все открытые позиции
             active_positions = await asyncio.to_thread(get_all_active_positions)
             if active_positions:
-                today_str = datetime.now().strftime("%Y-%m-%d")
                 for pos in active_positions:
-                    # Проверяем не истекла ли дата сделки
-                    target_date = str(pos.get("target_date") or "").strip()
-                    if target_date and target_date < today_str:
-                        await asyncio.to_thread(close_position_with_exit, pos["id"], 0.0)
-                        continue
-
                     icao = (pos.get("icao") or "").strip().upper()
                     if not icao:
                         continue
+
+                    # Проверяем локальное время станции для корректного срока жизни сделки
+                    airport = resolve_airport(icao)
+                    tz_name = airport.get("timezone", "UTC") if airport else "UTC"
+                    try:
+                        local_tz = zoneinfo.ZoneInfo(tz_name)
+                    except Exception:
+                        local_tz = zoneinfo.ZoneInfo("UTC")
+                    local_dt = datetime.now(local_tz)
+                    local_date_str = local_dt.strftime("%Y-%m-%d")
+
+                    target_date = str(pos.get("target_date") or "").strip()
+                    # Закрываем сделку как архивную ТОЛЬКО если дата станции строго опережает target_date
+                    # (например, в Мадриде уже наступил следующий календарный день)
+                    if target_date and target_date < local_date_str:
+                        await asyncio.to_thread(close_position_with_exit, pos["id"], 0.0)
+                        continue
+
                     try:
                         cm = await collect_city_metrics(icao)
                         if cm:
+                            # Если дата позиции отличается от локальной даты сегодня, подтягиваем рынок нужной даты
+                            if target_date and target_date != cm.get("local_dt", local_dt).strftime("%Y-%m-%d"):
+                                poly_event = await find_city_weather_event(icao, target_date)
+                                if poly_event:
+                                    cm = dict(cm)
+                                    cm["orderbook"] = parse_markets_orderbook(poly_event.get("markets", []))
                             await check_and_execute_auto_sell(bot, cm, pos)
                     except Exception as err:
                         logger.warning(f"Ошибка проверки позиции {pos.get('id')} ({icao}): {err}")
