@@ -41,6 +41,10 @@ from database import (
     add_position,
     delete_position,
     get_user_positions,
+    get_user_positions_split,
+    get_trading_mode,
+    set_trading_mode,
+    get_trading_stats,
     get_position_by_id,
     is_position_closed_today,
     save_user_wallet,
@@ -131,9 +135,10 @@ main_keyboard = ReplyKeyboardMarkup(
         ],
         [
             KeyboardButton(text="📌 Мои позиции"),
-            KeyboardButton(text="🌍 Избранные города"),
+            KeyboardButton(text="📊 Статистика"),
         ],
         [
+            KeyboardButton(text="🌍 Избранные города"),
             KeyboardButton(text="📖 Справка / Команды"),
         ],
     ],
@@ -992,15 +997,29 @@ async def sync_user_polymarket_positions(user_id: int) -> int:
             token_id = str(item.get("asset") or "")
 
             # Проверяем, есть ли уже такая активная сделка в базе или она была закрыта сегодня
-            is_already_added = any(
-                p.get("icao") == detected_icao
-                and p.get("target_date") == target_date
-                and str(p.get("outcomes")).replace(" ", "") == outcomes_str
-                for p in existing_positions
+            matching_pos = next(
+                (p for p in existing_positions
+                 if p.get("icao") == detected_icao
+                 and p.get("target_date") == target_date
+                 and str(p.get("outcomes")).replace(" ", "") == outcomes_str),
+                None
             )
             was_closed_today = is_position_closed_today(user_id, detected_icao, outcomes_str, target_date)
 
-            if not is_already_added and not was_closed_today:
+            if matching_pos:
+                # Если позиция числилась бумажной, но обнаружена реально на кошельке — переводим в боевые
+                if matching_pos.get("is_paper"):
+                    import sqlite3
+                    from database import DB_PATH
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.cursor().execute(
+                            "UPDATE user_positions SET is_paper = 0, shares = ?, token_id = ?, entry_price = ? WHERE id = ?",
+                            (size, token_id, entry_price, matching_pos["id"])
+                        )
+                        conn.commit()
+                    synced_count += 1
+                    logger.info(f"🔄 Бумажная позиция {detected_icao} {outcomes_str} переведена в боевые (найдена на кошельке)")
+            elif not was_closed_today:
                 add_position(
                     user_id=user_id,
                     icao=detected_icao,
@@ -1009,6 +1028,7 @@ async def sync_user_polymarket_positions(user_id: int) -> int:
                     entry_price=entry_price,
                     shares=size,
                     token_id=token_id,
+                    is_paper=0,
                 )
                 synced_count += 1
                 logger.info(f"✅ Автосинхронизирована позиция {detected_icao} {outcomes_str} для пользователя {user_id}")
@@ -1057,54 +1077,211 @@ async def _handle_public_wallet_input(message: Message, address: str) -> None:
     )
 
 
+def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    """Формирует единый интерфейс позиций с разделением на реальные и бумажные сделки."""
+    real_positions, paper_positions = get_user_positions_split(user_id)
+    trading_mode = get_trading_mode(user_id)
+    wallet = get_user_wallet(user_id)
+    has_pk = bool(wallet and wallet.get("private_key"))
+    proxy_addr = wallet.get("proxy_address") or wallet.get("wallet_address", "") if wallet else ""
+
+    balance = 0.0
+    if wallet:
+        try:
+            balance = get_wallet_collateral_balance(
+                wallet.get("private_key", ""),
+                wallet_address=wallet.get("wallet_address", ""),
+                proxy_address=proxy_addr,
+            )
+        except Exception:
+            pass
+
+    if trading_mode == "REAL":
+        mode_header = "⚡ <b>РЕЖИМ: БОЕВОЙ (Деньги + бумага при нехватке)</b>"
+        mode_btn = "🧪 Переключить в ТЕСТ"
+        auto_text = "🟢 Автопродажа активна" if has_pk else "🟡 Только сигналы (отправь /set_key)"
+    else:
+        mode_header = "🧪 <b>РЕЖИМ: ТЕСТ (Только бумага, без риска депозита)</b>"
+        mode_btn = "⚡ Переключить в БОЕВОЙ"
+        auto_text = "📝 Виртуальный риск-менеджмент"
+
+    wallet_info = f"💰 <b>Баланс:</b> <code>${balance:.2f} USDC</code> | 🛡️ <b>Защита:</b> {auto_text}"
+
+    text_sections = [
+        mode_header,
+        wallet_info,
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    buttons = []
+    buttons.append([
+        InlineKeyboardButton(text=mode_btn, callback_data="toggle_trading_mode"),
+        InlineKeyboardButton(text="📊 Статистика", callback_data="view_trading_stats"),
+    ])
+
+    if not real_positions and not paper_positions:
+        text_sections.append(
+            "\n📌 <b>У тебя пока нет активных сделок на контроле.</b>\n\n"
+            "🤖 Автосканер каждые полчаса отбирает надежные исходы:\n"
+            "• В боевом режиме — покупает на бирже (от $1.08) или берет на бумагу при нехватке средств.\n"
+            "• В тестовом режиме — проверяет теорию и ведет винрейт на бумаге без риска.\n\n"
+            "💡 <i>Ты также можешь добавить сделку вручную кнопкой ниже.</i>"
+        )
+    else:
+        if real_positions:
+            text_sections.append("\n🟢 <b>РЕАЛЬНЫЕ СДЕЛКИ (ПОД ЗАЩИТОЙ):</b>")
+            for pos in real_positions:
+                city_label = ALL_RADAR_CITIES.get(pos["icao"], pos["icao"])
+                p_out = pos["outcomes"]
+                p_entry = float(pos.get("entry_price") or 0.0)
+                p_shares = float(pos.get("shares") or 0.0)
+                shares_str = f" (~{p_shares:.1f} shares)" if p_shares > 0 else ""
+                conf_s = f" | ⭐ <b>{pos['confidence_score']:.0f}/100</b>" if pos.get("confidence_score") else ""
+                text_sections.append(
+                    f"• <b>{city_label}</b>: <code>{p_out}</code> "
+                    f"(вход: <b>{p_entry:.0f}¢</b>{shares_str}{conf_s})\n"
+                    f"  └ <i>Дата:</i> <code>{pos['target_date']}</code> | 🛡️ Трейлинг + Погодный парашют"
+                )
+                buttons.append([
+                    InlineKeyboardButton(text=f"⚡ AI: {pos['icao']}", callback_data=f"express_scan:{pos['icao']}"),
+                    InlineKeyboardButton(text=f"❌ Закрыть: {pos['icao']} ({p_out})", callback_data=f"del_pos:{pos['id']}"),
+                ])
+
+        if paper_positions:
+            text_sections.append("\n📝 <b>БУМАЖНЫЕ СДЕЛКИ (ТЕСТОВЫЙ РАСЧЕТ):</b>")
+            for pos in paper_positions:
+                city_label = ALL_RADAR_CITIES.get(pos["icao"], pos["icao"])
+                p_out = pos["outcomes"]
+                p_entry = float(pos.get("entry_price") or 0.0)
+                conf_s = f" | ⭐ <b>{pos['confidence_score']:.0f}/100</b>" if pos.get("confidence_score") else ""
+                text_sections.append(
+                    f"• <b>{city_label}</b>: <code>{p_out}</code> "
+                    f"(вход: <b>{p_entry:.0f}¢</b>{conf_s})\n"
+                    f"  └ <i>Дата:</i> <code>{pos['target_date']}</code> | 🧪 Тестовая позиция"
+                )
+                buttons.append([
+                    InlineKeyboardButton(text=f"⚡ AI: {pos['icao']}", callback_data=f"express_scan:{pos['icao']}"),
+                    InlineKeyboardButton(text=f"🗑️ Сброс: {pos['icao']} ({p_out})", callback_data=f"del_pos:{pos['id']}"),
+                ])
+
+    buttons.append([InlineKeyboardButton(text="➕ Добавить сделку вручную", callback_data="add_new_pos")])
+    return "\n".join(text_sections), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    """Формирует подробный отчет по статистике и винрейту сделок."""
+    stats = get_trading_stats(user_id)
+    real_s = stats.get("real", {})
+    paper_s = stats.get("paper", {})
+    recent_trades = stats.get("recent_trades", [])
+    mode = get_trading_mode(user_id)
+    mode_label = "⚡ БОЕВОЙ" if mode == "REAL" else "🧪 ТЕСТОВЫЙ"
+
+    real_pnl_str = f"{'+' if real_s.get('total_pnl_usd', 0) >= 0 else ''}${real_s.get('total_pnl_usd', 0):.2f} USDC"
+    paper_pnl_str = f"{'+' if paper_s.get('total_pnl_usd', 0) >= 0 else ''}${paper_s.get('total_pnl_usd', 0):.2f} USDC"
+
+    lines = [
+        "📊 <b>ДЕТАЛЬНАЯ СТАТИСТИКА ТОРГОВЛИ</b>\n",
+        f"🎯 <b>Текущий режим бота:</b> <b>{mode_label}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "⚡ <b>БОЕВАЯ ТОРГОВЛЯ (РЕАЛЬНЫЕ ДЕНЬГИ):</b>",
+        f"• Закрыто сделок: <b>{real_s.get('total', 0)}</b> (Побед: {real_s.get('wins', 0)} | Потерь: {real_s.get('losses', 0)})",
+        f"• Винрейт (Win Rate): <b>{real_s.get('winrate', 0.0):.1f}%</b>",
+        f"• Итоговый PnL: <b>{real_pnl_str}</b>",
+        f"• Средний плюс: <b>+{real_s.get('avg_win_cents', 0.0):.1f}¢</b> | Средний минус: <b>{real_s.get('avg_loss_cents', 0.0):.1f}¢</b>\n",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "🧪 <b>БУМАЖНАЯ ТОРГОВЛЯ (ТЕСТОВЫЙ РАСЧЕТ):</b>",
+        f"• Всего симуляций: <b>{paper_s.get('total', 0)}</b> (Побед: {paper_s.get('wins', 0)} | Потерь: {paper_s.get('losses', 0)})",
+        f"• Винрейт (Win Rate): <b>{paper_s.get('winrate', 0.0):.1f}%</b>",
+        f"• Теоретический PnL: <b>{paper_pnl_str}</b>\n",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "📋 <b>ПОСЛЕДНИЕ ЗАКРЫТЫЕ СДЕЛКИ:</b>",
+    ]
+
+    if not recent_trades:
+        lines.append("<i>История закрытых сделок пока пуста. После фиксации первой прибыли или стоп-лосса здесь появится разбор.</i>")
+    else:
+        for t in recent_trades[:7]:
+            tag = "🧪" if t.get("is_paper") else "⚡"
+            city = ALL_RADAR_CITIES.get(t.get("icao", ""), t.get("icao", ""))
+            outcomes = t.get("outcomes", "")
+            pnl_c = float(t.get("pnl_cents") or 0.0)
+            pnl_p = float(t.get("pnl_percent") or 0.0)
+            icon = "✅" if pnl_c > 0 else "🛑"
+            sign = "+" if pnl_c >= 0 else ""
+            reason = t.get("exit_reason") or "Плановое закрытие"
+            lines.append(
+                f"{tag} {icon} <b>{city}</b> (<code>{outcomes}</code>): "
+                f"<b>{sign}{pnl_c:.0f}¢ ({sign}{pnl_p:.0f}%)</b>\n"
+                f"   └ <i>Причина:</i> {reason}"
+            )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="« Назад к позициям", callback_data="back_to_positions"),
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="view_trading_stats"),
+        ]
+    ])
+    return "\n".join(lines), kb
+
+
 @router.message(F.text == "📌 Мои позиции", StateFilter("*"))
 @router.message(Command("positions"), StateFilter("*"))
 async def cmd_my_positions(message: Message, state: FSMContext):
     await state.clear()
     register_subscriber(message.from_user.id, message.from_user.username or "")
     await sync_user_polymarket_positions(message.from_user.id)
-    positions = get_user_positions(message.from_user.id)
+    text, markup = _render_positions_view(message.from_user.id)
+    await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
-    if not positions:
-        text = (
-            "📌 <b>У тебя пока нет активных сделок на контроле.</b>\n\n"
-            "Нажми <b>«➕ Добавить сделку»</b>, чтобы сканер каждые 30 минут отслеживал PnL, "
-            "сигнализировал о Тейк-Профите (+35% / 60¢) и тайм-стопе!\n\n"
-            "💡 <i>Или привяжи свой кошелек командой /set_wallet &lt;адрес&gt;, и бот сам найдет твои сделки с биржи!</i>"
-        )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_new_pos")]]
-        )
-        await message.answer(text, parse_mode="HTML", reply_markup=kb)
-        return
 
-    text_lines = ["📌 <b>Твои активные сделки под защитой сканера:</b>\n"]
-    buttons = []
+@router.callback_query(F.data == "toggle_trading_mode")
+async def process_toggle_trading_mode(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    current_mode = get_trading_mode(user_id)
+    new_mode = "PAPER" if current_mode == "REAL" else "REAL"
+    set_trading_mode(user_id, new_mode)
 
-    for pos in positions:
-        city_label = ALL_RADAR_CITIES.get(pos["icao"], pos["icao"])
-        entry_s = f" (вход: {pos.get('entry_price', 0):.0f}¢)" if pos.get('entry_price') else ""
-        text_lines.append(
-            f"• <b>{city_label}</b> | Исходы: <code>{pos['outcomes']}</code>{entry_s} | Дата: <code>{pos['target_date']}</code>"
-        )
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"⚡ AI Анализ: {pos['icao']}",
-                callback_data=f"express_scan:{pos['icao']}"
-            ),
-            InlineKeyboardButton(
-                text=f"❌ Закрыть: {pos['icao']}",
-                callback_data=f"del_pos:{pos['id']}"
-            )
-        ])
+    if new_mode == "REAL":
+        notice = "⚡ Режим переключен на БОЕВОЙ!\nБот будет покупать проверенные исходы на баланс кошелька, а при нехватке денег — отправлять в бумажный учет."
+    else:
+        notice = "🧪 Режим переключен на ТЕСТ!\nВсе последующие сделки будут открываться исключительно на бумаге без риска реальных денег."
 
-    buttons.append([InlineKeyboardButton(text="➕ Добавить еще сделку", callback_data="add_new_pos")])
+    await callback.answer(notice, show_alert=True)
+    text, markup = _render_positions_view(user_id)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        pass
 
-    await message.answer(
-        "\n".join(text_lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
+
+@router.message(F.text == "📊 Статистика", StateFilter("*"))
+@router.message(Command("stats"), StateFilter("*"))
+async def cmd_trading_stats(message: Message, state: FSMContext):
+    await state.clear()
+    register_subscriber(message.from_user.id, message.from_user.username or "")
+    text, markup = _render_trading_stats_view(message.from_user.id)
+    await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@router.callback_query(F.data == "view_trading_stats")
+async def process_view_trading_stats(callback: CallbackQuery):
+    text, markup = _render_trading_stats_view(callback.from_user.id)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "back_to_positions")
+async def process_back_to_positions(callback: CallbackQuery):
+    text, markup = _render_positions_view(callback.from_user.id)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        pass
+    await callback.answer()
 
 
 @router.message(Command("digest"), StateFilter("*"))
@@ -1135,6 +1312,12 @@ async def cmd_force_digest(message: Message, state: FSMContext):
             cm = await collect_city_metrics(icao)
             cities_metrics.append(cm)
             await asyncio.sleep(0.2)
+
+        from auto_scanner import check_and_execute_auto_buy
+        try:
+            await check_and_execute_auto_buy(message.bot, cities_metrics)
+        except Exception as e_buy:
+            logger.error(f"Ошибка вызова автопокупки в cmd_force_digest: {e_buy}", exc_info=True)
 
         positions = get_user_positions(message.from_user.id)
         pos_summary_block = ""
@@ -1621,8 +1804,9 @@ async def process_del_pos_callback(callback: CallbackQuery):
 
     pos_item = get_position_by_id(pos_id)
     sold_on_exchange = False
+    is_paper_trade = bool(pos_item and pos_item.get("is_paper"))
 
-    if pos_item and has_pk:
+    if pos_item and has_pk and not is_paper_trade:
         token_id = pos_item.get("token_id")
         shares = float(pos_item.get("shares") or 0.0)
         proxy_addr = wallet.get("proxy_address") or ""
@@ -1653,7 +1837,9 @@ async def process_del_pos_callback(callback: CallbackQuery):
 
     delete_position(pos_id, callback.from_user.id)
 
-    if sold_on_exchange:
+    if is_paper_trade:
+        await callback.answer("✅ Бумажная сделка удалена из учета.", show_alert=True)
+    elif sold_on_exchange:
         await callback.answer("⚡ Позиция успешно продана на Polymarket!", show_alert=True)
     elif has_pk:
         await callback.answer("⚠️ Не удалось продать на бирже (проверь ликвидность). Сделка закрыта в боте.", show_alert=True)
@@ -1663,37 +1849,11 @@ async def process_del_pos_callback(callback: CallbackQuery):
             show_alert=True
         )
 
-    positions = get_user_positions(callback.from_user.id)
-    if not positions:
-        await callback.message.edit_text(
-            "📌 <b>Все сделки закрыты. Активных позиций на контроле нет.</b>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_new_pos")]]
-            )
-        )
-        return
-
-    buttons = []
-    text_lines = ["📌 <b>Твои активные сделки под защитой сканера:</b>\n"]
-    for pos in positions:
-        city_label = ALL_RADAR_CITIES.get(pos["icao"], pos["icao"])
-        text_lines.append(
-            f"• <b>{city_label}</b> | Исходы: <code>{pos['outcomes']}</code> | Дата: <code>{pos['target_date']}</code>"
-        )
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"❌ Закрыть: {pos['icao']} ({pos['outcomes']})",
-                callback_data=f"del_pos:{pos['id']}"
-            )
-        ])
-
-    buttons.append([InlineKeyboardButton(text="➕ Добавить еще сделку", callback_data="add_new_pos")])
-    await callback.message.edit_text(
-        "\n".join(text_lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
+    text, markup = _render_positions_view(callback.from_user.id)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        pass
 
 
 # -------------------------------------------------------------
@@ -1834,47 +1994,12 @@ async def process_open_my_positions(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     register_subscriber(callback.from_user.id, callback.from_user.username or "")
     await sync_user_polymarket_positions(callback.from_user.id)
-    positions = get_user_positions(callback.from_user.id)
-    if not positions:
-        await callback.message.edit_text(
-            "📌 <b>У тебя пока нет активных сделок на контроле.</b>\n\n"
-            "Нажми <b>«➕ Добавить сделку»</b>, чтобы сканер каждые 30 минут отслеживал PnL!",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_new_pos")]]
-            )
-        )
-        return
-
-    wallet = get_user_wallet(callback.from_user.id)
-    has_pk = bool(wallet and wallet.get("private_key"))
-    mode_desc = (
-        "🟢 <b>Автопродажа активна</b> (Трейлинг + Погодный парашют)"
-        if has_pk
-        else ("🟡 <b>Только сигналы</b> (для автопродажи отправь /set_key)" if wallet else "⚪ <b>Кошелек не подключен</b> (отправь /set_key)")
-    )
-    text_lines = [
-        "📌 <b>Твои активные сделки под защитой сканера:</b>",
-        f"🤖 <i>Режим защиты: {mode_desc}</i>\n",
-    ]
-    buttons = []
-    for pos in positions:
-        city_label = ALL_RADAR_CITIES.get(pos["icao"], pos["icao"])
-        entry_s = f" (вход: {pos.get('entry_price', 0):.0f}¢)" if pos.get('entry_price') else ""
-        text_lines.append(
-            f"• <b>{city_label}</b> | Исходы: <code>{pos['outcomes']}</code>{entry_s} | Дата: <code>{pos['target_date']}</code>"
-        )
-        buttons.append([
-            InlineKeyboardButton(text=f"⚡ AI Анализ: {pos['icao']}", callback_data=f"express_scan:{pos['icao']}"),
-            InlineKeyboardButton(text=f"❌ Закрыть: {pos['icao']}", callback_data=f"del_pos:{pos['id']}")
-        ])
-    buttons.append([InlineKeyboardButton(text="➕ Добавить еще сделку", callback_data="add_new_pos")])
-
-    await callback.message.edit_text(
-        "\n".join(text_lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
+    text, markup = _render_positions_view(callback.from_user.id)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        pass
+    await callback.answer()
 
 
 @router.message(F.text == "🌍 Избранные города", StateFilter("*"))

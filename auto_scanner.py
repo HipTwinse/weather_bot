@@ -47,6 +47,11 @@ from database import (
     update_position_trailing,
     update_position_alert,
     close_position_with_exit,
+    add_position,
+    get_trading_mode,
+    get_user_positions,
+    get_user_positions_split,
+    get_trading_stats,
 )
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
@@ -58,7 +63,12 @@ from polymarket_service import (
     get_outcome_token_id,
     fetch_clob_token_price,
 )
-from clob_trader import execute_market_sell, get_token_balance
+from clob_trader import (
+    execute_market_sell,
+    execute_market_buy,
+    get_token_balance,
+    get_wallet_collateral_balance,
+)
 
 logger = logging.getLogger("AutoScanner")
 
@@ -1034,6 +1044,29 @@ async def check_and_execute_auto_sell(
     if not trigger_reason:
         return None
 
+    is_paper = int(pos.get("is_paper") or 0)
+    if is_paper:
+        await asyncio.to_thread(close_position_with_exit, pos_id, cur_price, trigger_reason)
+        pnl_val = round(((cur_price - entry_price) / entry_price) * 100, 1) if entry_price > 0 else 0.0
+        pnl_str = f"{'+' if pnl_val >= 0 else ''}{pnl_val:.0f}%"
+        profit_usd = (cur_price - entry_price) * float(pos.get("shares") or 2.5) / 100.0
+        profit_str = f"{'+' if profit_usd >= 0 else ''}${profit_usd:.2f}"
+
+        paper_notify = (
+            f"📝 <b>БУМАЖНАЯ СДЕЛКА ЗАКРЫТА (ТЕСТ БЕЗ РИСКА)</b>\n\n"
+            f"• <b>Причина:</b> {trigger_reason}\n"
+            f"• <b>Локация:</b> {city_name}\n"
+            f"• <b>Исход:</b> <code>{target_outcomes}</code>\n"
+            f"• <b>Вход:</b> <code>{entry_price:.0f}¢</code> | <b>Выход:</b> <b>{cur_price:.0f}¢</b>\n"
+            f"• <b>Результат:</b> <b>{pnl_str}</b> (Виртуальный PnL: <b>{profit_str}</b>)\n\n"
+            f"📊 <i>Сделка зафиксирована в базе и добавлена в статистику винрейта.</i>"
+        )
+        try:
+            await bot.send_message(user_id, paper_notify, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление о закрытии бумажной сделки: {e}")
+        return trigger_reason
+
     # Проверяем наличие приватного ключа
     has_private_key = bool(wallet and wallet.get("private_key"))
     last_alert = str(pos.get("last_alert") or "")
@@ -1090,7 +1123,7 @@ async def check_and_execute_auto_sell(
     )
 
     if success:
-        await asyncio.to_thread(close_position_with_exit, pos_id, cur_price)
+        await asyncio.to_thread(close_position_with_exit, pos_id, cur_price, trigger_reason)
         pnl_val = round(((cur_price - entry_price) / entry_price) * 100, 1) if entry_price > 0 else 0.0
         pnl_str = f"{'+' if pnl_val >= 0 else ''}{pnl_val:.0f}%"
 
@@ -1110,8 +1143,305 @@ async def check_and_execute_auto_sell(
 
         return trigger_reason
     else:
-        logger.error(f"Сбой исполнения автопродажи для позиции {pos_id}: {order_id}")
+        err_msg = str(order_id)
+        logger.error(f"Сбой исполнения автопродажи для позиции {pos_id}: {err_msg}")
+        last_alert = str(pos.get("last_alert") or "")
+        if f"SELL_FAIL_{err_msg}" != last_alert:
+            diag_text = (
+                f"⚠️ <b>ВНИМАНИЕ: СБОЙ АВТОПРОДАЖИ НА БИРЖЕ!</b>\n\n"
+                f"• <b>Локация:</b> {city_name} (<code>{target_outcomes}</code>)\n"
+                f"• <b>Причина срабатывания:</b> {trigger_reason}\n"
+                f"• <b>Ошибка биржи:</b> <code>{err_msg}</code>\n"
+                f"• <b>Текущая цена:</b> <b>{cur_price:.0f}¢</b>\n\n"
+                f"🚨 <i>Срочно сбрось позицию вручную на Polymarket / Predy и скопируй это сообщение разработчику для исправления!</i>"
+            )
+            try:
+                await bot.send_message(user_id, diag_text, parse_mode="HTML")
+                await asyncio.to_thread(update_position_alert, pos_id, f"SELL_FAIL_{err_msg}")
+            except Exception:
+                pass
         return None
+
+
+def calculate_candidate_confidence(
+    icao: str,
+    models: Dict[str, float],
+    raw_metar: str,
+    target_strike: int,
+    cand_price_cents: float,
+    rate_val: float = 0.0,
+    local_hour: float = 12.0,
+) -> Tuple[float, str, List[str]]:
+    """
+    Рассчитывает рейтинг надежности кандидата (0..100) и текстовую метку:
+    🟢 ВЫСОКАЯ УВЕРЕННОСТЬ (>= 75)
+    🟡 СРЕДНЯЯ УВЕРЕННОСТЬ (50..74)
+    ⛔ СКИП (< 50)
+    """
+    score = 50.0
+    reasons = []
+
+    # 1. Проверка блокирующих факторов погоды
+    if is_blocking_rain_and_clouds(raw_metar):
+        return 0.0, "⛔ СКИП (Осадки/Туман)", ["Обложные осадки блокируют дневной прогрев"]
+
+    # 2. Согласованность ведущих моделей (ICON, GFS, ECMWF)
+    vals = [v for k, v in models.items() if v is not None and k in ("icon_global", "gfs_global", "ecmwf_hres")]
+    if len(vals) >= 2:
+        spread = max(vals) - min(vals)
+        if spread <= 0.6:
+            score += 25.0
+            reasons.append(f"Консенсус моделей: разброс всего {spread:.1f}°C")
+        elif spread <= 1.0:
+            score += 15.0
+            reasons.append(f"Умеренный разброс моделей ({spread:.1f}°C)")
+        elif spread > 1.8:
+            score -= 25.0
+            reasons.append(f"Высокий рассинхрон моделей ({spread:.1f}°C)")
+    elif vals:
+        score += 10.0
+
+    # 3. Ценовой диапазон токена в стакане
+    if 25.0 <= cand_price_cents <= 48.0:
+        score += 20.0
+        reasons.append(f"Оптимальный диапазон входа ({cand_price_cents:.0f}¢)")
+    elif 18.0 <= cand_price_cents < 25.0:
+        score += 10.0
+        reasons.append(f"Дешевый токен с высоким плечом ({cand_price_cents:.0f}¢)")
+    elif cand_price_cents >= 65.0:
+        score -= 30.0
+        reasons.append(f"Рынок перегрет маркетмейкером ({cand_price_cents:.0f}¢)")
+    elif cand_price_cents < 15.0:
+        score -= 20.0
+        reasons.append(f"Слишком низкая рыночная вероятность ({cand_price_cents:.0f}¢)")
+
+    # 4. Облачность и синоптические драйверы
+    if any(c in raw_metar for c in ["CAVOK", "CLR", "SKC"]):
+        score += 10.0
+        reasons.append("Чистое небо: максимальная инсоляция")
+    elif has_real_low_cloud(raw_metar):
+        score -= 15.0
+        reasons.append("Низкая слоистая облачность на полосе")
+
+    score = max(0.0, min(100.0, round(score, 1)))
+    if score >= 75.0:
+        label = "🟢 ВЫСОКАЯ УВЕРЕННОСТЬ"
+    elif score >= 50.0:
+        label = "🟡 СРЕДНЯЯ УВЕРЕННОСТЬ"
+    else:
+        label = "⛔ СКИП (Недостаточно надежности)"
+
+    return score, label, reasons
+
+
+async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, Any]]) -> None:
+    """
+    Автоматически анализирует кандидатов дня и совершает покупки (реальные или бумажные)
+    с учетом режима пользователя, баланса кошелька и рейтинга надежности.
+    """
+    subscribers = await asyncio.to_thread(get_all_subscribers)
+    admin_id = getattr(config, "ADMIN_CHAT_ID", None)
+    all_uids = set(subscribers)
+    if admin_id:
+        try:
+            all_uids.add(int(admin_id))
+        except (ValueError, TypeError):
+            pass
+
+    for uid in all_uids:
+        wallet = await asyncio.to_thread(get_user_wallet, uid)
+        mode = await asyncio.to_thread(get_trading_mode, uid)
+        existing_positions = await asyncio.to_thread(get_user_positions, uid)
+
+        candidates = []
+        for cm in cities_metrics:
+            if not cm:
+                continue
+            icao = cm["icao"]
+            orderbook = cm.get("orderbook", [])
+            models = cm.get("models_max", {})
+            raw_metar = cm.get("raw_metar", "")
+            rate_val = cm.get("rate_val", 0.0)
+            local_dt = cm.get("local_dt")
+            local_hour = local_dt.hour if local_dt else 12
+            target_date = local_dt.strftime("%Y-%m-%d") if local_dt else datetime.now().strftime("%Y-%m-%d")
+
+            already_has_pos = any(
+                p.get("icao") == icao and p.get("target_date") == target_date
+                for p in existing_positions
+            )
+            if already_has_pos:
+                continue
+
+            target_val, priority_name = _get_priority_target(
+                icao, models, cm.get("avg_peak", 20.0), raw_metar, local_dt=local_dt
+            )
+            target_strike = get_strike_for_temp(target_val)
+            strike_str = f"{target_strike}°C"
+
+            matched_item = None
+            for item in orderbook:
+                if item.get("temp") == target_strike:
+                    matched_item = item
+                    break
+
+            if not matched_item:
+                continue
+
+            price_cents = matched_item.get("price_cents", 0.0)
+            token_id = matched_item.get("token_id", "")
+            title = matched_item.get("title", strike_str)
+
+            conf_score, conf_label, conf_reasons = calculate_candidate_confidence(
+                icao, models, raw_metar, target_strike, price_cents, rate_val, local_hour
+            )
+
+            # Кандидат принимается только если уверенность >= 50
+            if conf_score >= 50.0:
+                candidates.append({
+                    "icao": icao,
+                    "city_name": cm.get("city_name", icao),
+                    "outcomes": strike_str,
+                    "target_date": target_date,
+                    "token_id": token_id,
+                    "price_cents": price_cents,
+                    "conf_score": conf_score,
+                    "conf_label": conf_label,
+                    "conf_reasons": conf_reasons,
+                    "title": title,
+                })
+
+        if not candidates:
+            continue
+
+        # Сортируем кандидатов по рейтингу надежности (от высшего к низшему)
+        candidates.sort(key=lambda x: x["conf_score"], reverse=True)
+
+        has_pk = bool(wallet and wallet.get("private_key"))
+        proxy_addr = wallet.get("proxy_address") if wallet else ""
+        sig_type = int(wallet.get("signature_type") or 1) if wallet else 1
+
+        balance = 0.0
+        if has_pk:
+            balance = await asyncio.to_thread(
+                get_wallet_collateral_balance,
+                wallet["private_key"],
+                proxy_address=proxy_addr,
+            )
+
+        trade_cost = 1.08
+        buffer_usd = 0.10
+        available_trades = 0
+        if mode == "REAL" and has_pk and balance >= (trade_cost + buffer_usd):
+            available_trades = int((balance - buffer_usd) // trade_cost)
+
+        for idx, cand in enumerate(candidates):
+            is_top_pick = (idx < available_trades and cand["conf_score"] >= 75.0)
+
+            # 1. Реальная сделка на Polymarket CLOB
+            if mode == "REAL" and is_top_pick and has_pk:
+                success, order_id, resp = await asyncio.to_thread(
+                    execute_market_buy,
+                    wallet["private_key"],
+                    cand["token_id"],
+                    amount_usd=trade_cost,
+                    max_price=min(0.55, (cand["price_cents"] + 4.0) / 100.0),
+                    proxy_address=proxy_addr,
+                    signature_type=sig_type,
+                )
+                if success:
+                    shares = round(trade_cost / (cand["price_cents"] / 100.0), 2) if cand["price_cents"] > 0 else 2.5
+                    await asyncio.to_thread(
+                        add_position,
+                        uid,
+                        cand["icao"],
+                        cand["outcomes"],
+                        cand["target_date"],
+                        cand["price_cents"],
+                        shares,
+                        cand["token_id"],
+                        0,  # is_paper = 0
+                        cand["conf_score"],
+                    )
+                    reasons_str = "\n".join(f"• {r}" for r in cand["conf_reasons"])
+                    buy_msg = (
+                        f"⚡ <b>АВТОПОКУПКА УСПЕШНО ИСПОЛНЕНА! (РЕАЛЬНАЯ СДЕЛКА)</b>\n\n"
+                        f"• <b>Локация:</b> {cand['city_name']}\n"
+                        f"• <b>Выбранный исход:</b> <code>{cand['outcomes']}</code>\n"
+                        f"• <b>Цена входа:</b> <b>{cand['price_cents']:.0f}¢</b>\n"
+                        f"• <b>Сумма ордера:</b> <b>${trade_cost:.2f} USDC</b> (объем: ~{shares:.2f} долей)\n"
+                        f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n\n"
+                        f"<b>Факторы выбора:</b>\n{reasons_str}\n\n"
+                        f"🛡️ <i>Сделка взята под радарную защиту: активны трейлинг (+35%) и безусловный стоп-лосс (-8¢).</i>"
+                    )
+                    try:
+                        await bot.send_message(uid, buy_msg, parse_mode="HTML")
+                    except Exception as err:
+                        logger.error(f"Не удалось отправить уведомление о покупке: {err}")
+                else:
+                    err_text = str(order_id)
+                    fail_msg = (
+                        f"⚠️ <b>ВНИМАНИЕ: СБОЙ АВТОПОКУПКИ НА БИРЖЕ!</b>\n\n"
+                        f"• <b>Локация:</b> {cand['city_name']} (<code>{cand['outcomes']}</code>)\n"
+                        f"• <b>Причина отказа:</b> <code>{err_text}</code>\n"
+                        f"• <b>Баланс кошелька:</b> ${balance:.2f} USDC\n\n"
+                        f"💡 <i>Перевожу этот исход в режим «Бумажная сделка», чтобы не терять тест! Скопируй это сообщение разработчику для исправления.</i>"
+                    )
+                    try:
+                        await bot.send_message(uid, fail_msg, parse_mode="HTML")
+                    except Exception:
+                        pass
+                    await asyncio.to_thread(
+                        add_position,
+                        uid,
+                        cand["icao"],
+                        cand["outcomes"],
+                        cand["target_date"],
+                        cand["price_cents"],
+                        2.5,
+                        cand["token_id"],
+                        1,  # is_paper = 1
+                        cand["conf_score"],
+                    )
+            # 2. Бумажная сделка
+            else:
+                sim_shares = round(trade_cost / (cand["price_cents"] / 100.0), 2) if cand["price_cents"] > 0 else 2.5
+                await asyncio.to_thread(
+                    add_position,
+                    uid,
+                    cand["icao"],
+                    cand["outcomes"],
+                    cand["target_date"],
+                    cand["price_cents"],
+                    sim_shares,
+                    cand["token_id"],
+                    1,  # is_paper = 1
+                    cand["conf_score"],
+                )
+                if mode == "PAPER":
+                    reason_note = "Режим бота: 🧪 ТЕСТ (Только бумага)"
+                elif not has_pk:
+                    reason_note = "Приватный ключ не подключен (демо-тест)"
+                elif balance < (trade_cost + buffer_usd):
+                    reason_note = f"Баланса (${balance:.2f}) не хватает для ордера $1.08"
+                else:
+                    reason_note = "Вторичный сигнал (капитал распределен в топ-1)"
+
+                reasons_str = "\n".join(f"• {r}" for r in cand["conf_reasons"])
+                paper_msg = (
+                    f"📝 <b>ОФОРМЛЕНА БУМАЖНАЯ СДЕЛКА (ТЕСТ БЕЗ РИСКА)</b>\n\n"
+                    f"• <b>Локация:</b> {cand['city_name']}\n"
+                    f"• <b>Исход:</b> <code>{cand['outcomes']}</code>\n"
+                    f"• <b>Виртуальная цена входа:</b> <b>{cand['price_cents']:.0f}¢</b>\n"
+                    f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n\n"
+                    f"• <b>Причина виртуального входа:</b> <i>{reason_note}</i>\n"
+                    f"<b>Факторы выбора:</b>\n{reasons_str}\n\n"
+                    f"📊 <i>Бот будет виртуально сопровождать этот исход и зафиксирует PnL в статистику винрейта.</i>"
+                )
+                try:
+                    await bot.send_message(uid, paper_msg, parse_mode="HTML")
+                except Exception as err:
+                    logger.debug(f"Не удалось отправить уведомление о бумажной сделке: {err}")
 
 
 async def sync_all_subscribers_polymarket_positions() -> None:
@@ -1218,6 +1548,12 @@ async def send_consolidated_digest(
 
     # Автоматически синхронизируем сделки с Polymarket перед отправкой дайджеста
     await sync_all_subscribers_polymarket_positions()
+
+    # Автоматический отбор надежных исходов и совершение покупок (реальных или бумажных)
+    try:
+        await check_and_execute_auto_buy(bot, cities_metrics)
+    except Exception as e_buy:
+        logger.error(f"Ошибка в блоке автопокупки: {e_buy}", exc_info=True)
 
     if is_morning_base:
         header = (

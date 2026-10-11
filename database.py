@@ -43,6 +43,20 @@ def init_db() -> None:
             cursor.execute("ALTER TABLE user_positions ADD COLUMN token_id TEXT DEFAULT ''")
         if "last_alert" not in existing_cols:
             cursor.execute("ALTER TABLE user_positions ADD COLUMN last_alert TEXT DEFAULT ''")
+        if "is_paper" not in existing_cols:
+            cursor.execute("ALTER TABLE user_positions ADD COLUMN is_paper INTEGER DEFAULT 0")
+        if "confidence_score" not in existing_cols:
+            cursor.execute("ALTER TABLE user_positions ADD COLUMN confidence_score REAL DEFAULT 0.0")
+        if "exit_price" not in existing_cols:
+            cursor.execute("ALTER TABLE user_positions ADD COLUMN exit_price REAL DEFAULT 0.0")
+        if "exit_reason" not in existing_cols:
+            cursor.execute("ALTER TABLE user_positions ADD COLUMN exit_reason TEXT DEFAULT ''")
+        if "pnl_cents" not in existing_cols:
+            cursor.execute("ALTER TABLE user_positions ADD COLUMN pnl_cents REAL DEFAULT 0.0")
+        if "pnl_percent" not in existing_cols:
+            cursor.execute("ALTER TABLE user_positions ADD COLUMN pnl_percent REAL DEFAULT 0.0")
+        if "closed_at" not in existing_cols:
+            cursor.execute("ALTER TABLE user_positions ADD COLUMN closed_at TIMESTAMP")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_wallets (
@@ -51,6 +65,7 @@ def init_db() -> None:
                 wallet_address TEXT NOT NULL,
                 proxy_address TEXT DEFAULT '',
                 signature_type INTEGER DEFAULT 1,
+                trading_mode TEXT DEFAULT 'PAPER',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -61,6 +76,8 @@ def init_db() -> None:
             cursor.execute("ALTER TABLE user_wallets ADD COLUMN proxy_address TEXT DEFAULT ''")
         if "signature_type" not in wallet_cols:
             cursor.execute("ALTER TABLE user_wallets ADD COLUMN signature_type INTEGER DEFAULT 1")
+        if "trading_mode" not in wallet_cols:
+            cursor.execute("ALTER TABLE user_wallets ADD COLUMN trading_mode TEXT DEFAULT 'PAPER'")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bot_state (
@@ -143,13 +160,18 @@ def add_position(
     entry_price: float = 0.0,
     shares: float = 0.0,
     token_id: str = "",
+    is_paper: int = 0,
+    confidence_score: float = 0.0,
 ) -> int:
-    """Добавляет новую сделку на радарный контроль со статусом OPEN."""
+    """Добавляет новую сделку на радарный контроль (реальную или бумажную)."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO user_positions (user_id, icao, outcomes, target_date, entry_price, status, shares, peak_price, trailing_active, token_id)
-            VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, 0, ?)
+            INSERT INTO user_positions (
+                user_id, icao, outcomes, target_date, entry_price, status,
+                shares, peak_price, trailing_active, token_id, is_paper, confidence_score
+            )
+            VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, 0, ?, ?, ?)
         """, (
             user_id,
             icao.strip().upper(),
@@ -159,6 +181,8 @@ def add_position(
             float(shares),
             float(entry_price),
             token_id.strip(),
+            int(is_paper),
+            float(confidence_score),
         ))
         conn.commit()
         return cursor.lastrowid
@@ -171,13 +195,23 @@ def get_user_positions(user_id: int) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, user_id, icao, outcomes, target_date, entry_price, status,
-                   shares, peak_price, trailing_active, token_id, last_alert, created_at
+                   shares, peak_price, trailing_active, token_id, last_alert,
+                   COALESCE(is_paper, 0) AS is_paper, COALESCE(confidence_score, 0.0) AS confidence_score,
+                   exit_price, exit_reason, pnl_cents, pnl_percent, closed_at, created_at
             FROM user_positions
             WHERE user_id = ? AND (status = 'OPEN' OR status IS NULL)
             ORDER BY id DESC
         """, (user_id,))
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
+
+
+def get_user_positions_split(user_id: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Возвращает кортеж (реальные_сделки, бумажные_сделки) для конкретного пользователя."""
+    all_open = get_user_positions(user_id)
+    real = [p for p in all_open if not p.get("is_paper")]
+    paper = [p for p in all_open if p.get("is_paper")]
+    return real, paper
 
 
 def get_position_by_id(pos_id: int) -> Optional[Dict[str, Any]]:
@@ -187,7 +221,9 @@ def get_position_by_id(pos_id: int) -> Optional[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, user_id, icao, outcomes, target_date, entry_price, status,
-                   shares, peak_price, trailing_active, token_id, last_alert, created_at
+                   shares, peak_price, trailing_active, token_id, last_alert,
+                   COALESCE(is_paper, 0) AS is_paper, COALESCE(confidence_score, 0.0) AS confidence_score,
+                   exit_price, exit_reason, pnl_cents, pnl_percent, closed_at, created_at
             FROM user_positions WHERE id = ?
         """, (pos_id,))
         row = cursor.fetchone()
@@ -213,7 +249,9 @@ def get_all_active_positions() -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, user_id, icao, outcomes, target_date, entry_price, status,
-                   shares, peak_price, trailing_active, token_id, last_alert, created_at
+                   shares, peak_price, trailing_active, token_id, last_alert,
+                   COALESCE(is_paper, 0) AS is_paper, COALESCE(confidence_score, 0.0) AS confidence_score,
+                   exit_price, exit_reason, pnl_cents, pnl_percent, closed_at, created_at
             FROM user_positions
             WHERE status = 'OPEN' OR status IS NULL
         """)
@@ -315,16 +353,106 @@ def update_position_trailing(position_id: int, peak_price: float, trailing_activ
         conn.commit()
 
 
-def close_position_with_exit(position_id: int, exit_price: float = 0.0) -> None:
-    """Закрывает сделку в базе данных при исполнении автопродажи."""
+def close_position_with_exit(position_id: int, exit_price: float = 0.0, exit_reason: str = "") -> None:
+    """Закрывает сделку в базе данных при исполнении автопродажи с фиксацией PnL."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
+        cursor.execute("SELECT entry_price, shares FROM user_positions WHERE id = ?", (position_id,))
+        row = cursor.fetchone()
+        entry_price = float(row[0] or 0.0) if row else 0.0
+        pnl_cents = float(exit_price) - entry_price if entry_price > 0 else 0.0
+        pnl_percent = (pnl_cents / entry_price * 100.0) if entry_price > 0 else 0.0
         cursor.execute("""
             UPDATE user_positions
-            SET status = 'CLOSED'
+            SET status = 'CLOSED',
+                exit_price = ?,
+                exit_reason = ?,
+                pnl_cents = ?,
+                pnl_percent = ?,
+                closed_at = CURRENT_TIMESTAMP
             WHERE id = ?
-        """, (position_id,))
+        """, (float(exit_price), str(exit_reason or ""), round(pnl_cents, 2), round(pnl_percent, 1), position_id))
         conn.commit()
+
+
+def get_trading_mode(user_id: int) -> str:
+    """Возвращает текущий режим торговли: 'REAL' (боевой) или 'PAPER' (тестовый на бумаге)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT trading_mode FROM user_wallets WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return str(row[0]).strip().upper()
+        except Exception:
+            pass
+    state = get_bot_state(f"trading_mode_{user_id}")
+    return state.upper() if state else "PAPER"
+
+
+def set_trading_mode(user_id: int, mode: str) -> None:
+    """Переключает режим торговли пользователя ('REAL' или 'PAPER')."""
+    clean_mode = "REAL" if mode.strip().upper() == "REAL" else "PAPER"
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE user_wallets
+                SET trading_mode = ?
+                WHERE user_id = ?
+            """, (clean_mode, user_id))
+            conn.commit()
+        except Exception:
+            pass
+    set_bot_state(f"trading_mode_{user_id}", clean_mode)
+
+
+def get_trading_stats(user_id: int) -> Dict[str, Any]:
+    """Возвращает подробную статистику сделок (реальных и бумажных)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT id, icao, outcomes, target_date, entry_price, exit_price, exit_reason,
+                   pnl_cents, pnl_percent, shares, COALESCE(is_paper, 0) AS is_paper, status, closed_at
+            FROM user_positions
+            WHERE user_id = ? AND status = 'CLOSED'
+            ORDER BY id DESC
+        """, (user_id,))
+        rows = [dict(r) for r in cursor.fetchall()]
+
+        real_closed = [r for r in rows if not r.get("is_paper")]
+        paper_closed = [r for r in rows if r.get("is_paper")]
+
+        def calc_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+            if not trades:
+                return {
+                    "total": 0, "wins": 0, "losses": 0, "winrate": 0.0,
+                    "total_pnl_usd": 0.0, "avg_win_cents": 0.0, "avg_loss_cents": 0.0
+                }
+            wins = [t for t in trades if (t.get("pnl_cents") or 0.0) > 0]
+            losses = [t for t in trades if (t.get("pnl_cents") or 0.0) <= 0]
+            total_pnl_cents = sum((t.get("pnl_cents") or 0.0) * (float(t.get("shares") or 1.0)) for t in trades)
+            winrate = round(len(wins) / len(trades) * 100.0, 1)
+            avg_win = round(sum(t.get("pnl_cents") or 0.0 for t in wins) / len(wins), 1) if wins else 0.0
+            avg_loss = round(sum(t.get("pnl_cents") or 0.0 for t in losses) / len(losses), 1) if losses else 0.0
+            return {
+                "total": len(trades),
+                "wins": len(wins),
+                "losses": len(losses),
+                "winrate": winrate,
+                "total_pnl_usd": round(total_pnl_cents / 100.0, 2),
+                "avg_win_cents": avg_win,
+                "avg_loss_cents": avg_loss,
+            }
+
+        return {
+            "real": calc_metrics(real_closed),
+            "paper": calc_metrics(paper_closed),
+            "recent": rows[:10],
+            "recent_trades": rows[:10],
+        }
 
 
 def delete_position(position_id: int, user_id: int) -> bool:

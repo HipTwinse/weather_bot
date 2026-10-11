@@ -57,16 +57,19 @@ def resolve_polymarket_proxy(wallet_address: str) -> Optional[str]:
     """
     if not wallet_address:
         return None
-    try:
-        url = f"https://gamma-api.polymarket.com/public-profile?address={wallet_address.lower()}"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            proxy = data.get("proxyWallet")
-            if proxy and proxy.startswith("0x") and len(proxy) == 42:
-                return proxy.lower()
-    except Exception as e:
-        logger.warning(f"Не удалось получить proxyWallet для {wallet_address}: {e}")
+    for attempt in range(2):
+        try:
+            url = f"https://gamma-api.polymarket.com/public-profile?address={wallet_address.lower()}"
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                proxy = data.get("proxyWallet")
+                if proxy and proxy.startswith("0x") and len(proxy) == 42:
+                    return proxy.lower()
+        except Exception as e:
+            logger.warning(f"Попытка {attempt+1}: Не удалось получить proxyWallet для {wallet_address}: {e}")
+            if attempt == 0:
+                time.sleep(0.5)
     return None
 
 
@@ -159,15 +162,18 @@ def validate_private_key(raw_key: str) -> Tuple[bool, str, str]:
         address = acc.address
 
         # Тестовая проверка генерации API-ключей CLOB
-        client = ClobClient(
-            host=POLYMARKET_CLOB_HOST,
-            key=key,
-            chain_id=POLYGON_CHAIN_ID,
-            signature_type=0,
-        )
-        creds = client.create_or_derive_api_creds()
-        if not creds or not creds.api_key:
-            return False, address, "Не удалось сгенерировать торговые ключи Polymarket CLOB."
+        try:
+            client = ClobClient(
+                host=POLYMARKET_CLOB_HOST,
+                key=key,
+                chain_id=POLYGON_CHAIN_ID,
+                signature_type=0,
+            )
+            creds = client.create_or_derive_api_creds()
+            if not creds or not creds.api_key:
+                return False, address, "Не удалось сгенерировать торговые ключи Polymarket CLOB."
+        except Exception as e_clob:
+            logger.warning(f"Предупреждение при запросе к CLOB API (сетевая задержка): {e_clob}")
 
         return True, address, ""
     except Exception as e:
@@ -380,3 +386,105 @@ def execute_market_sell(
     except Exception as e:
         logger.error(f"Критическая ошибка исполнения автопродажи: {e}", exc_info=True)
         return False, f"Исключение при продаже: {str(e)}", {}
+
+
+def execute_market_buy(
+    raw_key: str,
+    token_id: str,
+    amount_usd: float = 1.08,
+    max_price: float = 0.50,
+    proxy_address: str = "",
+    signature_type: int = 1,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Выполняет покупку исхода на Polymarket CLOB.
+    Учитывает:
+    - Минимальный размер ордера на Polymarket ($1.00 - $1.05), по умолчанию $1.08.
+    - Ограничение максимальной цены входа (max_price), чтобы не покупать перегретые токены.
+    - Возвращает (успех, order_id_или_ошибка, детали).
+    """
+    if not token_id:
+        return False, "Не указан token_id для покупки", {}
+
+    if amount_usd < 1.00:
+        return False, f"Сумма покупки (${amount_usd:.2f}) ниже минимального порога Polymarket ($1.00)", {}
+
+    try:
+        key = clean_private_key(raw_key)
+        signer_acc = Account.from_key(key)
+        signer_addr = signer_acc.address
+
+        if not proxy_address:
+            proxy_address = resolve_polymarket_proxy(signer_addr) or ""
+
+        sig_type = signature_type
+        if proxy_address and proxy_address.lower() != signer_addr.lower():
+            sig_type = 1
+            funder_addr = proxy_address
+        else:
+            sig_type = 0
+            funder_addr = signer_addr
+
+        client = ClobClient(
+            host=POLYMARKET_CLOB_HOST,
+            key=key,
+            chain_id=POLYGON_CHAIN_ID,
+            signature_type=sig_type,
+            funder=funder_addr,
+        )
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+
+        # Шаг цены
+        try:
+            tick_size = float(client.get_tick_size(token_id))
+        except Exception:
+            tick_size = 0.01
+
+        safe_max_price = max(float(max_price), tick_size)
+        safe_max_price = min(safe_max_price, 0.99)
+        safe_max_price = round(safe_max_price, 4)
+
+        # Количество контрактов для покупки
+        shares = round(amount_usd / safe_max_price, 2)
+        if shares <= 0:
+            return False, f"Некорректный расчет объема: {shares}", {}
+
+        # 1. Попытка рыночного ордера на покупку (Market FOK)
+        try:
+            market_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=amount_usd,
+                side="BUY",
+                price=safe_max_price,
+                order_type=OrderType.FOK,
+            )
+            signed_order = client.create_market_order(market_args)
+            resp = client.post_order(signed_order, OrderType.FOK)
+            if resp and resp.get("success"):
+                order_id = resp.get("orderID", "OK")
+                return True, order_id, resp
+            elif resp and not resp.get("errorMsg") and resp.get("orderID"):
+                return True, str(resp.get("orderID")), resp
+        except Exception as e1:
+            logger.info(f"MarketOrderArgs на покупку не сработал ({e1}), переключаемся на OrderArgs...")
+
+        # 2. Агрессивный FAK-ордер на покупку
+        order_args = OrderArgs(
+            price=safe_max_price,
+            size=shares,
+            side="BUY",
+            token_id=token_id,
+        )
+        resp2 = client.create_and_post_order(order_args)
+        if resp2 and (resp2.get("success") or resp2.get("orderID")):
+            order_id = resp2.get("orderID", "OK")
+            return True, order_id, resp2
+        else:
+            err = resp2.get("errorMsg") if isinstance(resp2, dict) else str(resp2)
+            return False, f"Биржа отклонила покупку: {err}", resp2 if isinstance(resp2, dict) else {}
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка исполнения автопокупки: {e}", exc_info=True)
+        return False, f"Исключение при покупке: {str(e)}", {}
+
