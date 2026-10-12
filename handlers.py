@@ -52,6 +52,7 @@ from database import (
     get_user_wallet,
     delete_user_wallet,
     register_subscriber,
+    generate_daily_audit_report,
 )
 from clob_trader import (
     validate_private_key,
@@ -1218,6 +1219,9 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
+            InlineKeyboardButton(text="📄 Скачать отчет за день", callback_data="download_day_report"),
+        ],
+        [
             InlineKeyboardButton(text="« Назад к позициям", callback_data="back_to_positions"),
             InlineKeyboardButton(text="🔄 Обновить", callback_data="view_trading_stats"),
         ]
@@ -1282,6 +1286,35 @@ async def process_back_to_positions(callback: CallbackQuery):
     except Exception:
         pass
     await callback.answer()
+
+
+@router.callback_query(F.data == "download_day_report")
+async def process_download_day_report(callback: CallbackQuery):
+    await callback.answer("Формирую аудиторский отчет...")
+    user_id = callback.from_user.id
+    report_text, filename = generate_daily_audit_report("", user_id=user_id)
+    doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
+    caption = (
+        f"📄 <b>АУДИТОРСКИЙ ОТЧЕТ ДЕЙСТВИЙ РОБОТА</b>\n\n"
+        f"• Файл: <code>{filename}</code>\n"
+        f"• Включает полную хронологию сканирования, сделок, отказов и причин выхода за сегодня."
+    )
+    await callback.message.answer_document(document=doc_file, caption=caption, parse_mode="HTML")
+
+
+@router.message(Command("report"), StateFilter("*"))
+@router.message(Command("day_report"), StateFilter("*"))
+async def cmd_download_day_report(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    report_text, filename = generate_daily_audit_report("", user_id=user_id)
+    doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
+    caption = (
+        f"📄 <b>АУДИТОРСКИЙ ОТЧЕТ ДЕЙСТВИЙ РОБОТА</b>\n\n"
+        f"• Файл: <code>{filename}</code>\n"
+        f"• Включает полную хронологию сканирования, сделок, отказов и причин выхода за сегодня."
+    )
+    await message.answer_document(document=doc_file, caption=caption, parse_mode="HTML")
 
 
 @router.message(Command("digest"), StateFilter("*"))

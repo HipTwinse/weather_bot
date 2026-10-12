@@ -633,3 +633,208 @@ def clear_all_daily_snapshots_db() -> None:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM daily_snapshots")
         conn.commit()
+
+
+# -------------------------------------------------------------
+# ЖУРНАЛ ДНЕВНЫХ ДЕЙСТВИЙ И АУДИТОРСКИЙ ОТЧЕТ
+# -------------------------------------------------------------
+
+def record_daily_action(
+    user_id: int,
+    action_type: str,
+    icao: str = "",
+    outcomes: str = "",
+    price: float = 0.0,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Записывает действие или событие робота в журнал дня для последующей выгрузки отчета."""
+    import json
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daily_actions_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action_type TEXT,
+                icao TEXT,
+                outcomes TEXT,
+                price REAL,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        det_json = json.dumps(details or {}, ensure_ascii=False)
+        cursor.execute("""
+            INSERT INTO daily_actions_log (user_id, action_type, icao, outcomes, price, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (int(user_id or 0), str(action_type), str(icao or ""), str(outcomes or ""), float(price or 0.0), det_json))
+        conn.commit()
+
+
+def get_daily_actions(date_str: str = "", user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Возвращает все записанные действия за конкретную дату (YYYY-MM-DD по Хабаровску UTC+10)."""
+    import json
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daily_actions_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action_type TEXT,
+                icao TEXT,
+                outcomes TEXT,
+                price REAL,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        query = "SELECT id, user_id, action_type, icao, outcomes, price, details, datetime(created_at, '+10 hours') AS local_khv_time FROM daily_actions_log"
+        params = []
+        conditions = []
+        if date_str:
+            conditions.append("DATE(created_at, '+10 hours') = ?")
+            params.append(date_str)
+        if user_id is not None and user_id != 0:
+            conditions.append("(user_id = ? OR user_id = 0)")
+            params.append(user_id)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY id ASC"
+        cursor.execute(query, params)
+        rows = [dict(r) for r in cursor.fetchall()]
+        for r in rows:
+            try:
+                r["details"] = json.loads(r["details"]) if r.get("details") else {}
+            except Exception:
+                r["details"] = {}
+        return rows
+
+
+def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[str, str]:
+    """
+    Формирует полный структурированный отчет обо всех действиях робота за день (дата по Хабаровску YYYY-MM-DD).
+    Возвращает (текст_отчета, имя_файла).
+    """
+    from datetime import datetime
+    import zoneinfo
+
+    khv_tz = zoneinfo.ZoneInfo("Asia/Vladivostok")
+    if not date_str:
+        date_str = datetime.now(khv_tz).strftime("%Y-%m-%d")
+
+    actions = get_daily_actions(date_str, user_id=user_id if user_id else None)
+    stats = get_trading_stats(user_id) if user_id else {"real": {}, "paper": {}, "recent": []}
+    real_s = stats.get("real", {})
+    paper_s = stats.get("paper", {})
+    wallet = get_user_wallet(user_id) if user_id else None
+    mode = get_trading_mode(user_id) if user_id else "PAPER"
+    mode_label = "БОЕВОЙ (Деньги + бумага)" if mode == "REAL" else "ТЕСТОВЫЙ (Только бумага)"
+
+    wallet_str = wallet.get("proxy_address") or wallet.get("wallet_address", "Не подключен") if wallet else "Не подключен"
+
+    scans_count = sum(1 for a in actions if a["action_type"] == "SCAN")
+    buys_real = [a for a in actions if a["action_type"] == "BUY_REAL"]
+    buys_paper = [a for a in actions if a["action_type"] == "BUY_PAPER"]
+    sells_real = [a for a in actions if a["action_type"] == "SELL_REAL"]
+    sells_paper = [a for a in actions if a["action_type"] == "SELL_PAPER"]
+    skips_count = sum(1 for a in actions if a["action_type"] == "SKIP")
+    errors = [a for a in actions if a["action_type"] == "ERROR"]
+
+    lines = [
+        "=" * 80,
+        " ДНЕВНОЙ АУДИТОРСКИЙ ОТЧЕТ ДЕЙСТВИЙ РОБОТА WEATHER ALPHA ENGINE",
+        f" Дата (Хабаровск UTC+10): {date_str}",
+        f" Торговый режим: {mode_label}",
+        f" Торговый сейф/кошелек: {wallet_str}",
+        f" Торговое окно: 10:00 - 24:00 ХБР (Ночью бот спит)",
+        "=" * 80,
+        "",
+        "📊 1. СВОДНЫЕ РЕЗУЛЬТАТЫ ДНЯ:",
+        f" • Всего циклов сканирования: {scans_count}",
+        f" • Куплено реальных контрактов: {len(buys_real)}",
+        f" • Оформлено бумажных тестов: {len(buys_paper)}",
+        f" • Закрыто реальных сделок: {len(sells_real)}",
+        f" • Закрыто бумажных тестов: {len(sells_paper)}",
+        f" • Отклонено кандидатов (фильтры/скип): {skips_count}",
+        f" • Ошибок биржи/отказов: {len(errors)}",
+        "",
+        "💰 2. ФИНАНСОВЫЕ ПОКАЗАТЕЛИ (ПО ВСЕЙ ИСТОРИИ):",
+        f" • Реальный винрейт: {real_s.get('winrate', 0.0)}% (Побед: {real_s.get('wins', 0)} / Потерь: {real_s.get('losses', 0)})",
+        f" • Реальный PnL: ${real_s.get('total_pnl_usd', 0.0):.2f} USDC",
+        f" • Бумажный винрейт: {paper_s.get('winrate', 0.0)}% (Побед: {paper_s.get('wins', 0)} / Потерь: {paper_s.get('losses', 0)})",
+        f" • Бумажный PnL: ${paper_s.get('total_pnl_usd', 0.0):.2f} USDC",
+        "",
+        "=" * 80,
+        "📋 3. ПОЛНАЯ ХРОНОЛОГИЯ ВСЕХ ДЕЙСТВИЙ ЗА ДЕНЬ (ВРЕМЯ ХАБАРОВСК):",
+        "=" * 80,
+    ]
+
+    if not actions:
+        lines.append(" За указанный день действий в журнале не зафиксировано.")
+    else:
+        for idx, act in enumerate(actions, 1):
+            time_khv = act.get("local_khv_time", "")
+            atype = act.get("action_type", "")
+            icao = act.get("icao", "")
+            outcomes = act.get("outcomes", "")
+            price = float(act.get("price") or 0.0)
+            det = act.get("details", {})
+
+            time_label = time_khv.split()[1][:5] if " " in time_khv else time_khv
+
+            if atype == "SCAN":
+                lines.append(f"\n[{time_label} ХБР] 🔍 СКАНИРОВАНИЕ РЫНКОВ")
+                lines.append(f"   Города: {det.get('cities', 'EGLC, LFPB, LIMC, LEMD')}")
+                if det.get("note"):
+                    lines.append(f"   Инфо: {det.get('note')}")
+
+            elif atype == "BUY_REAL":
+                lines.append(f"\n[{time_label} ХБР] ⚡ АВТОПОКУПКА (РЕАЛЬНАЯ СДЕЛКА НА POLYMARKET)")
+                lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена входа: {price:.0f}¢")
+                lines.append(f"   Сумма ордера: ${det.get('amount_usd', 1.08):.2f} USDC (контрактов: ~{det.get('shares', 0):.2f})")
+                lines.append(f"   Рейтинг надежности: {det.get('conf_score', 0)}/100 ({det.get('conf_label', '')})")
+                reasons = det.get("reasons", [])
+                if reasons:
+                    lines.append("   Факторы входа:")
+                    for r in reasons:
+                        lines.append(f"     • {r}")
+
+            elif atype == "BUY_PAPER":
+                lines.append(f"\n[{time_label} ХБР] 📝 АВТОПОКУПКА (БУМАЖНЫЙ ТЕСТ)")
+                lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена входа: {price:.0f}¢")
+                lines.append(f"   Рейтинг надежности: {det.get('conf_score', 0)}/100 ({det.get('conf_label', '')})")
+                lines.append(f"   Причина теста: {det.get('paper_reason', 'Тестовый режим или вторичный кандидат')}")
+                reasons = det.get("reasons", [])
+                if reasons:
+                    lines.append("   Факторы:")
+                    for r in reasons:
+                        lines.append(f"     • {r}")
+
+            elif atype == "SELL_REAL":
+                lines.append(f"\n[{time_label} ХБР] ⚡ АВТОПРОДАЖА (РЕАЛЬНОЕ ЗАКРЫТИЕ НА БИРЖЕ)")
+                lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена выхода: {price:.0f}¢")
+                lines.append(f"   Причина закрытия: {det.get('reason', 'Плановый выход')}")
+                lines.append(f"   Результат сделки: PnL {det.get('pnl_str', '0%')} ({det.get('pnl_usd', '$0.00')})")
+
+            elif atype == "SELL_PAPER":
+                lines.append(f"\n[{time_label} ХБР] 📝 ЗАКРЫТИЕ БУМАЖНОГО ТЕСТА")
+                lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена выхода: {price:.0f}¢")
+                lines.append(f"   Причина закрытия: {det.get('reason', 'Плановый выход')}")
+                lines.append(f"   Результат: PnL {det.get('pnl_str', '0%')}")
+
+            elif atype == "SKIP":
+                lines.append(f"[{time_label} ХБР] ⛔ ПРОПУСК: {icao} ({outcomes}) — {det.get('reason', 'Низкая уверенность')}")
+
+            elif atype == "ERROR":
+                lines.append(f"\n[{time_label} ХБР] ⚠️ ОШИБКА БИРЖИ:")
+                lines.append(f"   Локация: {icao} | Исход: {outcomes}")
+                lines.append(f"   Описание: {det.get('error', 'Неизвестная ошибка')}")
+
+    lines.append("\n" + "=" * 80)
+    lines.append(f" Конец отчета. Сформировано автоматически Weather Alpha Engine в {datetime.now(khv_tz).strftime('%H:%M:%S')} ХБР.")
+    lines.append("=" * 80)
+
+    report_text = "\n".join(lines)
+    filename = f"weather_bot_report_{date_str}.txt"
+    return report_text, filename

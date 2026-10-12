@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import zoneinfo
 
 from aiogram import Bot
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 
 import config
 from airport_resolver import resolve_airport
@@ -52,6 +52,8 @@ from database import (
     get_user_positions,
     get_user_positions_split,
     get_trading_stats,
+    record_daily_action,
+    generate_daily_audit_report,
 )
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
@@ -85,6 +87,7 @@ TARGET_CITIES = {
 _MORNING_BASELINES: Dict[str, dict] = {}
 _LAST_MORNING_DIGEST_DATE: Optional[str] = None
 _LAST_SENT_SLOT: Optional[str] = None
+_LAST_AUDIT_REPORT_DATE: Optional[str] = None
 
 # Инлайн-кнопки быстрого анализа под сводным сообщением
 express_scan_keyboard = InlineKeyboardMarkup(
@@ -127,14 +130,35 @@ def get_next_sleep_seconds(now: datetime) -> Tuple[float, datetime, str]:
     Рассчитывает целевое время следующей контрольной точки (:02 или :32)
     и точное количество секунд сна до неё.
     С буфером в 2 секунды (:02:02 / :32:02) для гарантированного попадания в NOAA METAR.
+    Учитывает торговое окно 10:00 - 24:00 ХБР:
+    - Ночью (после 23:32:02 и до 10:02:02 ХБР) сканер спит строго до утренней точки 10:02:02!
     """
+    # 1. Если сейчас глухая ночь (00:00 - 09:59 ХБР): спим до 10:02:02 сегодня
+    if now.hour < 10:
+        target = now.replace(hour=10, minute=2, second=2, microsecond=0)
+        sleep_secs = max(1.0, (target - now).total_seconds())
+        slot_key = target.strftime("%Y-%m-%d %H:%M")
+        return sleep_secs, target, slot_key
+
+    # 2. Если сейчас 23:32 или позже: последний дневной цикл завершен, спим до 10:02:02 завтра
+    if now.hour == 23 and (now.minute > 32 or (now.minute == 32 and now.second >= 2)):
+        tomorrow = now + timedelta(days=1)
+        target = tomorrow.replace(hour=10, minute=2, second=2, microsecond=0)
+        sleep_secs = max(1.0, (target - now).total_seconds())
+        slot_key = target.strftime("%Y-%m-%d %H:%M")
+        return sleep_secs, target, slot_key
+
+    # 3. Внутри активного торгового окна (10:00 - 23:32):
     if now.minute < 2 or (now.minute == 2 and now.second < 2):
         target = now.replace(minute=2, second=2, microsecond=0)
     elif now.minute < 32 or (now.minute == 32 and now.second < 2):
         target = now.replace(minute=32, second=2, microsecond=0)
     else:
         next_hour = now + timedelta(hours=1)
-        target = next_hour.replace(minute=2, second=2, microsecond=0)
+        if next_hour.hour < 10 or next_hour.day != now.day:
+            target = next_hour.replace(hour=10, minute=2, second=2, microsecond=0)
+        else:
+            target = next_hour.replace(minute=2, second=2, microsecond=0)
 
     sleep_secs = (target - now).total_seconds()
     if sleep_secs <= 0.1:
@@ -142,11 +166,43 @@ def get_next_sleep_seconds(now: datetime) -> Tuple[float, datetime, str]:
             target = now.replace(minute=32, second=2, microsecond=0)
         else:
             next_hour = now + timedelta(hours=1)
-            target = next_hour.replace(minute=2, second=2, microsecond=0)
+            if next_hour.hour < 10 or next_hour.day != now.day:
+                target = next_hour.replace(hour=10, minute=2, second=2, microsecond=0)
+            else:
+                target = next_hour.replace(minute=2, second=2, microsecond=0)
         sleep_secs = max(1.0, (target - now).total_seconds())
 
     slot_key = target.strftime("%Y-%m-%d %H:%M")
     return sleep_secs, target, slot_key
+
+
+async def send_daily_audit_file(bot: Bot, date_str: str = "") -> None:
+    """
+    Формирует и отправляет итоговый документ (аудиторский лог) за день администратору и подписчикам.
+    """
+    subscribers = await asyncio.to_thread(get_all_subscribers)
+    admin_id = getattr(config, "ADMIN_CHAT_ID", None)
+    all_uids = set(subscribers)
+    if admin_id:
+        try:
+            all_uids.add(int(admin_id))
+        except (ValueError, TypeError):
+            pass
+
+    for uid in all_uids:
+        try:
+            report_text, filename = await asyncio.to_thread(generate_daily_audit_report, date_str, user_id=uid)
+            doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
+            caption = (
+                f"📄 <b>ИТОГОВЫЙ АУДИТОРСКИЙ ОТЧЕТ ЗА ДЕНЬ</b>\n\n"
+                f"• Дата: <code>{filename.replace('weather_bot_report_', '').replace('.txt', '')}</code>\n"
+                f"• Полный журнал всех проверок, сделок, причин выходов и балансов сохранен в файле выше.\n"
+                f"🌙 <i>Торговое окно завершено (10:00 - 24:00 ХБР). Сканер уходит в ночной режим сна до 10:00 утра.</i>"
+            )
+            await bot.send_document(uid, document=doc_file, caption=caption, parse_mode="HTML")
+            logger.info(f"Дневной отчет успешно отправлен пользователю {uid}.")
+        except Exception as err:
+            logger.error(f"Не удалось отправить дневной отчет пользователю {uid}: {err}")
 
 
 def get_seasonal_heating_cutoff(month: int, icao: str = "") -> Tuple[float, str]:
@@ -1052,6 +1108,16 @@ async def check_and_execute_auto_sell(
         profit_usd = (cur_price - entry_price) * float(pos.get("shares") or 2.5) / 100.0
         profit_str = f"{'+' if profit_usd >= 0 else ''}${profit_usd:.2f}"
 
+        await asyncio.to_thread(
+            record_daily_action,
+            user_id, "SELL_PAPER", icao, target_outcomes, cur_price,
+            {
+                "reason": trigger_reason,
+                "pnl_str": pnl_str,
+                "pnl_usd": profit_str,
+            }
+        )
+
         paper_notify = (
             f"📝 <b>БУМАЖНАЯ СДЕЛКА ЗАКРЫТА (ТЕСТ БЕЗ РИСКА)</b>\n\n"
             f"• <b>Причина:</b> {trigger_reason}\n"
@@ -1126,6 +1192,19 @@ async def check_and_execute_auto_sell(
         await asyncio.to_thread(close_position_with_exit, pos_id, cur_price, trigger_reason)
         pnl_val = round(((cur_price - entry_price) / entry_price) * 100, 1) if entry_price > 0 else 0.0
         pnl_str = f"{'+' if pnl_val >= 0 else ''}{pnl_val:.0f}%"
+        profit_usd = (cur_price - entry_price) * shares / 100.0
+        profit_str = f"{'+' if profit_usd >= 0 else ''}${profit_usd:.2f}"
+
+        await asyncio.to_thread(
+            record_daily_action,
+            user_id, "SELL_REAL", icao, target_outcomes, cur_price,
+            {
+                "reason": trigger_reason,
+                "pnl_str": pnl_str,
+                "pnl_usd": profit_str,
+                "shares": shares,
+            }
+        )
 
         notify_text = (
             f"⚡ <b>АВТОПРОДАЖА УСПЕШНО ИСПОЛНЕНА!</b>\n\n"
@@ -1145,6 +1224,14 @@ async def check_and_execute_auto_sell(
     else:
         err_msg = str(order_id)
         logger.error(f"Сбой исполнения автопродажи для позиции {pos_id}: {err_msg}")
+        await asyncio.to_thread(
+            record_daily_action,
+            user_id, "ERROR", icao, target_outcomes, cur_price,
+            {
+                "error": f"Сбой автопродажи CLOB: {err_msg}",
+                "reason": trigger_reason,
+            }
+        )
         last_alert = str(pos.get("last_alert") or "")
         if f"SELL_FAIL_{err_msg}" != last_alert:
             diag_text = (
@@ -1237,8 +1324,12 @@ def calculate_candidate_confidence(
 async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, Any]]) -> None:
     """
     Автоматически анализирует кандидатов дня и совершает покупки (реальные или бумажные)
-    с учетом режима пользователя, баланса кошелька и рейтинга надежности.
+    с учетом режима пользователя, баланса кошелька, солнечной инсоляции и рейтинга надежности.
     """
+    if not is_khv_active_hours():
+        logger.info("Ночные часы ХБР (00:00 - 10:00): автопокупка заблокирована.")
+        return
+
     subscribers = await asyncio.to_thread(get_all_subscribers)
     admin_id = getattr(config, "ADMIN_CHAT_ID", None)
     all_uids = set(subscribers)
@@ -1264,7 +1355,11 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
             rate_val = cm.get("rate_val", 0.0)
             local_dt = cm.get("local_dt")
             local_hour = local_dt.hour if local_dt else 12
+            local_time_val = (local_dt.hour + local_dt.minute / 60.0) if local_dt else 12.0
             target_date = local_dt.strftime("%Y-%m-%d") if local_dt else datetime.now().strftime("%Y-%m-%d")
+            heating_cutoff, _ = get_seasonal_heating_cutoff(local_dt.month if local_dt else 10, icao=icao)
+            rem_hours_str = cm.get("rem_hours_str", "")
+            temp_c = cm.get("temp_c")
 
             already_has_pos = any(
                 p.get("icao") == icao and p.get("target_date") == target_date
@@ -1273,11 +1368,45 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
             if already_has_pos:
                 continue
 
+            # Фильтр солнечной инсоляции: исключаем утро до старта и вечер после пика прогрева
+            if local_time_val < 8.5:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", icao, "", 0.0,
+                    {"reason": f"Раннее утро ({local_dt.strftime('%H:%M LT')}), прогрев еще не стартовал"}
+                )
+                continue
+
+            if local_time_val >= (heating_cutoff - 1.0) or local_time_val >= 14.5 or "Окно закрыто" in rem_hours_str:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", icao, "", 0.0,
+                    {"reason": f"Пик инсоляции пройден ({local_dt.strftime('%H:%M LT')} / окно {heating_cutoff:.1f} LT)"}
+                )
+                continue
+
             target_val, priority_name = _get_priority_target(
                 icao, models, cm.get("avg_peak", 20.0), raw_metar, local_dt=local_dt
             )
             target_strike = get_strike_for_temp(target_val)
             strike_str = f"{target_strike}°C"
+
+            # Проверка текущей температуры против страйка
+            if temp_c is not None and temp_c >= target_strike:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", icao, strike_str, 0.0,
+                    {"reason": f"Температура уже {temp_c:.1f}°C (цель {target_strike}°C взята)"}
+                )
+                continue
+
+            if temp_c is not None and (target_strike - temp_c) > 4.5:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", icao, strike_str, 0.0,
+                    {"reason": f"Слишком большой разрыв до цели ({target_strike - temp_c:.1f}°C прогрева)"}
+                )
+                continue
 
             matched_item = None
             for item in orderbook:
@@ -1286,30 +1415,51 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                     break
 
             if not matched_item:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", icao, strike_str, 0.0,
+                    {"reason": f"Страйк {strike_str} отсутствует в биржевом стакане"}
+                )
                 continue
 
             price_cents = matched_item.get("price_cents", 0.0)
             token_id = matched_item.get("token_id", "")
             title = matched_item.get("title", strike_str)
 
+            # Отсекаем неликвид дешевле 20¢ и перегретый рынок дороже 55¢
+            if price_cents < 20.0 or price_cents > 55.0:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", icao, strike_str, price_cents,
+                    {"reason": f"Цена вне рабочего диапазона 20-55¢ ({price_cents:.0f}¢)"}
+                )
+                continue
+
             conf_score, conf_label, conf_reasons = calculate_candidate_confidence(
                 icao, models, raw_metar, target_strike, price_cents, rate_val, local_hour
             )
 
-            # Кандидат принимается только если уверенность >= 50
-            if conf_score >= 50.0:
-                candidates.append({
-                    "icao": icao,
-                    "city_name": cm.get("city_name", icao),
-                    "outcomes": strike_str,
-                    "target_date": target_date,
-                    "token_id": token_id,
-                    "price_cents": price_cents,
-                    "conf_score": conf_score,
-                    "conf_label": conf_label,
-                    "conf_reasons": conf_reasons,
-                    "title": title,
-                })
+            # Кандидат принимается к покупке только если уверенность >= 70
+            if conf_score < 70.0:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", icao, strike_str, price_cents,
+                    {"reason": f"Низкий рейтинг надежности ({conf_score:.0f}/100)", "reasons": conf_reasons}
+                )
+                continue
+
+            candidates.append({
+                "icao": icao,
+                "city_name": cm.get("city_name", icao),
+                "outcomes": strike_str,
+                "target_date": target_date,
+                "token_id": token_id,
+                "price_cents": price_cents,
+                "conf_score": conf_score,
+                "conf_label": conf_label,
+                "conf_reasons": conf_reasons,
+                "title": title,
+            })
 
         if not candidates:
             continue
@@ -1336,7 +1486,8 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
             available_trades = int((balance - buffer_usd) // trade_cost)
 
         for idx, cand in enumerate(candidates):
-            is_top_pick = (idx < available_trades and cand["conf_score"] >= 75.0)
+            # В реальную сделку допускаются только самые надежные кандидаты с рейтингом >= 80.0
+            is_top_pick = (idx < available_trades and cand["conf_score"] >= 80.0)
 
             # 1. Реальная сделка на Polymarket CLOB
             if mode == "REAL" and is_top_pick and has_pk:
@@ -1363,6 +1514,17 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                         0,  # is_paper = 0
                         cand["conf_score"],
                     )
+                    await asyncio.to_thread(
+                        record_daily_action,
+                        uid, "BUY_REAL", cand["icao"], cand["outcomes"], cand["price_cents"],
+                        {
+                            "amount_usd": trade_cost,
+                            "shares": shares,
+                            "conf_score": cand["conf_score"],
+                            "conf_label": cand["conf_label"],
+                            "reasons": cand["conf_reasons"],
+                        }
+                    )
                     reasons_str = "\n".join(f"• {r}" for r in cand["conf_reasons"])
                     buy_msg = (
                         f"⚡ <b>АВТОПОКУПКА УСПЕШНО ИСПОЛНЕНА! (РЕАЛЬНАЯ СДЕЛКА)</b>\n\n"
@@ -1380,6 +1542,11 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                         logger.error(f"Не удалось отправить уведомление о покупке: {err}")
                 else:
                     err_text = str(order_id)
+                    await asyncio.to_thread(
+                        record_daily_action,
+                        uid, "ERROR", cand["icao"], cand["outcomes"], cand["price_cents"],
+                        {"error": f"Сбой покупки CLOB: {err_text}"}
+                    )
                     fail_msg = (
                         f"⚠️ <b>ВНИМАНИЕ: СБОЙ АВТОПОКУПКИ НА БИРЖЕ!</b>\n\n"
                         f"• <b>Локация:</b> {cand['city_name']} (<code>{cand['outcomes']}</code>)\n"
@@ -1403,6 +1570,16 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                         1,  # is_paper = 1
                         cand["conf_score"],
                     )
+                    await asyncio.to_thread(
+                        record_daily_action,
+                        uid, "BUY_PAPER", cand["icao"], cand["outcomes"], cand["price_cents"],
+                        {
+                            "conf_score": cand["conf_score"],
+                            "conf_label": cand["conf_label"],
+                            "paper_reason": f"Отказ биржи: {err_text}",
+                            "reasons": cand["conf_reasons"],
+                        }
+                    )
             # 2. Бумажная сделка
             else:
                 sim_shares = round(trade_cost / (cand["price_cents"] / 100.0), 2) if cand["price_cents"] > 0 else 2.5
@@ -1424,8 +1601,21 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                     reason_note = "Приватный ключ не подключен (демо-тест)"
                 elif balance < (trade_cost + buffer_usd):
                     reason_note = f"Баланса (${balance:.2f}) не хватает для ордера $1.08"
+                elif cand["conf_score"] < 80.0:
+                    reason_note = f"Уверенность ({cand['conf_score']:.0f}/100) ниже порога боевого входа (80)"
                 else:
                     reason_note = "Вторичный сигнал (капитал распределен в топ-1)"
+
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "BUY_PAPER", cand["icao"], cand["outcomes"], cand["price_cents"],
+                    {
+                        "conf_score": cand["conf_score"],
+                        "conf_label": cand["conf_label"],
+                        "paper_reason": reason_note,
+                        "reasons": cand["conf_reasons"],
+                    }
+                )
 
                 reasons_str = "\n".join(f"• {r}" for r in cand["conf_reasons"])
                 paper_msg = (
@@ -1546,6 +1736,23 @@ async def send_consolidated_digest(
     today_khv_str = now_khv.strftime("%d.%m.%Y")
     time_khv_str = now_khv.strftime("%H:%M")
 
+    # Записываем действие планового сканирования в дневной аудиторский лог
+    try:
+        await asyncio.to_thread(
+            record_daily_action,
+            0,
+            "SCAN",
+            "ALL",
+            "",
+            0.0,
+            {
+                "cities": ", ".join(TARGET_CITIES.keys()),
+                "note": f"Плановый METAR-цикл ({time_khv_str} ХБР)",
+            },
+        )
+    except Exception as e_scan_log:
+        logger.debug(f"Не удалось зафиксировать SCAN в daily_actions_log: {e_scan_log}")
+
     # Автоматически синхронизируем сделки с Polymarket перед отправкой дайджеста
     await sync_all_subscribers_polymarket_positions()
 
@@ -1610,7 +1817,7 @@ async def send_consolidated_digest(
                 if p_cur is None:
                     p_cur = p_entry if p_entry > 0 else 0.0
 
-                pnl_v = round(((p_cur - p_entry) / p_entry) * 100, 1) if p_entry > 0 else 0.0
+                pnl_v = round(((p_cur - p_entry) / entry_price) * 100, 1) if p_entry > 0 else 0.0
                 pnl_s = f"{'+' if pnl_v >= 0 else ''}{pnl_v:.0f}%"
 
                 pos_summary_lines.append(
@@ -1653,24 +1860,26 @@ async def run_auto_scanner(bot: Bot) -> None:
     """
     Основной цикл автоматического сканера.
     Синхронизирован со сводками METAR строго 2 раза в час: ровно в :02 и :32 минуты.
-    Работает круглосуточно (24/7) для непрерывного контроля европейских, азиатских и американских рынков.
+    Работает в торговом окне 10:00 - 24:00 по времени Хабаровска (UTC+10).
+    В 23:32 формирует и рассылает дневной аудиторский отчет и уходит в ночной сон до 10:02.
     """
-    global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT
-    logger.info("🚀 Единый консолидированный автосканер v8.0 запущен (Режим 24/7, METAR: :02 и :32).")
+    global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT, _LAST_AUDIT_REPORT_DATE
+    logger.info("🚀 Консолидированный автосканер запущен (Окно: 10:00 - 24:00 ХБР, METAR: :02 и :32).")
 
-    # Запускаем непрерывный высокочастотный мониторинг позиций (каждые 60 сек)
+    # Запускаем непрерывный высокочастотный мониторинг позиций (каждые 15 сек при наличии сделок)
     asyncio.create_task(run_position_monitor(bot))
 
     while True:
         try:
             now_khv = datetime.now(KHV_TZ)
 
-            # 1. Проверяем, находимся ли мы прямо сейчас в контрольной минуте (:02 или :32)
+            # 1. Проверяем контрольную точку (:02 или :32) только если мы в активных часах
             current_checkpoint_slot: Optional[str] = None
-            if now_khv.minute in (2, 3):
-                current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:02"
-            elif now_khv.minute in (32, 33):
-                current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:32"
+            if is_khv_active_hours():
+                if now_khv.minute in (2, 3):
+                    current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:02"
+                elif now_khv.minute in (32, 33):
+                    current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:32"
 
             # 2. Если мы в контрольной точке И дайджест для этого слота еще не отправлялся — отправляем!
             if current_checkpoint_slot and current_checkpoint_slot != _LAST_SENT_SLOT:
@@ -1723,7 +1932,16 @@ async def run_auto_scanner(bot: Bot) -> None:
                 _LAST_SENT_SLOT = current_checkpoint_slot
                 logger.info(f"✅ Дайджест {current_checkpoint_slot} ХБР успешно разослан.")
 
-            # 3. Расчет точного сна до СЛЕДУЮЩЕЙ контрольной точки (:02 или :32)
+                # 3. Если это завершающий вечерний цикл дня (23:32 ХБР) — формируем и рассылаем дневной отчет
+                if now_khv.hour == 23 and now_khv.minute in (32, 33) and _LAST_AUDIT_REPORT_DATE != today_khv_str:
+                    _LAST_AUDIT_REPORT_DATE = today_khv_str
+                    logger.info("🌙 Торговое окно 10:00-24:00 закрывается. Отправка итогового аудиторского отчета за день...")
+                    try:
+                        await send_daily_audit_file(bot, today_khv_str)
+                    except Exception as audit_err:
+                        logger.error(f"Ошибка отправки итогового отчета: {audit_err}")
+
+            # 4. Расчет точного сна до СЛЕДУЮЩЕЙ контрольной точки
             now_after = datetime.now(KHV_TZ)
             sleep_secs, next_target, next_slot_str = get_next_sleep_seconds(now_after)
 
