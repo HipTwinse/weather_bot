@@ -561,7 +561,12 @@ def format_markdown_to_telegram_html(text: str) -> str:
     return out.strip()
 
 
-async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[str]:
+async def ask_gemini_model(
+    user_prompt: str,
+    scenario: str = "A",
+    custom_system_prompt: Optional[str] = None,
+    raw_response: bool = False,
+) -> Optional[str]:
     """
     Выполняет асинхронный вызов Google Gemini REST API.
     Использует цепочку быстрых и надежных моделей с мгновенным переключением при 503/429.
@@ -587,9 +592,11 @@ async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[st
         "Content-Type": "application/json",
     }
 
+    system_text = custom_system_prompt if custom_system_prompt else SYSTEM_PROMPT_V8_0
+
     body = {
         "system_instruction": {
-            "parts": [{"text": SYSTEM_PROMPT_V8_0}]
+            "parts": [{"text": system_text}]
         },
         "contents": [
             {
@@ -618,6 +625,8 @@ async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[st
                                 raw_text = parts[0].get("text", "")
                                 global _LAST_SUCCESSFUL_MODEL
                                 _LAST_SUCCESSFUL_MODEL = model_name
+                                if raw_response:
+                                    return raw_text.strip()
                                 return format_markdown_to_telegram_html(raw_text)
                     else:
                         err_text = await resp.text()
@@ -628,6 +637,97 @@ async def ask_gemini_model(user_prompt: str, scenario: str = "A") -> Optional[st
                 continue
 
     return None
+
+
+VALIDATION_SYSTEM_PROMPT = """Ты — главный риск-офицер и квант-синоптик торгового фонда Weather Alpha Engine.
+Твоя задача — жесткая пре-трейд валидация сделок перед совершением покупки на бирже Polymarket.
+Оцени микрофизику атмосферы (ветер, инверсии, облачность, фазовые переходы осадков), динамику солнечной инсоляции и справедливость цены.
+КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО одобрение сомнительных исходов при рисках затухания темпа прогрева, сдуве ветром или нехватке времени солнца.
+
+ФОРМАТ ОТВЕТА СТРОГО:
+РЕШЕНИЕ: [ОДОБРЕНО или ОТКЛОНЕНО]
+ПРИЧИНА: [Четкое синоптическое объяснение на русском языке в 1-2 предложения]
+"""
+
+
+async def validate_candidate_ai(
+    icao: str,
+    city_name: str,
+    target_outcomes: str,
+    price_cents: float,
+    models: Dict[str, float],
+    raw_metar: str,
+    rate_str: str,
+    rem_hours_str: str,
+    conf_score: float,
+    conf_reasons: List[str],
+) -> Tuple[bool, str]:
+    """
+    Экспресс-валидация сделки нейросетью Google Gemini перед автоматической покупкой.
+    Возвращает (is_approved: bool, reason: str).
+    """
+    from typing import Tuple
+    if not is_gemini_configured():
+        return True, "AI-модуль не настроен, сделка допущена по строгой математике"
+
+    reasons_bullet = "\n".join(f"  • {r}" for r in conf_reasons) if conf_reasons else "  • Высокий математический рейтинг"
+    models_str = ", ".join(f"{k.upper()}: {v}°C" for k, v in models.items() if v is not None)
+
+    prompt = f"""
+ВХОДНЫЕ ДАННЫЕ КАНДИДАТА НА ПОКУПКУ:
+• Локация: {city_name} ({icao})
+• Целевой страйк: {target_outcomes}
+• Цена токена в стакане: {price_cents:.0f}¢
+• Сводка погоды (METAR): {raw_metar if raw_metar else 'Н/Д'}
+• Темп прогрева: {rate_str}
+• Окно солнечной инсоляции: {rem_hours_str}
+• Прогнозы моделей (T_max): {models_str}
+• Оценка надежности алгоритма: {conf_score:.0f}/100
+• Факторы выбора алгоритма:
+{reasons_bullet}
+
+ПРОВЕДИ РИСК-ВАЛИДАЦИЮ:
+1. Достаточно ли оставшейся инсоляции для достижения страйка {target_outcomes}?
+2. Нет ли риска блокировки дневного прогрева (низкие слоистые облака Stratus, влажность, сдув ветром)?
+3. Оправдана ли покупка по цене {price_cents:.0f}¢?
+
+Ответь строго по шаблону:
+РЕШЕНИЕ: [ОДОБРЕНО или ОТКЛОНЕНО]
+ПРИЧИНА: [Короткое синоптическое объяснение на русском]
+"""
+
+    try:
+        raw_res = await ask_gemini_model(
+            prompt,
+            scenario="VALIDATION",
+            custom_system_prompt=VALIDATION_SYSTEM_PROMPT,
+            raw_response=True,
+        )
+        if not raw_res:
+            return True, "Нейросеть временно недоступна, подтверждено по математике"
+
+        upper_res = raw_res.upper()
+        if "РЕШЕНИЕ: ОТКЛОНЕНО" in upper_res or "РЕШЕНИЕ: REJECTED" in upper_res or "ВЕРДИКТ: ОТКЛОНЕНО" in upper_res:
+            is_approved = False
+        elif "РЕШЕНИЕ: ОДОБРЕНО" in upper_res or "РЕШЕНИЕ: APPROVED" in upper_res or "ВЕРДИКТ: ОДОБРЕНО" in upper_res:
+            is_approved = True
+        else:
+            is_approved = ("ОТКЛОНЕНО" not in upper_res) and ("ОДОБРЕНО" in upper_res)
+
+        reason = "Синоптическая картина подтверждает потенциал прогрева"
+        if "ПРИЧИНА:" in raw_res:
+            reason = raw_res.split("ПРИЧИНА:", 1)[1].strip().split("\n")[0].strip()
+        elif "Причина:" in raw_res:
+            reason = raw_res.split("Причина:", 1)[1].strip().split("\n")[0].strip()
+        else:
+            lines = [line.strip() for line in raw_res.split("\n") if line.strip() and not line.startswith("РЕШЕНИЕ:")]
+            if lines:
+                reason = lines[0]
+
+        return is_approved, reason
+    except Exception as e:
+        logger.warning(f"Ошибка вызова AI-валидации Gemini: {e}")
+        return True, "AI-валидация пропущена из-за сбоя сети"
 
 
 async def analyze_city_weather_ai(city_data: Dict[str, Any], scenario: str = "A") -> Optional[str]:

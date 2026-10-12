@@ -794,6 +794,8 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
                 lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена входа: {price:.0f}¢")
                 lines.append(f"   Сумма ордера: ${det.get('amount_usd', 1.08):.2f} USDC (контрактов: ~{det.get('shares', 0):.2f})")
                 lines.append(f"   Рейтинг надежности: {det.get('conf_score', 0)}/100 ({det.get('conf_label', '')})")
+                if det.get("ai_verdict"):
+                    lines.append(f"   🧠 Вердикт нейросети (Gemini AI): {det.get('ai_verdict')}")
                 reasons = det.get("reasons", [])
                 if reasons:
                     lines.append("   Факторы входа:")
@@ -805,6 +807,8 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
                 lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена входа: {price:.0f}¢")
                 lines.append(f"   Рейтинг надежности: {det.get('conf_score', 0)}/100 ({det.get('conf_label', '')})")
                 lines.append(f"   Причина теста: {det.get('paper_reason', 'Тестовый режим или вторичный кандидат')}")
+                if det.get("ai_verdict"):
+                    lines.append(f"   🧠 Вердикт нейросети (Gemini AI): {det.get('ai_verdict')}")
                 reasons = det.get("reasons", [])
                 if reasons:
                     lines.append("   Факторы:")

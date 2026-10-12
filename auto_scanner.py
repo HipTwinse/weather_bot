@@ -1459,6 +1459,10 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                 "conf_label": conf_label,
                 "conf_reasons": conf_reasons,
                 "title": title,
+                "models": models,
+                "raw_metar": raw_metar,
+                "rate_str": cm.get("rate_str", "Н/Д"),
+                "rem_hours_str": rem_hours_str,
             })
 
         if not candidates:
@@ -1489,8 +1493,75 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
             # В реальную сделку допускаются только самые надежные кандидаты с рейтингом >= 80.0
             is_top_pick = (idx < available_trades and cand["conf_score"] >= 80.0)
 
+            # === AI-ВАЛИДАЦИЯ НЕЙРОСЕТЬЮ (GEMINI RISK VALIDATION) ===
+            from gemini_analyzer import validate_candidate_ai
+            is_ai_approved = True
+            ai_reason = "Подтверждено по математическому алгоритму"
+
+            if (mode == "REAL" and is_top_pick and has_pk) or (mode == "PAPER" and idx == 0 and cand["conf_score"] >= 75.0):
+                try:
+                    is_ai_approved, ai_reason = await validate_candidate_ai(
+                        icao=cand["icao"],
+                        city_name=cand["city_name"],
+                        target_outcomes=cand["outcomes"],
+                        price_cents=cand["price_cents"],
+                        models=cand.get("models", {}),
+                        raw_metar=cand.get("raw_metar", ""),
+                        rate_str=cand.get("rate_str", "Н/Д"),
+                        rem_hours_str=cand.get("rem_hours_str", "Н/Д"),
+                        conf_score=cand["conf_score"],
+                        conf_reasons=cand["conf_reasons"],
+                    )
+                except Exception as e_ai:
+                    logger.warning(f"Ошибка AI-валидации: {e_ai}")
+                    is_ai_approved = True
+                    ai_reason = "AI-валидация временно недоступна, допущено по математике"
+
+            # Если нейросеть НАЛОЖИЛА ВЕТО на реальную сделку — спасаем деньги!
+            if mode == "REAL" and is_top_pick and has_pk and not is_ai_approved:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", cand["icao"], cand["outcomes"], cand["price_cents"],
+                    {"reason": f"AI-вето нейросети: {ai_reason}", "conf_score": cand["conf_score"]}
+                )
+                await asyncio.to_thread(
+                    add_position,
+                    uid,
+                    cand["icao"],
+                    cand["outcomes"],
+                    cand["target_date"],
+                    cand["price_cents"],
+                    2.5,
+                    cand["token_id"],
+                    1,  # is_paper = 1
+                    cand["conf_score"],
+                )
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "BUY_PAPER", cand["icao"], cand["outcomes"], cand["price_cents"],
+                    {
+                        "conf_score": cand["conf_score"],
+                        "conf_label": cand["conf_label"],
+                        "paper_reason": f"🛡️ ВЕТО НЕЙРОСЕТИ (Защита депозита): {ai_reason}",
+                        "reasons": cand["conf_reasons"],
+                    }
+                )
+                veto_msg = (
+                    f"🛡️ <b>НЕЙРОСЕТЬ ОТКЛОНИЛА СДЕЛКУ (ЗАЩИТА ДЕПОЗИТА)</b>\n\n"
+                    f"• <b>Локация:</b> {cand['city_name']}\n"
+                    f"• <b>Исход:</b> <code>{cand['outcomes']}</code> (цена: <b>{cand['price_cents']:.0f}¢</b>)\n"
+                    f"• <b>Рейтинг формулы:</b> {cand['conf_score']:.0f}/100 (математический фильтр был пройден)\n"
+                    f"• <b>Вердикт AI-синоптика:</b> 🛑 <i>{ai_reason}</i>\n\n"
+                    f"💡 <i>Реальная покупка отменена для защиты баланса! Исход переведен в бумажный тест для проверки точности нейросети.</i>"
+                )
+                try:
+                    await bot.send_message(uid, veto_msg, parse_mode="HTML")
+                except Exception:
+                    pass
+                continue
+
             # 1. Реальная сделка на Polymarket CLOB
-            if mode == "REAL" and is_top_pick and has_pk:
+            if mode == "REAL" and is_top_pick and has_pk and is_ai_approved:
                 success, order_id, resp = await asyncio.to_thread(
                     execute_market_buy,
                     wallet["private_key"],
@@ -1523,6 +1594,7 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                             "conf_score": cand["conf_score"],
                             "conf_label": cand["conf_label"],
                             "reasons": cand["conf_reasons"],
+                            "ai_verdict": ai_reason,
                         }
                     )
                     reasons_str = "\n".join(f"• {r}" for r in cand["conf_reasons"])
@@ -1532,7 +1604,8 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                         f"• <b>Выбранный исход:</b> <code>{cand['outcomes']}</code>\n"
                         f"• <b>Цена входа:</b> <b>{cand['price_cents']:.0f}¢</b>\n"
                         f"• <b>Сумма ордера:</b> <b>${trade_cost:.2f} USDC</b> (объем: ~{shares:.2f} долей)\n"
-                        f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n\n"
+                        f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n"
+                        f"• <b>AI-валидация:</b> 🟢 <b>ОДОБРЕНО НЕЙРОСЕТЬЮ</b> (<i>{ai_reason}</i>)\n\n"
                         f"<b>Факторы выбора:</b>\n{reasons_str}\n\n"
                         f"🛡️ <i>Сделка взята под радарную защиту: активны трейлинг (+35%) и безусловный стоп-лосс (-8¢).</i>"
                     )
@@ -1614,16 +1687,19 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                         "conf_label": cand["conf_label"],
                         "paper_reason": reason_note,
                         "reasons": cand["conf_reasons"],
+                        "ai_verdict": ai_reason,
                     }
                 )
 
                 reasons_str = "\n".join(f"• {r}" for r in cand["conf_reasons"])
+                ai_paper_line = f"• <b>AI-валидация:</b> {'🟢 ОДОБРЕНО' if is_ai_approved else '🛑 ВЕТО'} (<i>{ai_reason}</i>)\n" if (idx == 0 and cand["conf_score"] >= 75.0) else ""
                 paper_msg = (
                     f"📝 <b>ОФОРМЛЕНА БУМАЖНАЯ СДЕЛКА (ТЕСТ БЕЗ РИСКА)</b>\n\n"
                     f"• <b>Локация:</b> {cand['city_name']}\n"
                     f"• <b>Исход:</b> <code>{cand['outcomes']}</code>\n"
                     f"• <b>Виртуальная цена входа:</b> <b>{cand['price_cents']:.0f}¢</b>\n"
-                    f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n\n"
+                    f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n"
+                    f"{ai_paper_line}"
                     f"• <b>Причина виртуального входа:</b> <i>{reason_note}</i>\n"
                     f"<b>Факторы выбора:</b>\n{reasons_str}\n\n"
                     f"📊 <i>Бот будет виртуально сопровождать этот исход и зафиксирует PnL в статистику винрейта.</i>"
