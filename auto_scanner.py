@@ -81,6 +81,13 @@ TARGET_CITIES = {
     "LFPB": "🇫🇷 Париж (LFPB)",
     "LIMC": "🇮🇹 Милан (LIMC)",
     "LEMD": "🇪🇸 Мадрид (LEMD)",
+    "RJTT": "🇯🇵 Токио (RJTT)",
+}
+
+# Резервные города фонового радара автопокупки (проверяются на наличие ликвидного стакана и сильного сигнала)
+STANDBY_AUTO_BUY_CITIES = {
+    "RKSI": "🇰🇷 Сеул (RKSI)",
+    "LTAC": "🇹🇷 Анкара (LTAC)",
 }
 
 # Хранилище утренней базы прогрева: icao -> {"date": "YYYY-MM-DD", "temp": float, "timestamp": float}
@@ -102,6 +109,7 @@ express_scan_keyboard = InlineKeyboardMarkup(
             InlineKeyboardButton(text="🇪🇸 Мадрид LEMD", callback_data="express_scan:LEMD"),
         ],
         [
+            InlineKeyboardButton(text="🇯🇵 Токио RJTT", callback_data="express_scan:RJTT"),
             InlineKeyboardButton(text="🧭 Почему вне рынка?", callback_data="btn_why_standby"),
         ],
     ]
@@ -442,6 +450,19 @@ def _get_city_physics_note(icao: str, raw_metar: str, temp_c: Optional[float], l
     elif icao == "EDDM":
         return "Мюнхен: при южном ветре (150°-210°) работает Альпийский фён (+1.2°C...+2.0°C к консенсусу)."
 
+    elif icao == "RJTT":
+        if wdir is not None and 80 <= wdir <= 160 and wspd and wspd >= 8:
+            return "Токио (Ханеда): дневной морской бриз с Токийского залива (E/SE) ограничивает пик прогрева. Приоритет ICON/ECMWF."
+        return "Токио (Ханеда): мощный городской остров тепла Токийской агломерации. Опора на консенсус ICON и ECMWF."
+
+    elif icao == "RKSI":
+        if wdir is not None and 220 <= wdir <= 310 and wspd and wspd >= 8:
+            return "Сеул (Инчхон): морской вынос с Желтого моря (W/SW) сглаживает дневной максимум на островной станции."
+        return "Сеул (Инчхон): континентальный прогрев при восточном/слабом ветре. Опора на консенсус ICON/ECMWF."
+
+    elif icao == "LTAC":
+        return "Анкара (Эсенбога): сухое Анатолийское плато (~950 м). Сильная дневная амплитуда инсоляции (аналог Мадрида), приоритет ICON+ECMWF."
+
     return "Синтез эмпирических физических законов KB v8.0."
 
 
@@ -454,6 +475,7 @@ ALL_RADAR_CITIES_MAP = {
     "KJFK": "🇺🇸 Нью-Йорк (KJFK)",
     "RJTT": "🇯🇵 Токио (RJTT)",
     "RKSI": "🇰🇷 Сеул (RKSI)",
+    "LTAC": "🇹🇷 Анкара (LTAC)",
     "UHHH": "🇷🇺 Хабаровск (UHHH)",
 }
 
@@ -647,6 +669,35 @@ def get_priority_target(
             return val, f"Альпийский фён ({val:.1f}°C)"
         val = icon_val if icon_val is not None else avg_peak
         return val, f"ICON ({val:.1f}°C)"
+
+    elif icao == "RJTT":
+        # Токио (Ханеда): Морской бриз с залива или городской прогрев
+        if icon_val is not None and ecm_val is not None:
+            base = round((icon_val + ecm_val) / 2.0, 1)
+        else:
+            base = icon_val if icon_val is not None else (ecm_val if ecm_val is not None else avg_peak)
+        if wdir is not None and 80 <= wdir <= 160 and wspd and wspd >= 8:
+            return base, f"ICON+ECMWF ({base:.1f}°C, Бриз залива)"
+        if is_calm:
+            return round(base + 0.3, 1), f"ICON+ECMWF+0.3°C ({base+0.3:.1f}°C, Токио UHI)"
+        return base, f"ICON+ECMWF ({base:.1f}°C, Токио)"
+
+    elif icao == "RKSI":
+        # Сеул (Инчхон): островной аэропорт в Желтом море
+        if icon_val is not None and ecm_val is not None:
+            base = round((icon_val + ecm_val) / 2.0, 1)
+        else:
+            base = icon_val if icon_val is not None else avg_peak
+        return base, f"ICON+ECMWF ({base:.1f}°C, Инчхон)"
+
+    elif icao == "LTAC":
+        # Анкара (Эсенбога): Анатолийское плато (~950 м), схоже с Мадридом
+        if icon_val is not None:
+            val = round(icon_val + 0.3, 1)
+            return val, f"ICON+0.3°C ({val:.1f}°C, Плато Анкара)"
+        elif ecm_val is not None:
+            return ecm_val, f"ECMWF ({ecm_val:.1f}°C, Анкара)"
+        return avg_peak, f"Консенсус ({avg_peak:.1f}°C)"
 
     else:
         val = icon_val if icon_val is not None else avg_peak
@@ -1328,14 +1379,32 @@ def calculate_candidate_confidence(
     return score, label, reasons
 
 
-async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, Any]]) -> None:
+async def check_and_execute_auto_buy(
+    bot: Bot,
+    cities_metrics: List[Dict[str, Any]],
+    include_standby: bool = False,
+) -> None:
     """
     Автоматически анализирует кандидатов дня и совершает покупки (реальные или бумажные)
     с учетом режима пользователя, баланса кошелька, солнечной инсоляции и рейтинга надежности.
+    При include_standby=True дополнительно опрашивает резервные города (Сеул RKSI, Анкара LTAC)
+    и включает их в отбор, если на Polymarket есть активный стакан котировок.
     """
     if not is_khv_active_hours():
         logger.info("Ночные часы ХБР (00:00 - 10:00): автопокупка заблокирована.")
         return
+
+    all_metrics = list(cities_metrics)
+    if include_standby:
+        existing_icaos = {str(cm.get("icao", "")).strip().upper() for cm in all_metrics if cm}
+        for st_icao in STANDBY_AUTO_BUY_CITIES.keys():
+            if st_icao not in existing_icaos:
+                try:
+                    st_cm = await collect_city_metrics(st_icao)
+                    if st_cm and st_cm.get("orderbook"):
+                        all_metrics.append(st_cm)
+                except Exception as e_st:
+                    logger.debug(f"Не удалось опросить резервный город {st_icao} для автопокупки: {e_st}")
 
     subscribers = await asyncio.to_thread(get_all_subscribers)
     admin_id = getattr(config, "ADMIN_CHAT_ID", None)
@@ -1352,7 +1421,7 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
         existing_positions = await asyncio.to_thread(get_user_positions, uid)
 
         candidates = []
-        for cm in cities_metrics:
+        for cm in all_metrics:
             if not cm:
                 continue
             icao = cm["icao"]
@@ -1408,9 +1477,9 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                 continue
 
             # Максимально допустимый разрыв прогрева до цели:
-            # При ясном солнце (CAVOK/CLR) или для Мадрида (LEMD) дневной прогрев на Месете достигает 9-11°C
+            # При ясном солнце (CAVOK/CLR) или для Мадрида/Анкары (LEMD/LTAC) дневной прогрев на плато достигает 9-11°C
             is_clear_sky = any(c in raw_metar for c in ["CAVOK", "CLR", "SKC"])
-            max_allowed_gap = 9.5 if (is_clear_sky or icao == "LEMD") else 5.0
+            max_allowed_gap = 9.5 if (is_clear_sky or icao in ("LEMD", "LTAC")) else 5.0
 
             if temp_c is not None and (target_strike - temp_c) > max_allowed_gap:
                 await asyncio.to_thread(
@@ -2037,7 +2106,7 @@ async def send_consolidated_digest(
 
     # Автоматический отбор надежных исходов и совершение покупок (реальных или бумажных)
     try:
-        await check_and_execute_auto_buy(bot, cities_metrics)
+        await check_and_execute_auto_buy(bot, cities_metrics, include_standby=True)
     except Exception as e_buy:
         logger.error(f"Ошибка в блоке автопокупки: {e_buy}", exc_info=True)
 

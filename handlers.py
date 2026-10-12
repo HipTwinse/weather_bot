@@ -166,6 +166,7 @@ ai_cities_inline_keyboard = InlineKeyboardMarkup(
             InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="ai_city:RKSI"),
         ],
         [
+            InlineKeyboardButton(text="🇹🇷 Анкара (LTAC)", callback_data="ai_city:LTAC"),
             InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="ai_city:UHHH"),
         ],
     ]
@@ -190,6 +191,7 @@ cities_inline_keyboard = InlineKeyboardMarkup(
             InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="icao:RKSI"),
         ],
         [
+            InlineKeyboardButton(text="🇹🇷 Анкара (LTAC)", callback_data="icao:LTAC"),
             InlineKeyboardButton(text="🇷🇺 Хабаровск (UHHH)", callback_data="icao:UHHH"),
         ],
     ]
@@ -206,7 +208,14 @@ position_city_keyboard = InlineKeyboardMarkup(
             InlineKeyboardButton(text="🇪🇸 Мадрид (LEMD)", callback_data="pos_city:LEMD"),
         ],
         [
+            InlineKeyboardButton(text="🇯🇵 Токио (RJTT)", callback_data="pos_city:RJTT"),
+            InlineKeyboardButton(text="🇰🇷 Сеул (RKSI)", callback_data="pos_city:RKSI"),
+        ],
+        [
+            InlineKeyboardButton(text="🇹🇷 Анкара (LTAC)", callback_data="pos_city:LTAC"),
             InlineKeyboardButton(text="🇩🇪 Мюнхен (EDDM)", callback_data="pos_city:EDDM"),
+        ],
+        [
             InlineKeyboardButton(text="🇺🇸 Нью-Йорк (KJFK)", callback_data="pos_city:KJFK"),
         ],
     ]
@@ -233,6 +242,7 @@ CITY_KEYWORD_MAP = {
     "LFPB": ["paris", "париж", "lfpb", "bourget"],
     "RJTT": ["tokyo", "токио", "rjtt", "haneda"],
     "RKSI": ["seoul", "сеул", "rksi", "incheon"],
+    "LTAC": ["ankara", "анкара", "ltac", "esenboga"],
     "ZSPD": ["shanghai", "шанхай", "zspd", "pudong"],
     "EDDM": ["munich", "мюнхен", "eddm"],
     "LEMD": ["madrid", "мадрид", "lemd", "barajas"],

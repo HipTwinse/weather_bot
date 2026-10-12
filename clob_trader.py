@@ -6,22 +6,35 @@
 
 import logging
 import re
+import time
 from typing import Any, Dict, Optional, Tuple
 import requests
 from eth_account import Account
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+from py_clob_client_v2 import (
+    ClobClient,
     AssetType,
     BalanceAllowanceParams,
     MarketOrderArgs,
     OrderArgs,
     OrderType,
+    PartialCreateOrderOptions,
 )
 
 logger = logging.getLogger("ClobTrader")
 
 POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
+
+
+def _derive_and_set_api_creds(client: ClobClient):
+    """Генерирует или восстанавливает API-ключи CLOB V2 и устанавливает их в клиенте."""
+    derive_fn = getattr(client, "create_or_derive_api_key", None) or getattr(
+        client, "create_or_derive_api_creds", None
+    )
+    creds = derive_fn() if derive_fn else None
+    if creds:
+        client.set_api_creds(creds)
+    return creds
 
 # Публичные RPC-узлы Polygon для ончейн-проверок баланса
 POLYGON_RPCS = [
@@ -169,7 +182,7 @@ def validate_private_key(raw_key: str) -> Tuple[bool, str, str]:
                 chain_id=POLYGON_CHAIN_ID,
                 signature_type=0,
             )
-            creds = client.create_or_derive_api_creds()
+            creds = _derive_and_set_api_creds(client)
             if not creds or not creds.api_key:
                 return False, address, "Не удалось сгенерировать торговые ключи Polymarket CLOB."
         except Exception as e_clob:
@@ -226,9 +239,8 @@ def get_wallet_collateral_balance(
                 signature_type=sig_type,
                 funder=proxy_address if proxy_address else None,
             )
-            creds = client.create_or_derive_api_creds()
+            creds = _derive_and_set_api_creds(client)
             if creds:
-                client.set_api_creds(creds)
                 params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=sig_type)
                 res = client.get_balance_allowance(params)
                 raw_bal = float(res.get("balance", 0))
@@ -278,9 +290,8 @@ def get_token_balance(
             signature_type=sig_type,
             funder=proxy_address if proxy_address else None,
         )
-        creds = client.create_or_derive_api_creds()
+        creds = _derive_and_set_api_creds(client)
         if creds:
-            client.set_api_creds(creds)
             params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id, signature_type=sig_type)
             res = client.get_balance_allowance(params)
             raw_bal = float(res.get("balance", 0))
@@ -300,7 +311,7 @@ def execute_market_sell(
     signature_type: int = 1,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Выполняет продажу указанного объема контрактов по рынку (Market-Taker).
+    Выполняет продажу указанного объема контрактов по рынку (Market-Taker) по протоколу CLOB V2.
     Учитывает архитектуру Polymarket Proxy/Safe:
     - maker: proxy_address (где хранятся токены)
     - signer: EOA address из приватного ключа
@@ -320,7 +331,6 @@ def execute_market_sell(
         if not proxy_address:
             proxy_address = resolve_polymarket_proxy(signer_addr) or ""
 
-        # Если proxyWallet найден и отличается от адреса ключа -> signature_type = 1, funder = proxy
         sig_type = signature_type
         if proxy_address and proxy_address.lower() != signer_addr.lower():
             sig_type = 1
@@ -336,10 +346,8 @@ def execute_market_sell(
             signature_type=sig_type,
             funder=funder_addr,
         )
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
+        _derive_and_set_api_creds(client)
 
-        # Получаем реальный минимальный шаг цены (tick_size) рынка (обычно 0.01 на Polymarket)
         try:
             tick_size = float(client.get_tick_size(token_id))
         except Exception:
@@ -349,39 +357,44 @@ def execute_market_sell(
         safe_worst_price = min(safe_worst_price, 1.0 - tick_size)
         safe_worst_price = round(safe_worst_price, 4)
 
-        # Способ 1: Прямой рыночный ордер через SDK
+        # Способ 1: Прямой рыночный ордер V2 (create_and_post_market_order)
         try:
             market_args = MarketOrderArgs(
                 token_id=token_id,
-                amount=shares,
+                amount=round(shares, 2),
                 side="SELL",
                 price=safe_worst_price,
                 order_type=OrderType.FOK,
             )
-            signed_order = client.create_market_order(market_args)
-            resp = client.post_order(signed_order, OrderType.FOK)
-            if resp and resp.get("success"):
-                order_id = resp.get("orderID", "OK")
+            if hasattr(client, "create_and_post_market_order"):
+                resp = client.create_and_post_market_order(market_args, order_type=OrderType.FOK)
+            else:
+                signed_order = client.create_market_order(market_args)
+                resp = client.post_order(signed_order, OrderType.FOK)
+            if isinstance(resp, dict) and (resp.get("success") or (resp.get("orderID") and not resp.get("errorMsg"))):
+                order_id = str(resp.get("orderID", "OK"))
                 return True, order_id, resp
-            elif resp and not resp.get("errorMsg"):
-                return True, str(resp.get("orderID", "FILLED")), resp
         except Exception as e1:
-            logger.info(f"MarketOrderArgs не сработал ({e1}), переключаемся на агрессивный OrderArgs...")
+            logger.info(f"MarketOrderArgs V2 не сработал ({e1}), переключаемся на агрессивный OrderArgs V2...")
 
-        # Способ 2: Агрессивный FAK-ордер на продажу в существующий бид
+        # Способ 2: Агрессивный ордер OrderArgs V2 (сначала FAK, затем GTC)
         order_args = OrderArgs(
-            price=safe_worst_price,
-            size=shares,
-            side="SELL",
             token_id=token_id,
+            price=safe_worst_price,
+            size=round(shares, 2),
+            side="SELL",
         )
-        resp2 = client.create_and_post_order(order_args)
-        if resp2 and (resp2.get("success") or resp2.get("orderID")):
-            order_id = resp2.get("orderID", "OK")
-            return True, order_id, resp2
-        else:
-            err = resp2.get("errorMsg") if isinstance(resp2, dict) else str(resp2)
-            return False, f"Биржа отклонила сделку: {err}", resp2 if isinstance(resp2, dict) else {}
+        for o_type in (OrderType.FAK, OrderType.GTC):
+            try:
+                resp2 = client.create_and_post_order(order_args, order_type=o_type)
+                if isinstance(resp2, dict) and (resp2.get("success") or (resp2.get("orderID") and not resp2.get("errorMsg"))):
+                    order_id = str(resp2.get("orderID", "OK"))
+                    return True, order_id, resp2
+            except Exception as e_sub:
+                logger.info(f"Попытка продажи ({o_type}) завершилась: {e_sub}")
+                last_sub_err = e_sub
+
+        return False, f"Биржа отклонила сделку ({locals().get('last_sub_err', 'нет ликвидности')})", {}
 
     except Exception as e:
         logger.error(f"Критическая ошибка исполнения автопродажи: {e}", exc_info=True)
@@ -397,7 +410,7 @@ def execute_market_buy(
     signature_type: int = 1,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Выполняет покупку исхода на Polymarket CLOB.
+    Выполняет покупку исхода на Polymarket CLOB V2.
     Учитывает:
     - Минимальный размер ордера на Polymarket ($1.00 - $1.05), по умолчанию $1.08.
     - Ограничение максимальной цены входа (max_price), чтобы не покупать перегретые токены.
@@ -432,10 +445,8 @@ def execute_market_buy(
             signature_type=sig_type,
             funder=funder_addr,
         )
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
+        _derive_and_set_api_creds(client)
 
-        # Шаг цены
         try:
             tick_size = float(client.get_tick_size(token_id))
         except Exception:
@@ -445,44 +456,48 @@ def execute_market_buy(
         safe_max_price = min(safe_max_price, 0.99)
         safe_max_price = round(safe_max_price, 4)
 
-        # Количество контрактов для покупки
         shares = round(amount_usd / safe_max_price, 2)
         if shares <= 0:
             return False, f"Некорректный расчет объема: {shares}", {}
 
-        # 1. Попытка рыночного ордера на покупку (Market FOK)
+        # 1. Попытка рыночного ордера V2 на покупку (Market FOK)
         try:
             market_args = MarketOrderArgs(
                 token_id=token_id,
-                amount=amount_usd,
+                amount=round(amount_usd, 2),
                 side="BUY",
                 price=safe_max_price,
                 order_type=OrderType.FOK,
             )
-            signed_order = client.create_market_order(market_args)
-            resp = client.post_order(signed_order, OrderType.FOK)
-            if resp and resp.get("success"):
-                order_id = resp.get("orderID", "OK")
+            if hasattr(client, "create_and_post_market_order"):
+                resp = client.create_and_post_market_order(market_args, order_type=OrderType.FOK)
+            else:
+                signed_order = client.create_market_order(market_args)
+                resp = client.post_order(signed_order, OrderType.FOK)
+            if isinstance(resp, dict) and (resp.get("success") or (resp.get("orderID") and not resp.get("errorMsg"))):
+                order_id = str(resp.get("orderID", "OK"))
                 return True, order_id, resp
-            elif resp and not resp.get("errorMsg") and resp.get("orderID"):
-                return True, str(resp.get("orderID")), resp
         except Exception as e1:
-            logger.info(f"MarketOrderArgs на покупку не сработал ({e1}), переключаемся на OrderArgs...")
+            logger.info(f"MarketOrderArgs V2 на покупку не сработал ({e1}), переключаемся на OrderArgs V2...")
 
-        # 2. Агрессивный FAK-ордер на покупку
+        # 2. Агрессивный ордер OrderArgs V2 на покупку (FAK / GTC)
         order_args = OrderArgs(
+            token_id=token_id,
             price=safe_max_price,
             size=shares,
             side="BUY",
-            token_id=token_id,
         )
-        resp2 = client.create_and_post_order(order_args)
-        if resp2 and (resp2.get("success") or resp2.get("orderID")):
-            order_id = resp2.get("orderID", "OK")
-            return True, order_id, resp2
-        else:
-            err = resp2.get("errorMsg") if isinstance(resp2, dict) else str(resp2)
-            return False, f"Биржа отклонила покупку: {err}", resp2 if isinstance(resp2, dict) else {}
+        for o_type in (OrderType.FAK, OrderType.GTC):
+            try:
+                resp2 = client.create_and_post_order(order_args, order_type=o_type)
+                if isinstance(resp2, dict) and (resp2.get("success") or (resp2.get("orderID") and not resp2.get("errorMsg"))):
+                    order_id = str(resp2.get("orderID", "OK"))
+                    return True, order_id, resp2
+            except Exception as e_sub:
+                logger.info(f"Попытка покупки ({o_type}) завершилась: {e_sub}")
+                last_sub_err = e_sub
+
+        return False, f"Биржа отклонила покупку ({locals().get('last_sub_err', 'нет ликвидности')})", {}
 
     except Exception as e:
         logger.error(f"Критическая ошибка исполнения автопокупки: {e}", exc_info=True)
