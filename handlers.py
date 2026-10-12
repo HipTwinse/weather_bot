@@ -1409,6 +1409,58 @@ async def cmd_force_digest(message: Message, state: FSMContext):
         await status_msg.edit_text(f"⚠️ Не удалось собрать дайджест: {e}")
 
 
+
+@router.message(Command("standby", "why"), StateFilter("*"))
+async def cmd_standby_explanation(message: Message, state: FSMContext):
+    """Выдает подробный синоптический разбор: почему бот пока вне рынка, за чем следит и где вероятнее всего зайдет."""
+    await state.clear()
+    wait_msg = await message.answer("🧭 <i>Формирую разбор рынков: почему бот пока вне рынка и за чем следит...</i>", parse_mode="HTML")
+    try:
+        from auto_scanner import (
+            collect_city_metrics,
+            TARGET_CITIES,
+            generate_midday_standby_briefing,
+            express_scan_keyboard,
+            sanitize_telegram_html,
+        )
+        metrics = []
+        for icao in TARGET_CITIES.keys():
+            cm = await collect_city_metrics(icao)
+            metrics.append(cm)
+            await asyncio.sleep(0.05)
+        briefing_text = await generate_midday_standby_briefing(metrics)
+        safe_text = sanitize_telegram_html(briefing_text)
+        await wait_msg.edit_text(safe_text, parse_mode="HTML", reply_markup=express_scan_keyboard)
+    except Exception as e:
+        logger.error(f"Ошибка в cmd_standby_explanation: {e}", exc_info=True)
+        await wait_msg.edit_text("⚠️ <i>Не удалось сформировать разбор ожидания. Попробуйте через пару минут.</i>", parse_mode="HTML")
+
+
+@router.callback_query(F.data == "btn_why_standby")
+async def process_why_standby_callback(callback: CallbackQuery):
+    """Обработка кнопки '🧭 Почему вне рынка?' под дайджестом."""
+    await callback.answer("⏳ Анализирую ситуацию по 4 рынкам...")
+    try:
+        from auto_scanner import (
+            collect_city_metrics,
+            TARGET_CITIES,
+            generate_midday_standby_briefing,
+            express_scan_keyboard,
+            sanitize_telegram_html,
+        )
+        metrics = []
+        for icao in TARGET_CITIES.keys():
+            cm = await collect_city_metrics(icao)
+            metrics.append(cm)
+            await asyncio.sleep(0.05)
+        briefing_text = await generate_midday_standby_briefing(metrics)
+        safe_text = sanitize_telegram_html(briefing_text)
+        await callback.message.answer(safe_text, parse_mode="HTML", reply_markup=express_scan_keyboard)
+    except Exception as e:
+        logger.error(f"Ошибка в process_why_standby_callback: {e}", exc_info=True)
+        await callback.message.answer("⚠️ Не удалось сформировать разбор. Попробуйте чуть позже.")
+
+
 # -------------------------------------------------------------
 # АВТОПРОДАЖА И ПОДКЛЮЧЕНИЕ КОШЕЛЬКА POLYMARKET
 # -------------------------------------------------------------

@@ -88,6 +88,7 @@ _MORNING_BASELINES: Dict[str, dict] = {}
 _LAST_MORNING_DIGEST_DATE: Optional[str] = None
 _LAST_SENT_SLOT: Optional[str] = None
 _LAST_AUDIT_REPORT_DATE: Optional[str] = None
+_LAST_1900_BRIEFING_DATE: Optional[str] = None
 
 # Инлайн-кнопки быстрого анализа под сводным сообщением
 express_scan_keyboard = InlineKeyboardMarkup(
@@ -99,6 +100,9 @@ express_scan_keyboard = InlineKeyboardMarkup(
         [
             InlineKeyboardButton(text="🇮🇹 Милан LIMC", callback_data="express_scan:LIMC"),
             InlineKeyboardButton(text="🇪🇸 Мадрид LEMD", callback_data="express_scan:LEMD"),
+        ],
+        [
+            InlineKeyboardButton(text="🧭 Почему вне рынка?", callback_data="btn_why_standby"),
         ],
     ]
 )
@@ -1810,6 +1814,197 @@ async def run_position_monitor(bot: Bot) -> None:
             await asyncio.sleep(15)
 
 
+async def generate_midday_standby_briefing(
+    cities_metrics: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """
+    Формирует понятный синоптический отчет ожидания на 19:00 ХБР (почему бот пока вне рынка):
+    - По каждому рынку: местное время, температура, цель, цена, рейтинг надежности,
+      почему бот осторожничает, за чем следит прямо сейчас.
+    - Итог: где вероятнее всего зайдет бот при подтверждении условий, либо вердикт о защите капитала.
+    """
+    if not cities_metrics:
+        cities_metrics = []
+        for icao in TARGET_CITIES.keys():
+            try:
+                cm = await collect_city_metrics(icao)
+                cities_metrics.append(cm)
+            except Exception as e_c:
+                logger.debug(f"Не удалось собрать метрики для {icao} в брифинге: {e_c}")
+            await asyncio.sleep(0.05)
+
+    city_records: List[Dict[str, Any]] = []
+
+    for cm in cities_metrics:
+        if not cm or not isinstance(cm, dict):
+            continue
+        icao = cm.get("icao", "").strip().upper()
+        if not icao:
+            continue
+        city_name = cm.get("city_name") or TARGET_CITIES.get(icao, f"Локация {icao}")
+        temp_c = cm.get("temp_c")
+        local_dt = cm.get("local_dt")
+        time_str = local_dt.strftime("%H:%M") if local_dt else "утро"
+        raw_metar = cm.get("raw_metar", "")
+        rate_val = cm.get("rate_val", 0.0)
+        models = cm.get("models_max", {})
+        avg_peak = cm.get("avg_peak", 20.0)
+        orderbook = cm.get("orderbook", [])
+
+        target_val, priority_name = _get_priority_target(
+            icao, models, avg_peak, raw_metar, local_dt=local_dt
+        )
+        target_strike = get_strike_for_temp(target_val)
+        strike_str = f"{target_strike}°C"
+
+        matched_item = next((item for item in orderbook if item.get("temp") == target_strike), None)
+        price_cents = float(matched_item.get("price_cents", 0.0)) if matched_item else 0.0
+        price_str = f"{price_cents:.0f} центов" if price_cents > 0 else "нет в стакане"
+
+        local_hour = (local_dt.hour + (local_dt.minute / 60.0)) if local_dt else 12.0
+        conf_score, conf_label, conf_reasons = calculate_candidate_confidence(
+            icao, models, raw_metar, target_strike, price_cents, rate_val, local_hour
+        )
+
+        has_rain = is_blocking_rain_and_clouds(raw_metar) or any(
+            w in raw_metar for w in ["-RA", " RA", "+RA", "-DZ", " DZ", "+DZ", "SHRA", "TSRA"]
+        )
+        has_stratus = has_real_low_cloud(raw_metar)
+
+        valid_model_vals = [float(v) for v in models.values() if isinstance(v, (int, float))]
+        model_spread = (max(valid_model_vals) - min(valid_model_vals)) if len(valid_model_vals) >= 2 else 0.0
+
+        is_clear = any(c in raw_metar for c in ["CAVOK", "CLR", "SKC"])
+        max_allowed_gap = 9.5 if (is_clear or icao == "LEMD") else 5.0
+        temp_gap = (target_strike - temp_c) if temp_c is not None else 0.0
+
+        if has_rain:
+            obstacle = "В утренней сводке зафиксированы осадки (дождь/морось). Испарение влаги с поверхности охлаждает приземный воздух и блокирует прогрев."
+            watching = "Прекратятся ли осадки к полудню и начнет ли подсыхать полоса для старта прогрева."
+            watching_short = "прекратятся осадки"
+        elif has_stratus:
+            obstacle = "Низкая плотная облачность (Stratus, потолок ниже 2500 ft). Облака экранируют прямое солнце и срезают дневной максимум."
+            watching = "Рассеется ли нижний ярус облаков к полудню."
+            watching_short = "рассеется облачность"
+        elif model_spread >= 2.0:
+            min_m = min(valid_model_vals)
+            max_m = max(valid_model_vals)
+            obstacle = f"Погодные модели устроили жесткий спор: разброс прогнозов целых {model_spread:.1f}°C (от {min_m:.1f}°C до {max_m:.1f}°C). Входить в сделку при таком рассинхроне — чистая рулетка."
+            watching = "К какому модельному сценарию склонится реальный тренд температуры к 12:00-13:00 местного времени."
+            watching_short = "разрешится спор моделей"
+        elif 0 < price_cents < 20.0:
+            obstacle = f"Нужный исход на бирже стоит всего {price_cents:.0f}¢ (дешевле минимального порога 20¢). Сама биржа пока почти не верит в этот прогрев, ликвидность слабая."
+            watching = "Появится ли реальный покупательский спрос в стакане по мере потепления."
+            watching_short = "подтянется спрос в стакане"
+        elif price_cents > 64.0:
+            obstacle = f"Контракт уже перегрет ({price_cents:.0f}¢, выше потолка 64¢). Потенциал прибыли мал, а риск отката при паузе прогрева слишком велик."
+            watching = "Возможный откат цены в стакане для безопасного входа или возможность взять соседний страйк."
+            watching_short = "скорректируется цена"
+        elif temp_c is not None and temp_gap > max_allowed_gap:
+            obstacle = f"Утром еще прохладно (дистанция до цели целых {temp_gap:.1f}°C при допустимом лимите {max_allowed_gap:.1f}°C). Бот выжидает, чтобы не ловить нож."
+            watching = "Набор устойчивого темпа прогрева в часы максимальной инсоляции (11:30–13:30 LT)."
+            watching_short = "ускорится дневной прогрев"
+        elif rate_val < 0.3 and temp_gap > 2.0:
+            obstacle = f"Утренний темп прогрева пока слабый ({rate_val:+.1f}°C/ч). Воздух греется медленнее расчетного графика."
+            watching = "Пойдет ли ускорение прироста температуры в следующих метеосводках."
+            watching_short = "ускорится темп прогрева"
+        elif conf_score < 70.0:
+            obstacle = f"Рейтинг надежности {conf_score:.0f} из 100 — немного не дотягивает до нашего строгого порога 70."
+            watching = "Ближайшие замеры, чтобы убедиться, что утренний темп солнца реально пошел вверх, а не застрял."
+            watching_short = "подтвердится стабильность прогрева"
+        elif temp_c is not None and temp_c >= target_strike:
+            obstacle = f"Целевая планка {target_strike}°C уже взята ({temp_c:.1f}°C), время раннего входа завершено."
+            watching = "Фиксацию дневного максимума."
+            watching_short = "зафиксируется максимум"
+        else:
+            obstacle = "Бот перепроверяет синоптическую устойчивость перед открытием сделки."
+            watching = "Подтверждение условий."
+            watching_short = "подтвердятся условия"
+
+        city_records.append({
+            "icao": icao,
+            "city_name": city_name,
+            "time_str": time_str,
+            "temp_c": temp_c,
+            "target_strike": target_strike,
+            "price_cents": price_cents,
+            "price_str": price_str,
+            "conf_score": conf_score,
+            "obstacle": obstacle,
+            "watching": watching,
+            "watching_short": watching_short,
+            "has_rain": has_rain,
+            "has_stratus": has_stratus,
+        })
+
+    if not city_records:
+        return "🧭 <b>СТАТУС ПО ТОРГАМ НА 19:00 ХБР</b>\n\n<i>Нет доступных данных по метеостанциям.</i>"
+
+    lines = [
+        "🧭 <b>СТАТУС ПО ТОРГАМ НА 19:00 ХБР | ПОЧЕМУ БОТ ПОКА ВНЕ РЫНКА</b>\n",
+        "<i>К 19:00 по Хабаровску бот защищает депозит и пока не открыл сделок, так как ни один рынок не удовлетворил строгому порогу надежности (70/100). Разбор ситуации по рынкам:</i>\n",
+    ]
+
+    for rec in city_records:
+        temp_display = f"{rec['temp_c']:.1f}°C" if rec['temp_c'] is not None else "Н/Д"
+        lines.append(
+            f"<b>{rec['city_name']}</b> (сейчас {rec['time_str']}, {temp_display}):\n"
+            f"• <b>Цель:</b> {rec['target_strike']}°C | <b>Цена в стакане:</b> {rec['price_str']}\n"
+            f"• <b>Рейтинг надежности:</b> {rec['conf_score']:.0f} из 100\n"
+            f"• <b>Почему бот осторожничает:</b> {rec['obstacle']}\n"
+            f"• <b>За чем следит:</b> {rec['watching']}\n"
+        )
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    clean_cands = [r for r in city_records if not r["has_rain"] and not r["has_stratus"]]
+    eval_cands = clean_cands if clean_cands else city_records
+    best_cand = max(eval_cands, key=lambda x: x["conf_score"])
+
+    if best_cand["conf_score"] >= 45 and not best_cand["has_rain"]:
+        lines.append(
+            f"🎯 <b>Наиболее вероятная точка входа:</b>\n"
+            f"<b>{best_cand['city_name']}</b> — наивысшая надежность среди рынков: <b>{best_cand['conf_score']:.0f}/100</b> "
+            f"(цель: <code>{best_cand['target_strike']}°C</code> по <code>{best_cand['price_cents']:.0f}¢</code>).\n"
+            f"<i>Если в ближайшие 1-2 часа {best_cand['watching_short']}, бот рассмотрит открытие позиции.</i>"
+        )
+    else:
+        lines.append(
+            "🎯 <b>Наиболее вероятная точка входа:</b>\n"
+            "<i>На данный момент условия на всех рынках остаются высокорискованными (спор моделей, облачность или осадки). "
+            "Бот сохраняет депозит и ждет идеального сетапа.</i>"
+        )
+
+    deterministic_text = "\n".join(lines)
+
+    try:
+        from gemini_analyzer import ask_gemini_model, is_gemini_configured
+        if is_gemini_configured():
+            prompt = (
+                "Ты — Weather Alpha Bot: робот погодных рынков. На часах 19:00 по Хабаровску. "
+                "За утреннюю сессию ты не открыл сделок, защищая депозит трейдера от рисков.\n"
+                "Сформируй для трейдера в Telegram разбор ситуации ПРОСТЫМ ЧЕЛОВЕЧЕСКИМ ЯЗЫКОМ БЕЗ КОДА И ЖАРГОНА.\n"
+                "Структура:\n"
+                "🧭 <b>СТАТУС ПО ТОРГАМ НА 19:00 ХБР | ПОЧЕМУ БОТ ПОКА ВНЕ РЫНКА</b>\n"
+                "Краткое введение (1 предложение: бот сохраняет депозит, ждет надежности).\n"
+                "По каждому городу:\n"
+                "Флаг Город (местное время, температура):\n"
+                "• Цель X°C | Цена: Y центов | Рейтинг: Z из 100\n"
+                "• Почему осторожничает: (объясни человеческим языком причину)\n"
+                "• За чем следит: (что выжидает прямо сейчас)\n\n"
+                "В конце блок:\n"
+                "🎯 <b>Наиболее вероятная точка входа:</b> (город-фаворит, условия входа или защита депозита).\n\n"
+                f"ФАКТИЧЕСКИЕ ДАННЫЕ:\n{deterministic_text}"
+            )
+            ai_resp = await asyncio.wait_for(ask_gemini_model(prompt, scenario="БРИФИНГ_ОЖИДАНИЯ"), timeout=5.0)
+            if ai_resp and len(ai_resp.strip()) > 150:
+                return sanitize_telegram_html(ai_resp.strip())
+    except Exception as ai_err:
+        logger.debug(f"Gemini briefing fallback: {ai_err}")
+
+    return sanitize_telegram_html(deterministic_text)
+
+
 async def send_consolidated_digest(
     bot: Bot,
     cities_metrics: List[Dict[str, Any]],
@@ -1878,10 +2073,18 @@ async def send_consolidated_digest(
         if p.get("user_id"):
             recipients.add(p["user_id"])
 
+    briefing_text_1900: Optional[str] = None
+    if now_khv.hour == 19 and now_khv.minute in (2, 3):
+        try:
+            briefing_text_1900 = await generate_midday_standby_briefing(cities_metrics)
+        except Exception as e_br:
+            logger.error(f"Не удалось подготовить брифинг ожидания на 19:00 ХБР: {e_br}")
+
     for uid in recipients:
         user_pos_list = [p for p in active_positions if p.get("user_id") == uid]
         if not user_pos_list:
-            await _safe_send_digest(bot, uid, default_msg, express_scan_keyboard)
+            msg_to_send = briefing_text_1900 if briefing_text_1900 else default_msg
+            await _safe_send_digest(bot, uid, msg_to_send, express_scan_keyboard)
         else:
             wallet = await asyncio.to_thread(get_user_wallet, uid)
             has_pk = bool(wallet and wallet.get("private_key"))
@@ -1947,7 +2150,7 @@ async def run_auto_scanner(bot: Bot) -> None:
     Работает в торговом окне 10:00 - 24:00 по времени Хабаровска (UTC+10).
     В 23:32 формирует и рассылает дневной аудиторский отчет и уходит в ночной сон до 10:02.
     """
-    global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT, _LAST_AUDIT_REPORT_DATE
+    global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT, _LAST_AUDIT_REPORT_DATE, _LAST_1900_BRIEFING_DATE
     logger.info("🚀 Консолидированный автосканер запущен (Окно: 10:00 - 24:00 ХБР, METAR: :02 и :32).")
 
     # Запускаем непрерывный высокочастотный мониторинг позиций (каждые 15 сек при наличии сделок)
