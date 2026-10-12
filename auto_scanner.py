@@ -1289,14 +1289,17 @@ def calculate_candidate_confidence(
         score += 10.0
 
     # 3. Ценовой диапазон токена в стакане
-    if 25.0 <= cand_price_cents <= 48.0:
+    if 25.0 <= cand_price_cents <= 58.0:
         score += 20.0
         reasons.append(f"Оптимальный диапазон входа ({cand_price_cents:.0f}¢)")
+    elif 58.0 < cand_price_cents <= 64.0:
+        score += 15.0
+        reasons.append(f"Высокая рыночная вероятность победы ({cand_price_cents:.0f}¢)")
     elif 18.0 <= cand_price_cents < 25.0:
         score += 10.0
         reasons.append(f"Дешевый токен с высоким плечом ({cand_price_cents:.0f}¢)")
-    elif cand_price_cents >= 65.0:
-        score -= 30.0
+    elif cand_price_cents > 64.0:
+        score -= 25.0
         reasons.append(f"Рынок перегрет маркетмейкером ({cand_price_cents:.0f}¢)")
     elif cand_price_cents < 15.0:
         score -= 20.0
@@ -1400,11 +1403,16 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                 )
                 continue
 
-            if temp_c is not None and (target_strike - temp_c) > 4.5:
+            # Максимально допустимый разрыв прогрева до цели:
+            # При ясном солнце (CAVOK/CLR) или для Мадрида (LEMD) дневной прогрев на Месете достигает 9-11°C
+            is_clear_sky = any(c in raw_metar for c in ["CAVOK", "CLR", "SKC"])
+            max_allowed_gap = 9.5 if (is_clear_sky or icao == "LEMD") else 5.0
+
+            if temp_c is not None and (target_strike - temp_c) > max_allowed_gap:
                 await asyncio.to_thread(
                     record_daily_action,
                     uid, "SKIP", icao, strike_str, 0.0,
-                    {"reason": f"Слишком большой разрыв до цели ({target_strike - temp_c:.1f}°C прогрева)"}
+                    {"reason": f"Слишком большой разрыв до цели ({target_strike - temp_c:.1f}°C прогрева, лимит {max_allowed_gap:.1f}°C)"}
                 )
                 continue
 
@@ -1426,12 +1434,12 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
             token_id = matched_item.get("token_id", "")
             title = matched_item.get("title", strike_str)
 
-            # Отсекаем неликвид дешевле 20¢ и перегретый рынок дороже 55¢
-            if price_cents < 20.0 or price_cents > 55.0:
+            # Отсекаем неликвид дешевле 20¢ и перегретый рынок дороже 64¢
+            if price_cents < 20.0 or price_cents > 64.0:
                 await asyncio.to_thread(
                     record_daily_action,
                     uid, "SKIP", icao, strike_str, price_cents,
-                    {"reason": f"Цена вне рабочего диапазона 20-55¢ ({price_cents:.0f}¢)"}
+                    {"reason": f"Цена вне рабочего диапазона 20-64¢ ({price_cents:.0f}¢)"}
                 )
                 continue
 
@@ -1567,7 +1575,7 @@ async def check_and_execute_auto_buy(bot: Bot, cities_metrics: List[Dict[str, An
                     wallet["private_key"],
                     cand["token_id"],
                     amount_usd=trade_cost,
-                    max_price=min(0.55, (cand["price_cents"] + 4.0) / 100.0),
+                    max_price=min(0.66, (cand["price_cents"] + 4.0) / 100.0),
                     proxy_address=proxy_addr,
                     signature_type=sig_type,
                 )
@@ -1893,7 +1901,7 @@ async def send_consolidated_digest(
                 if p_cur is None:
                     p_cur = p_entry if p_entry > 0 else 0.0
 
-                pnl_v = round(((p_cur - p_entry) / entry_price) * 100, 1) if p_entry > 0 else 0.0
+                pnl_v = round(((p_cur - p_entry) / p_entry) * 100, 1) if p_entry > 0 else 0.0
                 pnl_s = f"{'+' if pnl_v >= 0 else ''}{pnl_v:.0f}%"
 
                 pos_summary_lines.append(
