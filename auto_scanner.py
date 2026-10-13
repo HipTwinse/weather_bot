@@ -111,7 +111,15 @@ express_scan_keyboard = InlineKeyboardMarkup(
         ],
         [
             InlineKeyboardButton(text="🇯🇵 Токио RJTT", callback_data="express_scan:RJTT"),
+            InlineKeyboardButton(text="🇰🇷 Сеул RKSI", callback_data="express_scan:RKSI"),
+        ],
+        [
+            InlineKeyboardButton(text="🇹🇷 Анкара LTAC", callback_data="express_scan:LTAC"),
             InlineKeyboardButton(text="🧭 Почему вне рынка?", callback_data="btn_why_standby"),
+        ],
+        [
+            InlineKeyboardButton(text="📌 Мои позиции", callback_data="open_my_positions"),
+            InlineKeyboardButton(text="📊 Статистика", callback_data="view_trading_stats"),
         ],
     ]
 )
@@ -934,12 +942,11 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
             verdict = (
                 f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — После полудня темп затух под низкой облачностью, отставание от цели {target_temp - temp_c:.1f}°C критично!"
             )
-        # 4. Триггер Неблагоприятного отбора / Стоп-лосс (обвал стакана днем >= 8¢ или >= 30%):
-        elif entry_price > 0 and ((entry_price - cur_price) >= 8.0 or ((entry_price - cur_price) / entry_price >= 0.30 and (entry_price - cur_price) >= 5.0)) and local_time_val >= 10.0:
+        # 4. Триггер Неблагоприятного отбора (Adverse Selection — дневное падение цены на >= 8¢ в стакане):
+        elif entry_price > 0 and (entry_price - cur_price) >= 8.0 and local_time_val >= 10.5:
             drop_cents = entry_price - cur_price
-            drop_pct = (drop_cents / entry_price) * 100
             verdict = (
-                f"🛑 <b>ТРЕВОГА (ПАДЕНИЕ СТАКАНА: -{drop_cents:.0f}¢)</b> — Дневной обвал цены (сигнал слома погоды / adverse selection). Срочный сброс для спасения депозита!"
+                f"⚠️ <b>ТРЕВОГА (ПАДЕНИЕ СТАКАНА: -{drop_cents:.0f}¢)</b> — Рынок прайсит свежий радар (adverse selection). Проверь облачность и будь готов к выходу!"
             )
         # 5. Утреннее развитие и удержание:
         # ВАЖНО: До 12:30 LT утреннее замедление или высокая облачность НЕ инвалидируют позицию!
@@ -1214,8 +1221,19 @@ async def check_and_execute_auto_sell(
     elif 12.5 <= local_time_val <= heating_cutoff and (rate_val < 0.4 and has_real_low_cloud(raw_metar) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
         trigger_reason = "🛑 ПОГОДНЫЙ ПАРАШЮТ: Затухание темпа под плотной облачностью"
 
-    # Триггер Д: Стоп-лосс / Защита от неблагоприятного отбора (обвал стакана на >= 8¢ или >= 30% от цены входа после 10:00 LT)
-    elif entry_price > 0 and ((entry_price - cur_price) >= 8.0 or ((entry_price - cur_price) / entry_price >= 0.30 and (entry_price - cur_price) >= 5.0)) and local_time_val >= 10.0:
+    # Триггер Д: Стоп-лосс / Защита от неблагоприятного отбора (глубокий обвал стакана >= 15¢ и >= 35% при подтвержденном риске слома погоды)
+    elif (
+        entry_price > 0
+        and (entry_price - cur_price) >= 15.0
+        and (entry_price - cur_price) / entry_price >= 0.35
+        and local_time_val >= 11.5
+        and target_temp is not None
+        and temp_c is not None
+        and (
+            (temp_c >= target_temp and rate_val >= 0.6)
+            or (local_time_val >= 12.5 and (target_temp - temp_c) >= 1.5 and rate_val < 0.5)
+        )
+    ):
         drop_cents = entry_price - cur_price
         drop_pct = (drop_cents / entry_price) * 100
         trigger_reason = f"🛑 СТОП-ЛОСС (ОБВАЛ СТАКАНА НА -{drop_cents:.0f}¢ / -{drop_pct:.0f}%): Сброс позиции для спасения депозита (вход: {entry_price:.0f}¢, сейчас: {cur_price:.0f}¢)"

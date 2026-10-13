@@ -42,15 +42,22 @@ daily_max_records: Dict[str, float] = {}
 
 
 async def setup_bot_commands(bot: Bot) -> None:
-    """Регистрирует интерактивное меню команд Telegram."""
+    """Регистрирует полное синхронизированное меню команд Telegram."""
     commands = [
-        BotCommand(command="start", description="🚀 Главное меню и статус бота"),
+        BotCommand(command="start", description="🚀 Главное меню и кнопки управления"),
+        BotCommand(command="digest", description="🔄 Свежий сводный дайджест по городам"),
+        BotCommand(command="standby", description="🧭 Почему вне рынка? Разбор ожидания"),
+        BotCommand(command="positions", description="📌 Мои открытые сделки и автопилот"),
+        BotCommand(command="stats", description="📊 Статистика торговли и винрейт"),
+        BotCommand(command="ai", description="🤖 AI-анализ погоды (Gemini)"),
+        BotCommand(command="cities", description="🌍 Избранные города (4 модели + METAR)"),
         BotCommand(command="scan", description="🔍 Сканировать маркет (Preddy / Polymarket)"),
-        BotCommand(command="ai", description="🤖 AI-анализ погоды (Gemini v7.4)"),
-        BotCommand(command="positions", description="📌 Мои открытые сделки"),
-        BotCommand(command="digest", description="🔄 Свежий сводный дайджест (4 города)"),
-        BotCommand(command="cities", description="🌍 Быстрый выбор избранных городов"),
-        BotCommand(command="help", description="📖 Справка и регламент v7.1"),
+        BotCommand(command="wallet", description="👛 Мой кошелек и баланс Polymarket"),
+        BotCommand(command="mode", description="⚡/🧪 Переключить режим (Боевой / Тест)"),
+        BotCommand(command="report", description="📄 Скачать аудиторский отчет за день"),
+        BotCommand(command="sync", description="🔄 Синхронизировать сделки с Polymarket"),
+        BotCommand(command="open", description="➕ Добавить сделку на автопилот"),
+        BotCommand(command="help", description="📖 Справка по всем командам и кнопкам"),
     ]
     try:
         await bot.set_my_commands(commands)

@@ -131,15 +131,27 @@ class AddPositionStates(StatesGroup):
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
-            KeyboardButton(text="🔍 Сканировать маркет"),
-            KeyboardButton(text="🤖 AI Аналитик"),
+            KeyboardButton(text="🔄 Свежий дайджест"),
+            KeyboardButton(text="🧭 Почему вне рынка?"),
         ],
         [
             KeyboardButton(text="📌 Мои позиции"),
             KeyboardButton(text="📊 Статистика"),
         ],
         [
+            KeyboardButton(text="🤖 AI Аналитик"),
             KeyboardButton(text="🌍 Избранные города"),
+        ],
+        [
+            KeyboardButton(text="🔍 Сканировать маркет"),
+            KeyboardButton(text="👛 Мой кошелек"),
+        ],
+        [
+            KeyboardButton(text="⚡/🧪 Режим торговли"),
+            KeyboardButton(text="📄 Отчет за день"),
+        ],
+        [
+            KeyboardButton(text="➕ Добавить сделку"),
             KeyboardButton(text="📖 Справка / Команды"),
         ],
     ],
@@ -902,10 +914,12 @@ async def cmd_start(message: Message, state: FSMContext):
     register_subscriber(message.from_user.id, message.from_user.username or "")
     welcome_text = (
         "👋 <b>Weather Alpha Engine v8.0 активен!</b>\n\n"
-        "🤖 <b>AI-Квант-Синоптик:</b> Нажми <b>«🤖 AI Аналитик»</b> или отправь /ai для полного нейросетевого разбора (Gemini).\n"
-        "🔍 <b>Сканер маркетов:</b> Нажми <b>«🔍 Сканировать маркет»</b> и отправь ссылку с Preddy / Polymarket.\n"
-        "📌 <b>Мои позиции:</b> Нажми <b>«📌 Мои позиции»</b> для контроля открытых сделок и PnL.\n"
-        "🌍 <b>Города:</b> Нажми <b>«🌍 Избранные города»</b> или отправь 4-значный ICAO-код (<code>EGLC</code>, <code>KJFK</code>)."
+        "🔄 <b>Свежий дайджест (/digest):</b> Сводка по 6 городам и твоим сделкам прямо сейчас.\n"
+        "🧭 <b>Почему вне рынка? (/standby):</b> Разбор, чего ждет бот и где готовит вход.\n"
+        "📌 <b>Мои позиции (/positions):</b> Контроль открытых сделок, PnL и режим торговли.\n"
+        "📊 <b>Статистика (/stats):</b> Винрейт, прибыль и история закрытых сделок.\n"
+        "🤖 <b>AI Аналитик (/ai):</b> Полный разбор города нейросетью со стаканом цен.\n"
+        "👛 <b>Мой кошелек (/wallet):</b> Баланс USDC, синхронизация (/sync) и статус автопродажи."
     )
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=main_keyboard)
 
@@ -915,12 +929,19 @@ async def cmd_start(message: Message, state: FSMContext):
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
     help_text = (
-        "📖 <b>Справка и регламент Weather Alpha Engine v8.0:</b>\n\n"
-        "1. <b>🤖 AI Квант-Синоптик (/ai):</b> Мгновенный глубокий нейросетевой анализ (Gemini v8.0) по любому городу с разбором микрофизики и цен стакана.\n"
-        "2. <b>🔍 Сканер маркета (/scan):</b> Отправь ссылку с Preddy/Polymarket — расчет сайзинга банкролла, безопасного коридора и генерация RAW Data Package.\n"
-        "3. <b>📌 Мои позиции (/positions):</b> Мониторинг PnL открытых сделок, расчет темпа прогрева, триггеры Тейк-Профита (+35% / 60¢) и Тайм-Стопа (13:30 LT).\n"
-        "4. <b>🔄 Консолидированный автосканер:</b> Каждые полчаса (:02 и :32) с 10:00 до 00:00 ХБР автоматическая рассылка единой сводки.\n"
-        "5. <b>⚡ Ввод ICAO или координат:</b> Отправь <code>EGLC</code> или координаты (<code>48.52, 135.18</code>) для моментального отчета 4 моделей (ECMWF, GFS, ICON, GEM)."
+        "📖 <b>Все команды и кнопки Weather Alpha Engine v8.0 (полная синхронизация):</b>\n\n"
+        "• <b>🔄 Свежий дайджест</b> или /digest — мгновенная сводка по всем городам\n"
+        "• <b>🧭 Почему вне рынка?</b> или /standby — почему бот ждет и какие условия нужны для входа\n"
+        "• <b>📌 Мои позиции</b> или /positions — открытые сделки (реальные и бумажные)\n"
+        "• <b>📊 Статистика</b> или /stats — общий счет побед/поражений и PnL\n"
+        "• <b>🤖 AI Аналитик</b> или /ai — глубокий AI-разбор любого города\n"
+        "• <b>🌍 Избранные города</b> или /cities — быстрый опрос метеостанций (METAR)\n"
+        "• <b>🔍 Сканировать маркет</b> или /scan — разбор ссылки с Polymarket / Preddy\n"
+        "• <b>👛 Мой кошелек</b> или /wallet — баланс, статус автопилота и синхронизация (/sync)\n"
+        "• <b>⚡/🧪 Режим торговли</b> или /mode — переключение Боевой / Тестовый режим\n"
+        "• <b>📄 Отчет за день</b> или /report — скачать полный файл логов за день\n"
+        "• <b>➕ Добавить сделку</b> или /open — взять сделку под защиту вручную\n"
+        "• /set_key и /set_wallet — привязка кошелька для автоторговли или мониторинга"
     )
     await message.answer(help_text, parse_mode="HTML", reply_markup=main_keyboard)
 
@@ -1129,6 +1150,10 @@ def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         InlineKeyboardButton(text=mode_btn, callback_data="toggle_trading_mode"),
         InlineKeyboardButton(text="📊 Статистика", callback_data="view_trading_stats"),
     ])
+    buttons.append([
+        InlineKeyboardButton(text="👛 Мой кошелек", callback_data="open_my_wallet"),
+        InlineKeyboardButton(text="🔄 Синхронизировать", callback_data="sync_wallet_positions"),
+    ])
 
     if not real_positions and not paper_positions:
         text_sections.append(
@@ -1175,7 +1200,10 @@ def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
                     InlineKeyboardButton(text=f"🗑️ Сброс: {pos['icao']} ({p_out})", callback_data=f"del_pos:{pos['id']}"),
                 ])
 
-    buttons.append([InlineKeyboardButton(text="➕ Добавить сделку вручную", callback_data="add_new_pos")])
+    buttons.append([
+        InlineKeyboardButton(text="➕ Добавить сделку вручную", callback_data="add_new_pos"),
+        InlineKeyboardButton(text="📄 Отчет за день", callback_data="download_day_report"),
+    ])
     return "\n".join(text_sections), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1249,6 +1277,25 @@ async def cmd_my_positions(message: Message, state: FSMContext):
     await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
 
+@router.message(F.text == "⚡/🧪 Режим торговли", StateFilter("*"))
+@router.message(Command("mode"), StateFilter("*"))
+async def cmd_toggle_mode_direct(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    register_subscriber(user_id, message.from_user.username or "")
+    current_mode = get_trading_mode(user_id)
+    new_mode = "PAPER" if current_mode == "REAL" else "REAL"
+    set_trading_mode(user_id, new_mode)
+
+    if new_mode == "REAL":
+        notice = "⚡ <b>Режим переключен на БОЕВОЙ!</b>\nБот будет покупать проверенные исходы на баланс кошелька, а при нехватке денег — отправлять в бумажный учет.\n\n"
+    else:
+        notice = "🧪 <b>Режим переключен на ТЕСТ!</b>\nВсе последующие сделки будут открываться исключительно на бумаге без риска реальных денег.\n\n"
+
+    text, markup = _render_positions_view(user_id)
+    await message.answer(notice + text, parse_mode="HTML", reply_markup=markup)
+
+
 @router.callback_query(F.data == "toggle_trading_mode")
 async def process_toggle_trading_mode(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -1312,6 +1359,7 @@ async def process_download_day_report(callback: CallbackQuery):
     await callback.message.answer_document(document=doc_file, caption=caption, parse_mode="HTML")
 
 
+@router.message(F.text == "📄 Отчет за день", StateFilter("*"))
 @router.message(Command("report"), StateFilter("*"))
 @router.message(Command("day_report"), StateFilter("*"))
 async def cmd_download_day_report(message: Message, state: FSMContext):
@@ -1327,12 +1375,13 @@ async def cmd_download_day_report(message: Message, state: FSMContext):
     await message.answer_document(document=doc_file, caption=caption, parse_mode="HTML")
 
 
+@router.message(F.text == "🔄 Свежий дайджест", StateFilter("*"))
 @router.message(Command("digest"), StateFilter("*"))
 async def cmd_force_digest(message: Message, state: FSMContext):
-    """Выдает свежий 30-минутный сводный дайджест по 4 городам по прямому запросу пользователя."""
+    """Выдает свежий 30-минутный сводный дайджест по всем городам по прямому запросу пользователя."""
     await state.clear()
     register_subscriber(message.from_user.id, message.from_user.username or "")
-    status_msg = await message.answer("🔄 <i>Считываю актуальные сводки METAR и моделей по 4 городам...</i>", parse_mode="HTML")
+    status_msg = await message.answer("🔄 <i>Считываю актуальные сводки METAR и моделей по городам...</i>", parse_mode="HTML")
     try:
         from auto_scanner import (
             collect_city_metrics,
@@ -1420,6 +1469,7 @@ async def cmd_force_digest(message: Message, state: FSMContext):
 
 
 
+@router.message(F.text == "🧭 Почему вне рынка?", StateFilter("*"))
 @router.message(Command("standby", "why"), StateFilter("*"))
 async def cmd_standby_explanation(message: Message, state: FSMContext):
     """Выдает подробный синоптический разбор: почему бот пока вне рынка, за чем следит и где вероятнее всего зайдет."""
@@ -1449,7 +1499,7 @@ async def cmd_standby_explanation(message: Message, state: FSMContext):
 @router.callback_query(F.data == "btn_why_standby")
 async def process_why_standby_callback(callback: CallbackQuery):
     """Обработка кнопки '🧭 Почему вне рынка?' под дайджестом."""
-    await callback.answer("⏳ Анализирую ситуацию по 4 рынкам...")
+    await callback.answer("⏳ Анализирую ситуацию по рынкам...")
     try:
         from auto_scanner import (
             collect_city_metrics,
@@ -1572,6 +1622,7 @@ async def cmd_set_wallet(message: Message):
     await _handle_public_wallet_input(message, args[1].strip())
 
 
+@router.message(F.text == "🔄 Синхронизация", StateFilter("*"))
 @router.message(Command("sync"), StateFilter("*"))
 async def cmd_sync(message: Message):
     register_subscriber(message.from_user.id, message.from_user.username or "")
@@ -1583,21 +1634,34 @@ async def cmd_sync(message: Message):
         await status_msg.edit_text("✅ <b>Синхронизация завершена.</b> Все открытые сделки уже под защитой сканера.", parse_mode="HTML")
 
 
-@router.message(Command("wallet"), StateFilter("*"))
-async def cmd_check_wallet(message: Message):
-    register_subscriber(message.from_user.id, message.from_user.username or "")
-    await sync_user_polymarket_positions(message.from_user.id)
-    wallet = get_user_wallet(message.from_user.id)
+@router.callback_query(F.data == "sync_wallet_positions")
+async def process_sync_wallet_positions(callback: CallbackQuery):
+    await callback.answer("🔄 Синхронизирую позиции с Polymarket...")
+    count = await sync_user_polymarket_positions(callback.from_user.id)
+    text, markup = _render_positions_view(callback.from_user.id)
+    note = f"\n\n✅ <i>Синхронизация завершена (новых позиций: {count}).</i>"
+    try:
+        await callback.message.edit_text(text + note, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        await callback.message.answer(text + note, parse_mode="HTML", reply_markup=markup)
+
+
+def _render_wallet_view(user_id: int) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    wallet = get_user_wallet(user_id)
     if not wallet:
-        await message.answer(
+        text = (
             "👛 <b>Кошелек не подключен.</b>\n\n"
             "• Чтобы бот отслеживал твои позиции и присылал сигналы на продажу:\n"
             "  <code>/set_wallet &lt;твой_публичный_EVM_адрес&gt;</code>\n\n"
             "• Чтобы бот сам автоматически закрывал сделки на бирже:\n"
-            "  <code>/set_key &lt;твой_приватный_ключ_из_Predy&gt;</code>",
-            parse_mode="HTML",
+            "  <code>/set_key &lt;твой_приватный_ключ_из_Predy&gt;</code>"
         )
-        return
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="« Назад к позициям", callback_data="back_to_positions")]
+            ]
+        )
+        return text, kb
 
     address = wallet["wallet_address"]
     proxy_address = wallet.get("proxy_address") or resolve_polymarket_proxy(address) or address
@@ -1616,16 +1680,39 @@ async def cmd_check_wallet(message: Message):
         addr_info.append("• <b>Статус:</b> 🟡 <b>Радарный мониторинг (сигналы на продажу в Telegram)</b>")
 
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="🔌 Отключить кошелек", callback_data="disconnect_wallet_confirm")
-        ]]
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Синхронизировать сделки", callback_data="sync_wallet_positions"),
+                InlineKeyboardButton(text="📌 Мои позиции", callback_data="back_to_positions"),
+            ],
+            [
+                InlineKeyboardButton(text="🔌 Отключить кошелек", callback_data="disconnect_wallet_confirm"),
+            ],
+        ]
     )
-    await message.answer(
-        f"👛 <b>ПОДКЛЮЧЕННЫЙ КОШЕЛЕК POLYMARKET:</b>\n\n"
-        + "\n".join(addr_info),
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
+    text = "👛 <b>ПОДКЛЮЧЕННЫЙ КОШЕЛЕК POLYMARKET:</b>\n\n" + "\n".join(addr_info)
+    return text, kb
+
+
+@router.message(F.text == "👛 Мой кошелек", StateFilter("*"))
+@router.message(Command("wallet"), StateFilter("*"))
+async def cmd_check_wallet(message: Message, state: FSMContext):
+    await state.clear()
+    register_subscriber(message.from_user.id, message.from_user.username or "")
+    await sync_user_polymarket_positions(message.from_user.id)
+    text, kb = _render_wallet_view(message.from_user.id)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "open_my_wallet")
+async def process_open_my_wallet(callback: CallbackQuery):
+    await callback.answer()
+    await sync_user_polymarket_positions(callback.from_user.id)
+    text, kb = _render_wallet_view(callback.from_user.id)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @router.callback_query(F.data == "disconnect_wallet_confirm")
@@ -1637,35 +1724,41 @@ async def process_disconnect_wallet_callback(callback: CallbackQuery):
     )
 
 
+@router.message(F.text.in_(["➕ Добавить сделку", "➕ Добавить сделку вручную"]), StateFilter("*"))
 @router.message(Command("open"), StateFilter("*"))
-async def cmd_quick_open_position(message: Message):
+async def cmd_quick_open_position(message: Message, state: FSMContext):
     """
     Быстрое добавление сделки: /open <город> <страйк> <цена_входа>
-    Например: /open Милан 23 35
+    Или интерактивный выбор кнопками, если вызвано без параметров или через кнопку.
     """
-    args = (message.text or "").split()[1:]
+    raw_text = (message.text or "").strip()
+    args = raw_text.split()[1:] if raw_text.startswith("/") else []
     if len(args) < 2:
+        await state.set_state(AddPositionStates.waiting_for_city)
         await message.answer(
-            "📌 <b>Быстрое взятие сделки на автопилот:</b>\n\n"
-            "Формат команды:\n"
-            "<code>/open &lt;город&gt; &lt;градус&gt; &lt;цена_входа_в_центах&gt;</code>\n\n"
-            "<i>Пример:</i> <code>/open Милан 23 35</code>\n"
-            "<i>Пример:</i> <code>/open Лондон 25 18</code>",
+            "🌍 <b>Шаг 1 из 2: Выбери город для добавления сделки в 1 клик:</b>\n\n"
+            "<i>(Или отправь быстрой командой: <code>/open Сеул 21 35</code>)</i>",
             parse_mode="HTML",
+            reply_markup=position_city_keyboard,
         )
         return
 
     city_raw = args[0].strip().lower()
     city_map = {
+        "токио": "RJTT", "tokyo": "RJTT", "rjtt": "RJTT",
+        "сеул": "RKSI", "seoul": "RKSI", "rksi": "RKSI",
+        "анкара": "LTAC", "ankara": "LTAC", "ltac": "LTAC",
         "лондон": "EGLC", "london": "EGLC", "eglc": "EGLC",
         "париж": "LFPB", "paris": "LFPB", "lfpb": "LFPB",
         "милан": "LIMC", "milan": "LIMC", "limc": "LIMC",
         "мадрид": "LEMD", "madrid": "LEMD", "lemd": "LEMD",
+        "мюнхен": "EDDM", "munich": "EDDM", "eddm": "EDDM",
+        "нью-йорк": "KJFK", "new-york": "KJFK", "kjfk": "KJFK",
     }
     icao = city_map.get(city_raw, "EGLC")
     strike_val = extract_temp_value(args[1])
     if strike_val is None:
-        await message.answer("❌ Не удалось распознать градус. Пример: <code>/open Милан 23 35</code>", parse_mode="HTML")
+        await message.answer("❌ Не удалось распознать градус. Пример: <code>/open Сеул 21 35</code>", parse_mode="HTML")
         return
 
     entry_price = float(extract_temp_value(args[2]) or 0.0) if len(args) >= 3 else 35.0
