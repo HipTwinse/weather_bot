@@ -1287,6 +1287,12 @@ async def cmd_toggle_mode_direct(message: Message, state: FSMContext):
     new_mode = "PAPER" if current_mode == "REAL" else "REAL"
     set_trading_mode(user_id, new_mode)
 
+    try:
+        from state_sync import sync_state_to_telegram
+        await sync_state_to_telegram(message.bot)
+    except Exception:
+        pass
+
     if new_mode == "REAL":
         notice = "⚡ <b>Режим переключен на БОЕВОЙ!</b>\nБот будет покупать проверенные исходы на баланс кошелька, а при нехватке денег — отправлять в бумажный учет.\n\n"
     else:
@@ -1302,6 +1308,12 @@ async def process_toggle_trading_mode(callback: CallbackQuery):
     current_mode = get_trading_mode(user_id)
     new_mode = "PAPER" if current_mode == "REAL" else "REAL"
     set_trading_mode(user_id, new_mode)
+
+    try:
+        from state_sync import sync_state_to_telegram
+        await sync_state_to_telegram(callback.bot)
+    except Exception:
+        pass
 
     if new_mode == "REAL":
         notice = "⚡ Режим переключен на БОЕВОЙ!\nБот будет покупать проверенные исходы на баланс кошелька, а при нехватке денег — отправлять в бумажный учет."
@@ -1786,6 +1798,11 @@ async def cmd_quick_open_position(message: Message, state: FSMContext):
         entry_price=entry_price,
         token_id=token_id,
     )
+    try:
+        from state_sync import sync_state_to_telegram
+        await sync_state_to_telegram(message.bot)
+    except Exception:
+        pass
 
     wallet = get_user_wallet(message.from_user.id)
     has_pk = bool(wallet and wallet.get("private_key"))
@@ -1895,6 +1912,11 @@ async def process_quick_pick_pos(callback: CallbackQuery, state: FSMContext):
         entry_price=price_cents,
         token_id=token_id,
     )
+    try:
+        from state_sync import sync_state_to_telegram
+        await sync_state_to_telegram(callback.bot)
+    except Exception:
+        pass
 
     wallet = get_user_wallet(callback.from_user.id)
     has_pk = bool(wallet and wallet.get("private_key"))
@@ -1959,6 +1981,11 @@ async def process_pos_outcomes_input(message: Message, state: FSMContext):
         entry_price=entry_price,
         token_id=token_id,
     )
+    try:
+        from state_sync import sync_state_to_telegram
+        await sync_state_to_telegram(message.bot)
+    except Exception:
+        pass
 
     await state.clear()
     city_name = ALL_RADAR_CITIES.get(icao, icao)
@@ -2024,6 +2051,11 @@ async def process_del_pos_callback(callback: CallbackQuery):
                 logger.error(f"Ошибка ручного сброса позиции на бирже: {e_sell}")
 
     delete_position(pos_id, callback.from_user.id)
+    try:
+        from state_sync import sync_state_to_telegram
+        await sync_state_to_telegram(callback.bot)
+    except Exception:
+        pass
 
     if is_paper_trade:
         await callback.answer("✅ Бумажная сделка удалена из учета.", show_alert=True)

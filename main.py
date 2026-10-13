@@ -122,6 +122,17 @@ async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -
             await bot.delete_webhook(drop_pending_updates=True)
             await setup_bot_commands(bot)
 
+            # Восстановление базы данных и активных сделок из облачного сейфа Telegram
+            try:
+                from state_sync import restore_state_from_telegram, sync_state_to_telegram
+                restored = await restore_state_from_telegram(bot)
+                if restored:
+                    logger.info("💾 Состояние успешно восстановлено из облачного сейфа Telegram.")
+                else:
+                    await sync_state_to_telegram(bot)
+            except Exception as e_safe:
+                logger.warning(f"Ошибка инициализации облачного сейфа: {e_safe}")
+
             # Запуск автосканера и Keep-Alive пингера Render
             scanner_task = asyncio.create_task(run_auto_scanner(bot))
             keepalive_task = asyncio.create_task(render_keepalive_loop())

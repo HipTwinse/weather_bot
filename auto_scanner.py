@@ -1272,6 +1272,13 @@ async def check_and_execute_auto_sell(
             await bot.send_message(user_id, paper_notify, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление о закрытии бумажной сделки: {e}")
+
+        try:
+            from state_sync import sync_state_to_telegram
+            await sync_state_to_telegram(bot)
+        except Exception:
+            pass
+
         return trigger_reason
 
     # Проверяем наличие приватного ключа
@@ -1360,6 +1367,12 @@ async def check_and_execute_auto_sell(
             await bot.send_message(user_id, notify_text, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление об автопродаже: {e}")
+
+        try:
+            from state_sync import sync_state_to_telegram
+            await sync_state_to_telegram(bot)
+        except Exception:
+            pass
 
         return trigger_reason
     else:
@@ -1502,6 +1515,12 @@ async def check_and_execute_auto_buy(
             pass
 
     for uid in all_uids:
+        try:
+            from handlers import sync_user_polymarket_positions
+            await sync_user_polymarket_positions(uid)
+        except Exception as e_sync:
+            logger.debug(f"Синхронизация Polymarket перед автопокупкой: {e_sync}")
+
         wallet = await asyncio.to_thread(get_user_wallet, uid)
         mode = await asyncio.to_thread(get_trading_mode, uid)
         existing_positions = await asyncio.to_thread(get_user_positions, uid)
@@ -1884,6 +1903,12 @@ async def check_and_execute_auto_buy(
                     await bot.send_message(uid, paper_msg, parse_mode="HTML")
                 except Exception as err:
                     logger.debug(f"Не удалось отправить уведомление о бумажной сделке: {err}")
+
+        try:
+            from state_sync import sync_state_to_telegram
+            await sync_state_to_telegram(bot)
+        except Exception:
+            pass
 
 
 async def sync_all_subscribers_polymarket_positions() -> None:
