@@ -23,21 +23,49 @@ STATE_TAG = "#WEATHER_ALPHA_BACKUP:"
 
 
 def export_state_payload() -> str:
-    """Сериализует активные и недавние сделки в компактную сжатую строку base64."""
+    """Сериализует активные и недавние сделки, а также журнал действий в компактную сжатую строку base64."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        # Экспортируем все открытые сделки + закрытые за последние 3 дня
-        positions = [
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_actions_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action_type TEXT,
+                icao TEXT,
+                outcomes TEXT,
+                price REAL,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Все открытые сделки (критично для предотвращения потери активных позиций)
+        open_pos = [
             dict(r) for r in c.execute("""
                 SELECT id, user_id, icao, outcomes, target_date, entry_price, status,
                        shares, peak_price, trailing_active, token_id, last_alert,
                        is_paper, confidence_score, exit_price, exit_reason, pnl_cents, pnl_percent,
                        closed_at, created_at
                 FROM user_positions
-                ORDER BY id DESC LIMIT 40
+                WHERE status = 'OPEN'
+                ORDER BY id DESC
             """).fetchall()
         ]
+
+        # Недавние закрытые сделки (для непрерывного расчета винрейта)
+        closed_pos = [
+            dict(r) for r in c.execute("""
+                SELECT id, user_id, icao, outcomes, target_date, entry_price, status,
+                       shares, peak_price, trailing_active, token_id, last_alert,
+                       is_paper, confidence_score, exit_price, exit_reason, pnl_cents, pnl_percent,
+                       closed_at, created_at
+                FROM user_positions
+                WHERE status != 'OPEN'
+                ORDER BY id DESC LIMIT 25
+            """).fetchall()
+        ]
+
         wallets = [
             dict(r) for r in c.execute("""
                 SELECT user_id, wallet_address, proxy_address, signature_type, trading_mode
@@ -50,21 +78,36 @@ def export_state_payload() -> str:
                 FROM bot_subscribers
             """).fetchall()
         ]
+        actions = [
+            dict(r) for r in c.execute("""
+                SELECT id, user_id, action_type, icao, outcomes, price, details, created_at
+                FROM daily_actions_log
+                ORDER BY id DESC LIMIT 40
+            """).fetchall()
+        ]
 
-    payload = {
-        "version": 1,
-        "updated_at": datetime.now().isoformat(),
-        "positions": positions,
-        "wallets": wallets,
-        "subscribers": subscribers,
-    }
-    raw_bytes = json.dumps(payload, default=str, ensure_ascii=False).encode("utf-8")
-    compressed = base64.b64encode(zlib.compress(raw_bytes, 9)).decode("ascii")
+    # Динамический контроль размера под жесткий лимит сообщения Telegram (4096 символов)
+    for max_act, max_cl in [(40, 25), (25, 20), (15, 15), (0, 10)]:
+        sub_actions = actions[:max_act]
+        sub_positions = open_pos + closed_pos[:max_cl]
+        payload = {
+            "version": 1,
+            "updated_at": datetime.now().isoformat(),
+            "positions": sub_positions,
+            "wallets": wallets,
+            "subscribers": subscribers,
+            "daily_actions": sub_actions,
+        }
+        raw_bytes = json.dumps(payload, default=str, ensure_ascii=False).encode("utf-8")
+        compressed = base64.b64encode(zlib.compress(raw_bytes, 9)).decode("ascii")
+        if len(compressed) <= 3500:
+            return compressed
+
     return compressed
 
 
 def import_state_payload(b64_str: str) -> int:
-    """Десериализует сжатую строку и восстанавливает позиции и кошельки в SQLite."""
+    """Десериализует сжатую строку и восстанавливает позиции, кошельки и журнал в SQLite."""
     if not b64_str or not b64_str.strip():
         return 0
 
@@ -78,6 +121,7 @@ def import_state_payload(b64_str: str) -> int:
     positions = payload.get("positions", [])
     wallets = payload.get("wallets", [])
     subscribers = payload.get("subscribers", [])
+    daily_actions = payload.get("daily_actions", [])
 
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
@@ -123,9 +167,34 @@ def import_state_payload(b64_str: str) -> int:
                     ON CONFLICT(user_id) DO UPDATE SET is_active = excluded.is_active
                 """, (uid, s.get("username", ""), s.get("is_active", 1)))
 
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_actions_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action_type TEXT,
+                icao TEXT,
+                outcomes TEXT,
+                price REAL,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        for a in daily_actions:
+            a_id = a.get("id")
+            det = a.get("details")
+            det_str = det if isinstance(det, str) else json.dumps(det or {}, ensure_ascii=False)
+            c.execute("""
+                INSERT OR REPLACE INTO daily_actions_log (
+                    id, user_id, action_type, icao, outcomes, price, details, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                a_id, a.get("user_id", 0), a.get("action_type", ""), a.get("icao", ""),
+                a.get("outcomes", ""), a.get("price", 0.0), det_str, a.get("created_at")
+            ))
+
         conn.commit()
 
-    logger.info(f"✅ Восстановлено {len(positions)} записей из облачного сейфа.")
+    logger.info(f"✅ Восстановлено {len(positions)} сделок и {len(daily_actions)} записей журнала из облачного сейфа.")
     return len(positions)
 
 

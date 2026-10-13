@@ -748,6 +748,15 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
     skips_count = sum(1 for a in actions if a["action_type"] == "SKIP")
     errors = [a for a in actions if a["action_type"] == "ERROR"]
 
+    today_trades = [
+        r for r in stats.get("recent_trades", [])
+        if str(r.get("closed_at") or "").startswith(date_str) or r.get("target_date") == date_str
+    ]
+    today_pnl_usd = sum((float(t.get("pnl_cents") or 0.0) * float(t.get("shares") or 1.0)) / 100.0 for t in today_trades)
+    today_wins = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) > 0)
+    today_losses = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) <= 0)
+    sign_today = "+" if today_pnl_usd >= 0 else ""
+
     lines = [
         "=" * 80,
         " ДНЕВНОЙ АУДИТОРСКИЙ ОТЧЕТ ДЕЙСТВИЙ РОБОТА WEATHER ALPHA ENGINE",
@@ -763,6 +772,7 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
         f" • Оформлено бумажных тестов: {len(buys_paper)}",
         f" • Закрыто реальных сделок: {len(sells_real)}",
         f" • Закрыто бумажных тестов: {len(sells_paper)}",
+        f" • Дневной PnL (закрытые сегодня): {sign_today}${today_pnl_usd:.2f} USDC (Побед: {today_wins} | Потерь: {today_losses})",
         f" • Отклонено кандидатов (фильтры/скип): {skips_count}",
         f" • Ошибок биржи/отказов: {len(errors)}",
         "",
@@ -835,7 +845,8 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
                 lines.append(f"   Результат: PnL {det.get('pnl_str', '0%')}")
 
             elif atype == "SKIP":
-                lines.append(f"[{time_label} ХБР] ⛔ ПРОПУСК: {icao} ({outcomes}) — {det.get('reason', 'Низкая уверенность')}")
+                outcomes_str = f" ({outcomes})" if outcomes else ""
+                lines.append(f"[{time_label} ХБР] ⛔ ПРОПУСК: {icao}{outcomes_str} — {det.get('reason', 'Низкая уверенность')}")
 
             elif atype == "ERROR":
                 lines.append(f"\n[{time_label} ХБР] ⚠️ ОШИБКА БИРЖИ:")
