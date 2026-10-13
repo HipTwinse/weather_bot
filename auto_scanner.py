@@ -265,6 +265,27 @@ def get_seasonal_heating_cutoff(month: int, icao: str = "") -> Tuple[float, str]
         else:
             return 16.5, "Лето (Лондон)"
 
+    elif icao_upper == "LTAC":
+        # Анкара: высокое Анатолийское плато (~950 м), сухой воздух греется до 15:00-16:00 LT
+        if month in (12, 1, 2):
+            return 14.5, "Зима (Анкара)"
+        elif month in (10, 11, 3):
+            return 15.0, "Осень/Весна (Анкара)"
+        else:
+            return 16.5, "Лето (Анкара)"
+
+    elif icao_upper in ("RJTT", "RKSI"):
+        # Токио / Сеул: восточноазиатский муссонно-прибрежный профиль
+        city_tag = "Токио" if icao_upper == "RJTT" else "Сеул"
+        if month in (12, 1, 2):
+            return 14.0, f"Зима ({city_tag})"
+        elif month in (10, 11):
+            return 14.5, f"Осень ({city_tag})"
+        elif month in (9, 3):
+            return 15.0, f"Осень/Весна ({city_tag})"
+        else:
+            return 16.0, f"Лето ({city_tag})"
+
     # Базовый дефолтный профиль (Париж и общие европейские координаты)
     if month in (12, 1, 2):
         return 13.5, "Зима"
@@ -673,7 +694,18 @@ def get_priority_target(
     elif icao == "RJTT":
         # Токио (Ханеда): Морской бриз с залива или городской прогрев
         if icon_val is not None and ecm_val is not None:
-            base = round((icon_val + ecm_val) / 2.0, 1)
+            if abs(icon_val - ecm_val) >= 1.5:
+                vals = sorted(
+                    v for k, v in models.items()
+                    if v is not None and k in ("icon_global", "ecmwf_hres", "gfs_global", "gem_global")
+                )
+                if len(vals) >= 3:
+                    mid = len(vals) // 2
+                    base = round((vals[mid - 1] + vals[mid]) / 2.0, 1) if len(vals) % 2 == 0 else round(vals[mid], 1)
+                else:
+                    base = round((icon_val + ecm_val) / 2.0, 1)
+            else:
+                base = round((icon_val + ecm_val) / 2.0, 1)
         else:
             base = icon_val if icon_val is not None else (ecm_val if ecm_val is not None else avg_peak)
         if wdir is not None and 80 <= wdir <= 160 and wspd and wspd >= 8:
@@ -685,7 +717,18 @@ def get_priority_target(
     elif icao == "RKSI":
         # Сеул (Инчхон): островной аэропорт в Желтом море
         if icon_val is not None and ecm_val is not None:
-            base = round((icon_val + ecm_val) / 2.0, 1)
+            if abs(icon_val - ecm_val) >= 1.5:
+                vals = sorted(
+                    v for k, v in models.items()
+                    if v is not None and k in ("icon_global", "ecmwf_hres", "gfs_global", "gem_global")
+                )
+                if len(vals) >= 3:
+                    mid = len(vals) // 2
+                    base = round((vals[mid - 1] + vals[mid]) / 2.0, 1) if len(vals) % 2 == 0 else round(vals[mid], 1)
+                else:
+                    base = round((icon_val + ecm_val) / 2.0, 1)
+            else:
+                base = round((icon_val + ecm_val) / 2.0, 1)
         else:
             base = icon_val if icon_val is not None else avg_peak
         return base, f"ICON+ECMWF ({base:.1f}°C, Инчхон)"
@@ -748,6 +791,18 @@ def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[
         if favorite_candidate and favorite_candidate.get("price_cents", 0.0) >= 80.0:
             is_overheated = True
 
+    cand_conf = 0.0
+    if favorite_candidate:
+        cand_conf, _, _ = calculate_candidate_confidence(
+            icao=icao,
+            models=models,
+            raw_metar=raw_metar,
+            target_strike=target_strike,
+            cand_price_cents=float(favorite_candidate.get("price_cents", 0.0)),
+            rate_val=float(city_data.get("rate_val", 0.0)),
+            local_hour=local_dt.hour + local_dt.minute / 60.0,
+        )
+
     is_rain = is_blocking_rain_and_clouds(raw_metar)
     if is_rain:
         status_line = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> — Обложные осадки глушат дневную радиацию."
@@ -756,13 +811,13 @@ def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[
             "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
             "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
         )
-    elif favorite_candidate and 25.0 <= favorite_candidate["price_cents"] <= 48.0:
+    elif favorite_candidate and 20.0 <= favorite_candidate["price_cents"] <= 64.0 and cand_conf >= 70.0:
         fav_title = html.escape(str(favorite_candidate["title"]))
         local_time_val = local_dt.hour + local_dt.minute / 60.0
         entry_hint = "Сразу по рынку / в упор к Best Ask" if local_time_val >= 9.5 else "Утренняя лимитка в спред"
         status_line = (
             f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b>\n"
-            f"• Рекомендуемый исход: <code>{fav_title}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b>)\n"
+            f"• Рекомендуемый исход: <code>{fav_title}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b> | надежность <b>{cand_conf:.0f}/100</b>)\n"
             f"• Вход: {entry_hint} (днем просадки не высиживать!)\n"
             f"• Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи."
         )
@@ -857,8 +912,8 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
 
         target_temp = extract_temp_value(target_outcomes)
 
-        # 1. Триггер Тейк-Профита (Take-Profit Alert: PnL >= +35% или цена >= 60¢)
-        if (entry_price > 0 and (cur_price - entry_price) / entry_price >= 0.35) or cur_price >= 60.0:
+        # 1. Триггер Тейк-Профита (Take-Profit Alert: реальный профит >= +35% или >= +14¢, либо супер-цена >= 75¢)
+        if (entry_price > 0 and (((cur_price - entry_price) / entry_price >= 0.35 and (cur_price - entry_price) >= 10.0) or (cur_price - entry_price) >= 14.0)) or cur_price >= 75.0:
             verdict = (
                 f"🚨 <b>ТЕЙК-ПРОФИТ (ВЫХОДИ ЛИМИТКОЙ)</b> — Цель импульса закрыта ({pnl_str}). "
                 f"До экспирации не сидеть! Сбрасывай страйк по лимитке в стакан прямо сейчас!"
@@ -869,8 +924,8 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
             verdict = (
                 f"⏱️ <b>ТАЙМ-СТОП ({int(heating_cutoff)}:{cutoff_m:02d} LT)</b> — Сброс в рынок для спасения остаточной стоимости! Окно инсоляции закрыто, цель не пробита."
             )
-        # 3. Триггер Физического слома (обложные осадки / плотный Stratus):
-        elif is_blocking_rain_and_clouds(raw_metar):
+        # 3. Триггер Физического слома (обложные осадки / плотный Stratus при отставании от цели >= 1.5°C):
+        elif is_blocking_rain_and_clouds(raw_metar) and (target_temp is None or temp_c is None or (target_temp - temp_c) >= 1.5):
             verdict = (
                 f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — На станцию вышли обложные осадки / плотный низкий Stratus!"
             )
@@ -926,6 +981,18 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
             if fav_candidate and fav_candidate.get("price_cents", 0.0) >= 80.0:
                 is_overheated = True
 
+        cand_conf = 0.0
+        if fav_candidate:
+            cand_conf, _, _ = calculate_candidate_confidence(
+                icao=icao,
+                models=models,
+                raw_metar=raw_metar,
+                target_strike=target_strike,
+                cand_price_cents=float(fav_candidate.get("price_cents", 0.0)),
+                rate_val=rate_val,
+                local_hour=local_time_val,
+            )
+
         # 1. Раннее утро (LT < 09:00): расчет темпа не переводит в СКИП!
         if local_hour < 9:
             if has_blocking_weather:
@@ -948,12 +1015,12 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
                     "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
                     "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
                 )
-            elif fav_candidate and 25.0 <= fav_candidate["price_cents"] <= 48.0:
+            elif fav_candidate and 20.0 <= fav_candidate["price_cents"] <= 64.0 and cand_conf >= 70.0:
                 cand_title = html.escape(str(fav_candidate['title']))
                 entry_hint = "сразу по рынку" if local_time_val >= 9.5 else "утренняя лимитка в спред"
                 status_desc = (
                     f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b> "
-                    f"(Вход: <code>{cand_title}</code> {fav_candidate['price_cents']:.0f}¢, {entry_hint}. "
+                    f"(Вход: <code>{cand_title}</code> {fav_candidate['price_cents']:.0f}¢, надежность {cand_conf:.0f}/100, {entry_hint}. "
                     f"Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи)"
                 )
             elif rate_val >= 0.5:
@@ -970,12 +1037,12 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
                     "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
                     "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
                 )
-            elif fav_candidate and 25.0 <= fav_candidate["price_cents"] <= 48.0:
+            elif fav_candidate and 20.0 <= fav_candidate["price_cents"] <= 64.0 and cand_conf >= 70.0:
                 cand_title = html.escape(str(fav_candidate['title']))
                 entry_hint = "сразу по рынку" if local_time_val >= 9.5 else "утренняя лимитка в спред"
                 status_desc = (
                     f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b> "
-                    f"(Вход: <code>{cand_title}</code> {fav_candidate['price_cents']:.0f}¢, {entry_hint}. "
+                    f"(Вход: <code>{cand_title}</code> {fav_candidate['price_cents']:.0f}¢, надежность {cand_conf:.0f}/100, {entry_hint}. "
                     f"Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи)"
                 )
             else:
@@ -1112,9 +1179,9 @@ async def check_and_execute_auto_sell(
     heating_cutoff, _ = get_seasonal_heating_cutoff(local_dt.month, icao=icao)
     target_temp = extract_temp_value(target_outcomes)
 
-    # 1. Активация трейлинга: если цена выросла на >= 50% или достигла >= 55¢
+    # 1. Активация трейлинга: только при реальном профите от цены входа (+35% и >= +10¢, либо >= +14¢)
     if not trailing_active:
-        if (entry_price > 0 and (cur_price - entry_price) / entry_price >= 0.50) or cur_price >= 55.0:
+        if entry_price > 0 and (((cur_price - entry_price) / entry_price >= 0.35 and (cur_price - entry_price) >= 10.0) or (cur_price - entry_price) >= 14.0):
             trailing_active = 1
             await asyncio.to_thread(update_position_trailing, pos_id, peak_price, 1)
 
@@ -1127,8 +1194,8 @@ async def check_and_execute_auto_sell(
     if cur_price >= 75.0:
         trigger_reason = f"🚨 ТЕЙК-ПРОФИТ (ЦЕЛЬ ВЫШЕ 75¢): Цена в стакане {cur_price:.0f}¢, фиксация сверхприбыли"
 
-    # Триггер А: Трейлинг-выход (замок прибыли сработал на откате 5–6¢ от пика)
-    elif trailing_active and (peak_price - cur_price) >= 5.0 and cur_price > 0:
+    # Триггер А: Трейлинг-выход (замок прибыли сработал на откате 5–6¢ от пика, строго в плюсе относительно входа)
+    elif trailing_active and (peak_price - cur_price) >= 5.0 and cur_price > entry_price and cur_price > 0:
         trigger_reason = f"🎉 ТРЕЙЛИНГ-ТЕЙК (ЗАМОК ПРИБЫЛИ): Пик был {peak_price:.0f}¢, выход на откате по {cur_price:.0f}¢"
 
     # Триггер Б: Превышение температуры (цель пробита вверх, исход математически сгорел)
@@ -1140,8 +1207,8 @@ async def check_and_execute_auto_sell(
         cutoff_m = int((heating_cutoff % 1) * 60)
         trigger_reason = f"⏱️ СЕЗОННЫЙ ТАЙМ-СТОП ({int(heating_cutoff)}:{cutoff_m:02d} LT): Окно инсоляции завершено"
 
-    # Триггер Г: Погодный парашют (обложные осадки / плотный Stratus)
-    elif is_blocking_rain_and_clouds(raw_metar):
+    # Триггер Г: Погодный парашют (обложные осадки / плотный Stratus при отставании от цели >= 1.5°C)
+    elif is_blocking_rain_and_clouds(raw_metar) and (target_temp is None or temp_c is None or (target_temp - temp_c) >= 1.5):
         trigger_reason = "🛑 ПОГОДНЫЙ ПАРАШЮТ: Обложные осадки блокируют дневной прогрев"
     elif 12.5 <= local_time_val <= heating_cutoff and (rate_val < 0.4 and has_real_low_cloud(raw_metar) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
         trigger_reason = "🛑 ПОГОДНЫЙ ПАРАШЮТ: Затухание темпа под плотной облачностью"
@@ -1279,16 +1346,16 @@ async def check_and_execute_auto_sell(
     else:
         err_msg = str(order_id)
         logger.error(f"Сбой исполнения автопродажи для позиции {pos_id}: {err_msg}")
-        await asyncio.to_thread(
-            record_daily_action,
-            user_id, "ERROR", icao, target_outcomes, cur_price,
-            {
-                "error": f"Сбой автопродажи CLOB: {err_msg}",
-                "reason": trigger_reason,
-            }
-        )
         last_alert = str(pos.get("last_alert") or "")
         if f"SELL_FAIL_{err_msg}" != last_alert:
+            await asyncio.to_thread(
+                record_daily_action,
+                user_id, "ERROR", icao, target_outcomes, cur_price,
+                {
+                    "error": f"Сбой автопродажи CLOB: {err_msg}",
+                    "reason": trigger_reason,
+                }
+            )
             diag_text = (
                 f"⚠️ <b>ВНИМАНИЕ: СБОЙ АВТОПРОДАЖИ НА БИРЖЕ!</b>\n\n"
                 f"• <b>Локация:</b> {city_name} (<code>{target_outcomes}</code>)\n"

@@ -81,8 +81,8 @@ async def run_health_check_server() -> None:
 
 async def render_keepalive_loop() -> None:
     """
-    Периодически пингует внешний URL сервиса на Render каждые 9 минут (540 сек).
-    Предотвращает засыпание бесплатного инстанса Render (15-минутный таймаут).
+    Периодически пингует внешний URL сервиса на Render каждые 4 минуты (240 сек).
+    Предотвращает засыпание бесплатного инстанса Render (15-минутный таймаут) даже при одиночном пропуске сети.
     """
     external_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_URL")
     if not external_url and os.getenv("RENDER_EXTERNAL_HOSTNAME"):
@@ -92,21 +92,24 @@ async def render_keepalive_loop() -> None:
         return
 
     health_url = f"{external_url.rstrip('/')}/healthz"
-    logger.info(f"🔄 Запущен Keep-Alive пингер для Render: {health_url} (интервал 9 мин).")
+    logger.info(f"🔄 Запущен Keep-Alive пингер для Render: {health_url} (интервал 4 мин).")
 
+    await asyncio.sleep(60)
     while True:
-        await asyncio.sleep(540)  # 9 минут
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(health_url, timeout=15) as resp:
                     logger.debug(f"🏓 Self-Ping Render Keep-Alive: HTTP {resp.status}")
         except Exception as e:
             logger.warning(f"⚠️ Ошибка Self-Ping Keep-Alive: {e}")
+        await asyncio.sleep(240)  # 4 минуты
 
 
 async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -> None:
     """Запускает опрос Telegram API и фоновый сканер с защитой от разрыва сети."""
     for attempt in range(1, max_retries + 1):
+        scanner_task = None
+        keepalive_task = None
         try:
             logger.info(f"🔄 Подключение к Telegram API ({attempt}/{max_retries})...")
             await bot.delete_webhook(drop_pending_updates=True)
@@ -118,9 +121,6 @@ async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -
 
             logger.info("🚀 УСПЕШНО! Weather Alpha Engine v8.0 запущен и слушает команды.")
             await dp.start_polling(bot)
-
-            scanner_task.cancel()
-            keepalive_task.cancel()
             break
         except Exception as error:
             logger.warning(f"⚠️ Сбой связи с Telegram API: {error}")
@@ -128,6 +128,11 @@ async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -
                 await asyncio.sleep(3.0)
             else:
                 logger.error("❌ Превышен лимит попыток подключения к Telegram.", exc_info=True)
+        finally:
+            if scanner_task:
+                scanner_task.cancel()
+            if keepalive_task:
+                keepalive_task.cancel()
 
 
 async def main() -> None:

@@ -541,8 +541,8 @@ async def process_ai_city_callback(callback: CallbackQuery, state: FSMContext = 
         local_time_val = local_dt.hour + local_dt.minute / 60.0
 
         # Триггеры вердикта по открытой позиции:
-        # 1. Тейк-Профит: PnL >= +35% или цена токена в стакане >= 60¢
-        if (entry_price > 0 and (cur_price - entry_price) / entry_price >= 0.35) or cur_price >= 60.0:
+        # 1. Тейк-Профит: реальный профит >= +35% (и >= +10¢) или >= +14¢, либо цена токена >= 75¢
+        if (entry_price > 0 and (((cur_price - entry_price) / entry_price >= 0.35 and (cur_price - entry_price) >= 10.0) or (cur_price - entry_price) >= 14.0)) or cur_price >= 75.0:
             pos_verdict = (
                 f"🚨 <b>ТЕЙК-ПРОФИТ (ВЫХОДИ ЛИМИТКОЙ)</b> — Цель импульса закрыта ({pnl_str}). "
                 f"До экспирации не сидеть! Сбрасывай страйк по лимитке в стакан прямо сейчас!"
@@ -555,7 +555,7 @@ async def process_ai_city_callback(callback: CallbackQuery, state: FSMContext = 
         # 3. Физический слом:
         # До 12:30 LT утреннее замедление или высокая облачность НЕ инвалидируют позицию!
         elif local_time_val < 12.5:
-            if is_blocking_rain_and_clouds(raw_metar):
+            if is_blocking_rain_and_clouds(raw_metar) and (target_temp is None or temp_c is None or (target_temp - temp_c) >= 1.5):
                 pos_verdict = (
                     f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — На станцию вышли обложные осадки / плотный низкий Stratus!"
                 )
