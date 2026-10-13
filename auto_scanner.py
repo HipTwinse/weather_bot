@@ -52,6 +52,7 @@ from database import (
     get_user_positions,
     get_user_positions_split,
     get_trading_stats,
+    is_position_closed_today,
     record_daily_action,
     generate_daily_audit_report,
 )
@@ -1509,6 +1510,15 @@ async def check_and_execute_auto_buy(
                 for p in existing_positions
             )
             if already_has_pos:
+                continue
+
+            closed_today = await asyncio.to_thread(is_position_closed_today, uid, icao, None, target_date)
+            if closed_today:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", icao, "", 0.0,
+                    {"reason": f"По городу {icao} сегодня уже была закрыта сделка (защита от повторного входа)"}
+                )
                 continue
 
             # Фильтр солнечной инсоляции: исключаем утро до старта и вечер после пика прогрева

@@ -230,15 +230,22 @@ def get_position_by_id(pos_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
-def is_position_closed_today(user_id: int, icao: str, outcomes: str, target_date: str) -> bool:
-    """Проверяет, была ли данная сделка уже закрыта пользователем сегодня."""
+def is_position_closed_today(user_id: int, icao: str, outcomes: Optional[str] = None, target_date: str = "") -> bool:
+    """Проверяет, была ли данная сделка (или любая сделка по городу на эту дату) уже закрыта сегодня."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT 1 FROM user_positions
-            WHERE user_id = ? AND icao = ? AND outcomes = ? AND target_date = ? AND status = 'CLOSED'
-            LIMIT 1
-        """, (user_id, icao.strip().upper(), outcomes.strip(), target_date.strip()))
+        if outcomes:
+            cursor.execute("""
+                SELECT 1 FROM user_positions
+                WHERE user_id = ? AND icao = ? AND outcomes = ? AND target_date = ? AND status = 'CLOSED'
+                LIMIT 1
+            """, (user_id, icao.strip().upper(), outcomes.strip(), target_date.strip()))
+        else:
+            cursor.execute("""
+                SELECT 1 FROM user_positions
+                WHERE user_id = ? AND icao = ? AND target_date = ? AND status = 'CLOSED'
+                LIMIT 1
+            """, (user_id, icao.strip().upper(), target_date.strip()))
         return cursor.fetchone() is not None
 
 
