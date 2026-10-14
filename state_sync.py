@@ -85,6 +85,12 @@ def export_state_payload() -> str:
                 ORDER BY id DESC LIMIT 40
             """).fetchall()
         ]
+        bot_state = [
+            dict(r) for r in c.execute("""
+                SELECT key, value
+                FROM bot_state
+            """).fetchall()
+        ]
 
     # Динамический контроль размера под жесткий лимит сообщения Telegram (4096 символов)
     for max_act, max_cl in [(40, 25), (25, 20), (15, 15), (0, 10)]:
@@ -97,6 +103,7 @@ def export_state_payload() -> str:
             "wallets": wallets,
             "subscribers": subscribers,
             "daily_actions": sub_actions,
+            "bot_state": bot_state,
         }
         raw_bytes = json.dumps(payload, default=str, ensure_ascii=False).encode("utf-8")
         compressed = base64.b64encode(zlib.compress(raw_bytes, 9)).decode("ascii")
@@ -192,9 +199,27 @@ def import_state_payload(b64_str: str) -> int:
                 a.get("outcomes", ""), a.get("price", 0.0), det_str, a.get("created_at")
             ))
 
+        bot_state = payload.get("bot_state", [])
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        for st in bot_state:
+            k = st.get("key")
+            v = st.get("value")
+            if k:
+                c.execute("""
+                    INSERT INTO bot_state (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+                """, (k, str(v)))
+
         conn.commit()
 
-    logger.info(f"✅ Восстановлено {len(positions)} сделок и {len(daily_actions)} записей журнала из облачного сейфа.")
+    logger.info(f"✅ Восстановлено {len(positions)} сделок, {len(daily_actions)} записей журнала и {len(bot_state)} настроек из облачного сейфа.")
     return len(positions)
 
 
@@ -224,12 +249,18 @@ async def sync_state_to_telegram(bot: Bot) -> bool:
         mode_label = "⚡ БОЕВОЙ" if mode == "REAL" else "🧪 ТЕСТОВЫЙ"
         now_str = datetime.now().strftime("%d.%m %H:%M")
 
+        from database import get_paper_balance
+        p_bal = get_paper_balance(admin_uid)
+        roi_sign = "+" if p_bal["roi_percent"] >= 0 else ""
+        bankroll_info = f"• Банкролл (бумага): <b>${p_bal['total_equity']:.2f} USDC</b> (ROI: <b>{roi_sign}{p_bal['roi_percent']}%</b>)\n"
+
         text = (
             f"{STATE_PIN_HEADER}\n"
-            f"<i>Автоматическое сохранение сделок и истории винрейта при перезапусках сервера. Не открепляйте!</i>\n\n"
+            f"<i>Автоматическое сохранение сделок, баланса и винрейта при перезапусках сервера. Не открепляйте!</i>\n\n"
+            f"• Режим торговли: <b>{mode_label}</b>\n"
+            f"{bankroll_info}"
             f"• Открытых сделок: <b>{open_count}</b>\n"
             f"• Закрытых сегодня: <b>{closed_count}</b>\n"
-            f"• Режим торговли: <b>{mode_label}</b>\n"
             f"• Синхронизировано: <code>{now_str}</code>\n\n"
             f"{STATE_TAG}\n<code>{payload}</code>"
         )

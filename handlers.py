@@ -53,6 +53,8 @@ from database import (
     delete_user_wallet,
     register_subscriber,
     generate_daily_audit_report,
+    get_paper_balance,
+    set_paper_deposit,
 )
 from clob_trader import (
     validate_private_key,
@@ -938,6 +940,7 @@ async def cmd_help(message: Message, state: FSMContext):
         "• <b>🌍 Избранные города</b> или /cities — быстрый опрос метеостанций (METAR)\n"
         "• <b>🔍 Сканировать маркет</b> или /scan — разбор ссылки с Polymarket / Preddy\n"
         "• <b>👛 Мой кошелек</b> или /wallet — баланс, статус автопилота и синхронизация (/sync)\n"
+        "• <b>💰 Депозит и риск</b> или /deposit — баланс $50, свободные средства и банкролл\n"
         "• <b>⚡/🧪 Режим торговли</b> или /mode — переключение Боевой / Тестовый режим\n"
         "• <b>📄 Отчет за день</b> или /report — скачать полный файл логов за день\n"
         "• <b>➕ Добавить сделку</b> или /open — взять сделку под защиту вручную\n"
@@ -1132,12 +1135,17 @@ def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         mode_header = "⚡ <b>РЕЖИМ: БОЕВОЙ (Деньги + бумага при нехватке)</b>"
         mode_btn = "🧪 Переключить в ТЕСТ"
         auto_text = "🟢 Автопродажа активна" if has_pk else "🟡 Только сигналы (отправь /set_key)"
+        wallet_info = f"💰 <b>Баланс:</b> <code>${balance:.2f} USDC</code> | 🛡️ <b>Защита:</b> {auto_text}"
     else:
         mode_header = "🧪 <b>РЕЖИМ: ТЕСТ (Только бумага, без риска депозита)</b>"
         mode_btn = "⚡ Переключить в БОЕВОЙ"
-        auto_text = "📝 Виртуальный риск-менеджмент"
-
-    wallet_info = f"💰 <b>Баланс:</b> <code>${balance:.2f} USDC</code> | 🛡️ <b>Защита:</b> {auto_text}"
+        p_bal = get_paper_balance(user_id)
+        roi_sign = "+" if p_bal["roi_percent"] >= 0 else ""
+        wallet_info = (
+            f"💰 <b>Банкролл:</b> <code>${p_bal['total_equity']:.2f} USDC</code> "
+            f"(свободно: <code>${p_bal['free_balance']:.2f}</code>) | "
+            f"📈 <b>ROI:</b> <b>{roi_sign}{p_bal['roi_percent']}%</b>"
+        )
 
     text_sections = [
         mode_header,
@@ -1159,8 +1167,8 @@ def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         text_sections.append(
             "\n📌 <b>У тебя пока нет активных сделок на контроле.</b>\n\n"
             "🤖 Автосканер каждые полчаса отбирает надежные исходы:\n"
-            "• В боевом режиме — покупает на бирже (от $1.08) или берет на бумагу при нехватке средств.\n"
-            "• В тестовом режиме — проверяет теорию и ведет винрейт на бумаге без риска.\n\n"
+            "• В боевом режиме — рассчитывает 5-10% от реального баланса (CLOB).\n"
+            "• В тестовом режиме — рассчитывает 5-10% от банкролла $50.00 без риска.\n\n"
             "💡 <i>Ты также можешь добавить сделку вручную кнопкой ниже.</i>"
         )
     else:
@@ -1171,11 +1179,12 @@ def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
                 p_out = pos["outcomes"]
                 p_entry = float(pos.get("entry_price") or 0.0)
                 p_shares = float(pos.get("shares") or 0.0)
-                shares_str = f" (~{p_shares:.1f} shares)" if p_shares > 0 else ""
+                cost_usd = (p_entry * p_shares) / 100.0 if p_shares > 0 else 1.08
+                shares_str = f" (~{p_shares:.1f} долей)" if p_shares > 0 else ""
                 conf_s = f" | ⭐ <b>{pos['confidence_score']:.0f}/100</b>" if pos.get("confidence_score") else ""
                 text_sections.append(
                     f"• <b>{city_label}</b>: <code>{p_out}</code> "
-                    f"(вход: <b>{p_entry:.0f}¢</b>{shares_str}{conf_s})\n"
+                    f"(вход: <b>{p_entry:.0f}¢</b> | <b>${cost_usd:.2f} USDC</b>{shares_str}{conf_s})\n"
                     f"  └ <i>Дата:</i> <code>{pos['target_date']}</code> | 🛡️ Трейлинг + Погодный парашют"
                 )
                 buttons.append([
@@ -1189,10 +1198,13 @@ def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
                 city_label = ALL_RADAR_CITIES.get(pos["icao"], pos["icao"])
                 p_out = pos["outcomes"]
                 p_entry = float(pos.get("entry_price") or 0.0)
+                p_shares = float(pos.get("shares") or 0.0)
+                cost_usd = (p_entry * p_shares) / 100.0 if p_shares > 0 else 1.08
+                shares_str = f" (~{p_shares:.1f} долей)" if p_shares > 0 else ""
                 conf_s = f" | ⭐ <b>{pos['confidence_score']:.0f}/100</b>" if pos.get("confidence_score") else ""
                 text_sections.append(
                     f"• <b>{city_label}</b>: <code>{p_out}</code> "
-                    f"(вход: <b>{p_entry:.0f}¢</b>{conf_s})\n"
+                    f"(вход: <b>{p_entry:.0f}¢</b> | <b>${cost_usd:.2f} USDC</b>{shares_str}{conf_s})\n"
                     f"  └ <i>Дата:</i> <code>{pos['target_date']}</code> | 🧪 Тестовая позиция"
                 )
                 buttons.append([
@@ -1223,6 +1235,9 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
     mode = get_trading_mode(user_id)
     mode_label = "⚡ БОЕВОЙ" if mode == "REAL" else "🧪 ТЕСТОВЫЙ"
 
+    p_bal = get_paper_balance(user_id)
+    roi_sign = "+" if p_bal["roi_percent"] >= 0 else ""
+
     real_pnl_str = f"{'+' if real_s.get('total_pnl_usd', 0) >= 0 else ''}${real_s.get('total_pnl_usd', 0):.2f} USDC"
     paper_pnl_str = f"{'+' if paper_s.get('total_pnl_usd', 0) >= 0 else ''}${paper_s.get('total_pnl_usd', 0):.2f} USDC"
 
@@ -1237,9 +1252,12 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
     today_losses = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) <= 0)
     sign_today = "+" if today_pnl_cents >= 0 else ""
     today_pnl_usd = today_pnl_cents / 100.0
+    daily_roi_pct = (today_pnl_usd / p_bal["initial_deposit"] * 100.0) if p_bal["initial_deposit"] > 0 else 0.0
+    daily_roi_sign = "+" if daily_roi_pct >= 0 else ""
 
     today_summary_str = (
-        f"<b>{sign_today}${today_pnl_usd:.2f} USDC</b> (Побед: {today_wins} | Потерь: {today_losses})"
+        f"<b>{sign_today}${today_pnl_usd:.2f} USDC ({daily_roi_sign}{daily_roi_pct:.1f}%)</b> "
+        f"(Побед: {today_wins} | Потерь: {today_losses})"
         if today_trades else "<i>сделок пока не закрыто</i>"
     )
 
@@ -1252,12 +1270,16 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
         f"• Закрыто сделок: <b>{real_s.get('total', 0)}</b> (Побед: {real_s.get('wins', 0)} | Потерь: {real_s.get('losses', 0)})",
         f"• Винрейт (Win Rate): <b>{real_s.get('winrate', 0.0):.1f}%</b>",
         f"• Итоговый PnL: <b>{real_pnl_str}</b>",
-        f"• Средний плюс: <b>+{real_s.get('avg_win_cents', 0.0):.1f}¢</b> | Средний минус: <b>{real_s.get('avg_loss_cents', 0.0):.1f}¢</b>\n",
+        f"• Средний плюс: <b>+{real_s.get('avg_win_cents', 0.0):.1f}¢</b> | Средний минус: <b>{real_s.get('avg_loss_cents', 0.0):.1f}¢</b>",
+        f"• Риск-модель: <b>Динамический 5-10% от баланса</b>\n",
         "━━━━━━━━━━━━━━━━━━━━",
         "🧪 <b>БУМАЖНАЯ ТОРГОВЛЯ (ТЕСТОВЫЙ РАСЧЕТ):</b>",
+        f"• Стартовый банкролл: <b>${p_bal['initial_deposit']:.2f} USDC</b>",
+        f"• Текущий капитал (Equity): <b>${p_bal['total_equity']:.2f} USDC</b> (Свободно: <b>${p_bal['free_balance']:.2f}</b>)",
+        f"• Совокупный ROI: <b>{roi_sign}{p_bal['roi_percent']}%</b> (PnL: <b>{paper_pnl_str}</b>)",
         f"• Всего симуляций: <b>{paper_s.get('total', 0)}</b> (Побед: {paper_s.get('wins', 0)} | Потерь: {paper_s.get('losses', 0)})",
         f"• Винрейт (Win Rate): <b>{paper_s.get('winrate', 0.0):.1f}%</b>",
-        f"• Теоретический PnL: <b>{paper_pnl_str}</b>\n",
+        f"• Риск-модель: <b>Динамический 5-10% от банка (Kelly)</b>\n",
         "━━━━━━━━━━━━━━━━━━━━",
         "📋 <b>ПОСЛЕДНИЕ ЗАКРЫТЫЕ СДЕЛКИ:</b>",
     ]
@@ -1271,8 +1293,13 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
             outcomes = t.get("outcomes", "")
             pnl_c = float(t.get("pnl_cents") or 0.0)
             pnl_p = float(t.get("pnl_percent") or 0.0)
+            shares = float(t.get("shares") or 1.0)
+            pnl_usd = (pnl_c * shares) / 100.0
+            entry_p = float(t.get("entry_price") or 0.0)
+            cost_usd = (entry_p * shares) / 100.0 if shares > 0 else 0.0
             icon = "✅" if pnl_c > 0 else "🛑"
-            sign = "+" if pnl_c >= 0 else ""
+            sign_usd = "+" if pnl_usd >= 0 else ""
+            sign_p = "+" if pnl_p >= 0 else ""
             reason = t.get("exit_reason") or "Плановое закрытие"
 
             time_label = ""
@@ -1297,9 +1324,10 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
                 time_label = f"рынок {t.get('target_date')}"
 
             time_prefix = f"🕒 <i>{time_label}</i> | " if time_label else ""
+            cost_str = f" [вход: ${cost_usd:.2f}]" if cost_usd > 0 else ""
             lines.append(
                 f"{tag} {icon} <b>{city}</b> (<code>{outcomes}</code>): "
-                f"<b>{sign}{pnl_c:.0f}¢ ({sign}{pnl_p:.0f}%)</b>\n"
+                f"<b>{sign_usd}${abs(pnl_usd):.2f} ({sign_p}{pnl_p:.0f}%)</b>{cost_str}\n"
                 f"   └ {time_prefix}<i>Причина:</i> {reason}"
             )
 
@@ -1781,6 +1809,56 @@ async def process_disconnect_wallet_callback(callback: CallbackQuery):
     await callback.message.edit_text(
         "🔌 <b>Кошелек успешно отключен.</b> Все данные удалены.",
         parse_mode="HTML",
+    )
+
+
+@router.message(Command("deposit", "bankroll"), StateFilter("*"))
+async def cmd_set_or_view_deposit(message: Message, state: FSMContext):
+    """
+    Просмотр или изменение виртуального банкролла для тестирования риск-менеджмента:
+    /deposit или /deposit 100
+    """
+    await state.clear()
+    uid = message.from_user.id
+    raw_text = (message.text or "").strip()
+    parts = raw_text.split()
+    if len(parts) >= 2:
+        try:
+            val = float(parts[1].replace("$", "").replace(",", "."))
+            if val < 5.0 or val > 100000.0:
+                await message.answer("⚠️ Сумма депозита должна быть от $5.00 до $100,000.00 USDC.")
+                return
+            new_val = set_paper_deposit(uid, val)
+            from state_sync import sync_state_to_telegram
+            await sync_state_to_telegram(message.bot)
+            await message.answer(
+                f"💰 <b>Банкролл успешно обновлен!</b>\n\n"
+                f"• Новый базовый депозит: <b>${new_val:.2f} USDC</b>\n"
+                f"• Размер сделки (5-10%): <b>${(new_val*0.05):.2f} - ${(new_val*0.10):.2f} USDC</b>\n"
+                f"• Лимит всех открытых сделок (50%): <b>${(new_val*0.50):.2f} USDC</b>\n\n"
+                f"🛡️ <i>Все новые позиции будут рассчитываться от этой суммы.</i>",
+                parse_mode="HTML"
+            )
+            return
+        except ValueError:
+            pass
+
+    p_bal = get_paper_balance(uid)
+    roi_sign = "+" if p_bal["roi_percent"] >= 0 else ""
+    await message.answer(
+        f"💰 <b>УПРАВЛЕНИЕ ДЕПОЗИТОМ И РИСК-МЕНЕДЖМЕНТОМ</b>\n\n"
+        f"• Стартовый депозит: <b>${p_bal['initial_deposit']:.2f} USDC</b>\n"
+        f"• Текущий капитал (Equity): <b>${p_bal['total_equity']:.2f} USDC</b>\n"
+        f"• Свободно для входа: <b>${p_bal['free_balance']:.2f} USDC</b>\n"
+        f"• В открытых позициях: <b>${p_bal['open_allocated_usd']:.2f} USDC</b>\n"
+        f"• Общий ROI: <b>{roi_sign}{p_bal['roi_percent']}%</b>\n\n"
+        f"🛡️ <b>Правила риск-менеджмента (Kelly-fractional):</b>\n"
+        f"• Рейтинг 90-100: <b>10% от банка</b> (${(p_bal['total_equity']*0.10):.2f})\n"
+        f"• Рейтинг 80-89: <b>7% от банка</b> (${(p_bal['total_equity']*0.07):.2f})\n"
+        f"• Рейтинг 70-79: <b>5% от банка</b> (${(p_bal['total_equity']*0.05):.2f})\n"
+        f"• Лимит всех открытых сделок: <b>не более 50% портфеля</b>\n\n"
+        f"💡 <i>Чтобы изменить размер депозита, отправь команду: <code>/deposit 100</code></i>",
+        parse_mode="HTML"
     )
 
 

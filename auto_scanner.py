@@ -55,6 +55,8 @@ from database import (
     is_position_closed_today,
     record_daily_action,
     generate_daily_audit_report,
+    calculate_risk_managed_order_size,
+    get_paper_balance,
 )
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
@@ -1670,23 +1672,50 @@ async def check_and_execute_auto_buy(
         proxy_addr = wallet.get("proxy_address") if wallet else ""
         sig_type = int(wallet.get("signature_type") or 1) if wallet else 1
 
-        balance = 0.0
-        if has_pk:
-            balance = await asyncio.to_thread(
-                get_wallet_collateral_balance,
-                wallet["private_key"],
-                proxy_address=proxy_addr,
-            )
-
-        trade_cost = 1.08
-        buffer_usd = 0.10
-        available_trades = 0
-        if mode == "REAL" and has_pk and balance >= (trade_cost + buffer_usd):
-            available_trades = int((balance - buffer_usd) // trade_cost)
+        # Расчет базового баланса и лимитов риска в зависимости от режима торговли
+        if mode == "REAL":
+            real_cash = 0.0
+            if has_pk:
+                real_cash = await asyncio.to_thread(
+                    get_wallet_collateral_balance,
+                    wallet["private_key"],
+                    proxy_address=proxy_addr,
+                )
+            open_real_positions = [p for p in existing_positions if not p.get("is_paper") and p.get("status") == "OPEN"]
+            open_real_allocated = sum((float(p.get("entry_price") or 0.0) * float(p.get("shares") or 1.0)) / 100.0 for p in open_real_positions)
+            effective_balance = max(real_cash + open_real_allocated, real_cash)
+            open_allocated = open_real_allocated
+            free_cash = real_cash
+        else:
+            p_bal = await asyncio.to_thread(get_paper_balance, uid)
+            effective_balance = p_bal["total_equity"]
+            open_allocated = p_bal["open_allocated_usd"]
+            free_cash = p_bal["free_balance"]
 
         for idx, cand in enumerate(candidates):
-            # В реальную сделку допускаются только самые надежные кандидаты с рейтингом >= 80.0
-            is_top_pick = (idx < available_trades and cand["conf_score"] >= 80.0)
+            # Проверяем мани-менеджмент и допустимый размер позиции
+            sizing = calculate_risk_managed_order_size(
+                balance=effective_balance,
+                conf_score=cand["conf_score"],
+                price_cents=cand["price_cents"],
+                max_portfolio_exposure_pct=0.50,
+                open_positions_allocated_usd=open_allocated,
+            )
+
+            if not sizing["allowed"]:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", cand["icao"], cand["outcomes"], cand["price_cents"],
+                    {"reason": sizing["reason"], "conf_score": cand["conf_score"]}
+                )
+                continue
+
+            trade_cost = sizing["cost_usd"]
+            shares = sizing["shares"]
+            risk_pct = sizing["risk_pct"]
+
+            # В реальную сделку допускается топ-кандидат с рейтингом >= 80.0 при наличии свободных средств
+            is_top_pick = (cand["conf_score"] >= 80.0 and free_cash >= trade_cost)
 
             # === AI-ВАЛИДАЦИЯ НЕЙРОСЕТЬЮ (GEMINI RISK VALIDATION) ===
             from gemini_analyzer import validate_candidate_ai
@@ -1726,15 +1755,19 @@ async def check_and_execute_auto_buy(
                     cand["outcomes"],
                     cand["target_date"],
                     cand["price_cents"],
-                    2.5,
+                    shares,
                     cand["token_id"],
                     1,  # is_paper = 1
                     cand["conf_score"],
                 )
+                open_allocated += trade_cost
                 await asyncio.to_thread(
                     record_daily_action,
                     uid, "BUY_PAPER", cand["icao"], cand["outcomes"], cand["price_cents"],
                     {
+                        "amount_usd": trade_cost,
+                        "shares": shares,
+                        "risk_pct": risk_pct,
                         "conf_score": cand["conf_score"],
                         "conf_label": cand["conf_label"],
                         "paper_reason": f"🛡️ ВЕТО НЕЙРОСЕТИ (Защита депозита): {ai_reason}",
@@ -1745,9 +1778,10 @@ async def check_and_execute_auto_buy(
                     f"🛡️ <b>НЕЙРОСЕТЬ ОТКЛОНИЛА СДЕЛКУ (ЗАЩИТА ДЕПОЗИТА)</b>\n\n"
                     f"• <b>Локация:</b> {cand['city_name']}\n"
                     f"• <b>Исход:</b> <code>{cand['outcomes']}</code> (цена: <b>{cand['price_cents']:.0f}¢</b>)\n"
+                    f"• <b>Сумма теста:</b> <b>${trade_cost:.2f} USDC</b> (доля: <b>{risk_pct}%</b> от депозита)\n"
                     f"• <b>Рейтинг формулы:</b> {cand['conf_score']:.0f}/100 (математический фильтр был пройден)\n"
                     f"• <b>Вердикт AI-синоптика:</b> 🛑 <i>{ai_reason}</i>\n\n"
-                    f"💡 <i>Реальная покупка отменена для защиты баланса! Исход переведен в бумажный тест для проверки точности нейросети.</i>"
+                    f"💡 <i>Реальная покупка отменена для защиты баланса! Исход переведен в бумажный тест (${trade_cost:.2f} USDC) для проверки точности нейросети.</i>"
                 )
                 try:
                     await bot.send_message(uid, veto_msg, parse_mode="HTML")
@@ -1767,7 +1801,6 @@ async def check_and_execute_auto_buy(
                     signature_type=sig_type,
                 )
                 if success:
-                    shares = round(trade_cost / (cand["price_cents"] / 100.0), 2) if cand["price_cents"] > 0 else 2.5
                     await asyncio.to_thread(
                         add_position,
                         uid,
@@ -1780,12 +1813,15 @@ async def check_and_execute_auto_buy(
                         0,  # is_paper = 0
                         cand["conf_score"],
                     )
+                    open_allocated += trade_cost
+                    free_cash -= trade_cost
                     await asyncio.to_thread(
                         record_daily_action,
                         uid, "BUY_REAL", cand["icao"], cand["outcomes"], cand["price_cents"],
                         {
                             "amount_usd": trade_cost,
                             "shares": shares,
+                            "risk_pct": risk_pct,
                             "conf_score": cand["conf_score"],
                             "conf_label": cand["conf_label"],
                             "reasons": cand["conf_reasons"],
@@ -1798,7 +1834,7 @@ async def check_and_execute_auto_buy(
                         f"• <b>Локация:</b> {cand['city_name']}\n"
                         f"• <b>Выбранный исход:</b> <code>{cand['outcomes']}</code>\n"
                         f"• <b>Цена входа:</b> <b>{cand['price_cents']:.0f}¢</b>\n"
-                        f"• <b>Сумма ордера:</b> <b>${trade_cost:.2f} USDC</b> (объем: ~{shares:.2f} долей)\n"
+                        f"• <b>Сумма ордера:</b> <b>${trade_cost:.2f} USDC</b> (доля: <b>{risk_pct}%</b> от баланса, ~{shares:.2f} долей)\n"
                         f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n"
                         f"• <b>AI-валидация:</b> 🟢 <b>ОДОБРЕНО НЕЙРОСЕТЬЮ</b> (<i>{ai_reason}</i>)\n\n"
                         f"<b>Факторы выбора:</b>\n{reasons_str}\n\n"
@@ -1819,7 +1855,7 @@ async def check_and_execute_auto_buy(
                         f"⚠️ <b>ВНИМАНИЕ: СБОЙ АВТОПОКУПКИ НА БИРЖЕ!</b>\n\n"
                         f"• <b>Локация:</b> {cand['city_name']} (<code>{cand['outcomes']}</code>)\n"
                         f"• <b>Причина отказа:</b> <code>{err_text}</code>\n"
-                        f"• <b>Баланс кошелька:</b> ${balance:.2f} USDC\n\n"
+                        f"• <b>Баланс кошелька:</b> ${free_cash:.2f} USDC\n\n"
                         f"💡 <i>Перевожу этот исход в режим «Бумажная сделка», чтобы не терять тест! Скопируй это сообщение разработчику для исправления.</i>"
                     )
                     try:
@@ -1833,15 +1869,19 @@ async def check_and_execute_auto_buy(
                         cand["outcomes"],
                         cand["target_date"],
                         cand["price_cents"],
-                        2.5,
+                        shares,
                         cand["token_id"],
                         1,  # is_paper = 1
                         cand["conf_score"],
                     )
+                    open_allocated += trade_cost
                     await asyncio.to_thread(
                         record_daily_action,
                         uid, "BUY_PAPER", cand["icao"], cand["outcomes"], cand["price_cents"],
                         {
+                            "amount_usd": trade_cost,
+                            "shares": shares,
+                            "risk_pct": risk_pct,
                             "conf_score": cand["conf_score"],
                             "conf_label": cand["conf_label"],
                             "paper_reason": f"Отказ биржи: {err_text}",
@@ -1850,7 +1890,6 @@ async def check_and_execute_auto_buy(
                     )
             # 2. Бумажная сделка
             else:
-                sim_shares = round(trade_cost / (cand["price_cents"] / 100.0), 2) if cand["price_cents"] > 0 else 2.5
                 await asyncio.to_thread(
                     add_position,
                     uid,
@@ -1858,17 +1897,18 @@ async def check_and_execute_auto_buy(
                     cand["outcomes"],
                     cand["target_date"],
                     cand["price_cents"],
-                    sim_shares,
+                    shares,
                     cand["token_id"],
                     1,  # is_paper = 1
                     cand["conf_score"],
                 )
+                open_allocated += trade_cost
                 if mode == "PAPER":
-                    reason_note = "Режим бота: 🧪 ТЕСТ (Только бумага)"
+                    reason_note = f"Режим бота: 🧪 ТЕСТ (риск {risk_pct}% от банка)"
                 elif not has_pk:
                     reason_note = "Приватный ключ не подключен (демо-тест)"
-                elif balance < (trade_cost + buffer_usd):
-                    reason_note = f"Баланса (${balance:.2f}) не хватает для ордера $1.08"
+                elif free_cash < trade_cost:
+                    reason_note = f"Баланса (${free_cash:.2f}) не хватает для ордера ${trade_cost:.2f}"
                 elif cand["conf_score"] < 80.0:
                     reason_note = f"Уверенность ({cand['conf_score']:.0f}/100) ниже порога боевого входа (80)"
                 else:
@@ -1878,6 +1918,9 @@ async def check_and_execute_auto_buy(
                     record_daily_action,
                     uid, "BUY_PAPER", cand["icao"], cand["outcomes"], cand["price_cents"],
                     {
+                        "amount_usd": trade_cost,
+                        "shares": shares,
+                        "risk_pct": risk_pct,
                         "conf_score": cand["conf_score"],
                         "conf_label": cand["conf_label"],
                         "paper_reason": reason_note,
@@ -1893,11 +1936,12 @@ async def check_and_execute_auto_buy(
                     f"• <b>Локация:</b> {cand['city_name']}\n"
                     f"• <b>Исход:</b> <code>{cand['outcomes']}</code>\n"
                     f"• <b>Виртуальная цена входа:</b> <b>{cand['price_cents']:.0f}¢</b>\n"
+                    f"• <b>Сумма ордера:</b> <b>${trade_cost:.2f} USDC</b> (доля: <b>{risk_pct}%</b> от депозита, ~{shares:.2f} долей)\n"
                     f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n"
                     f"{ai_paper_line}"
                     f"• <b>Причина виртуального входа:</b> <i>{reason_note}</i>\n"
                     f"<b>Факторы выбора:</b>\n{reasons_str}\n\n"
-                    f"📊 <i>Бот будет виртуально сопровождать этот исход и зафиксирует PnL в статистику винрейта.</i>"
+                    f"📊 <i>Бот сопровождает позицию по риск-менеджменту и зафиксирует PnL в статистику.</i>"
                 )
                 try:
                     await bot.send_message(uid, paper_msg, parse_mode="HTML")

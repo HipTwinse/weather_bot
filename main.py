@@ -53,6 +53,7 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="cities", description="🌍 Избранные города (4 модели + METAR)"),
         BotCommand(command="scan", description="🔍 Сканировать маркет (Preddy / Polymarket)"),
         BotCommand(command="wallet", description="👛 Мой кошелек и баланс Polymarket"),
+        BotCommand(command="deposit", description="💰 Управление депозитом и банкроллом"),
         BotCommand(command="mode", description="⚡/🧪 Переключить режим (Боевой / Тест)"),
         BotCommand(command="report", description="📄 Скачать аудиторский отчет за день"),
         BotCommand(command="sync", description="🔄 Синхронизировать сделки с Polymarket"),

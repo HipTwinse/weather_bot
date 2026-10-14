@@ -459,9 +459,161 @@ def get_trading_stats(user_id: int) -> Dict[str, Any]:
         return {
             "real": calc_metrics(real_closed),
             "paper": calc_metrics(paper_closed),
+            "paper_balance": get_paper_balance(user_id),
             "recent": rows[:10],
             "recent_trades": rows[:10],
         }
+
+
+DEFAULT_PAPER_DEPOSIT = 50.0  # Базовый стартовый баланс ($50 USDC) по ТЗ
+
+
+def set_paper_deposit(user_id: int, amount: float) -> float:
+    """Устанавливает базовый виртуальный депозит для тестовой торговли пользователя."""
+    val = round(max(5.0, float(amount)), 2)
+    set_bot_state(f"paper_deposit_{user_id}", str(val))
+    return val
+
+
+def get_paper_balance(user_id: int) -> Dict[str, float]:
+    """
+    Рассчитывает текущее состояние бумажного депозита пользователя:
+    - initial_deposit: стартовый депозит ($50.00 USDC по умолчанию).
+    - closed_pnl_usd: накопленный реализованный PnL по закрытым бумажным сделкам.
+    - open_allocated_usd: объем средств, заблокированный в открытых бумажных сделках.
+    - total_equity: текущая совокупная стоимость портфеля (initial + closed_pnl).
+    - free_balance: доступные свободные средства для новых покупок.
+    - roi_percent: общая доходность от стартового депозита в %.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        row_dep = c.execute("SELECT value FROM bot_state WHERE key = ?", (f"paper_deposit_{user_id}",)).fetchone()
+        try:
+            initial_deposit = float(row_dep[0]) if (row_dep and row_dep[0]) else DEFAULT_PAPER_DEPOSIT
+        except Exception:
+            initial_deposit = DEFAULT_PAPER_DEPOSIT
+
+        # Закрытые бумажные сделки: берем pnl_cents и shares
+        closed_trades = c.execute("""
+            SELECT pnl_cents, shares
+            FROM user_positions
+            WHERE user_id = ? AND is_paper = 1 AND status = 'CLOSED'
+        """, (user_id,)).fetchall()
+        closed_pnl_usd = sum((float(r["pnl_cents"] or 0.0) * float(r["shares"] or 1.0)) / 100.0 for r in closed_trades)
+
+        # Открытые бумажные сделки (замороженный капитал)
+        open_trades = c.execute("""
+            SELECT entry_price, shares
+            FROM user_positions
+            WHERE user_id = ? AND is_paper = 1 AND status = 'OPEN'
+        """, (user_id,)).fetchall()
+        open_allocated_usd = sum((float(r["entry_price"] or 0.0) * float(r["shares"] or 1.0)) / 100.0 for r in open_trades)
+
+    total_equity = round(initial_deposit + closed_pnl_usd, 2)
+    free_balance = round(max(0.0, total_equity - open_allocated_usd), 2)
+    roi_percent = round((total_equity - initial_deposit) / initial_deposit * 100.0, 1) if initial_deposit > 0 else 0.0
+
+    return {
+        "initial_deposit": initial_deposit,
+        "closed_pnl_usd": round(closed_pnl_usd, 2),
+        "open_allocated_usd": round(open_allocated_usd, 2),
+        "total_equity": total_equity,
+        "free_balance": free_balance,
+        "roi_percent": roi_percent,
+    }
+
+
+def calculate_risk_managed_order_size(
+    balance: float,
+    conf_score: float,
+    price_cents: float,
+    max_portfolio_exposure_pct: float = 0.50,
+    open_positions_allocated_usd: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Рассчитывает объем ордера и долю депозита по строгим правилам риск-менеджмента:
+    1. Базовый риск на сделку (Kelly-fractional):
+       - Сверхвысокая надежность (90 - 100/100): 10% от текущего капитала (Equity)
+       - Высокая надежность (80 - 89/100): 7% от текущего капитала
+       - Умеренная надежность (70 - 79/100): 5% от текущего капитала
+       - Ниже 70: вход запрещен (0%)
+    2. Ограничения биржи и риск-лимиты:
+       - Минимальный размер ордера на Polymarket CLOB: $1.08 USDC (или min 5 долей).
+       - Максимальный лимит на одну позицию: не более 12% от общего баланса.
+       - Лимит общего риска портфеля: сумма всех открытых сделок не более 50% от баланса.
+    """
+    if balance <= 0 or price_cents <= 0:
+        return {
+            "cost_usd": 0.0, "shares": 0.0, "risk_pct": 0.0,
+            "allowed": False, "reason": "Нулевой баланс или некорректная цена"
+        }
+
+    # Лимит совокупного риска портфеля (не более 50% в рынке одновременно)
+    max_allowed_portfolio_capital = balance * max_portfolio_exposure_pct
+    remaining_portfolio_capital = max(0.0, max_allowed_portfolio_capital - open_positions_allocated_usd)
+    if remaining_portfolio_capital < 1.08:
+        return {
+            "cost_usd": 0.0,
+            "shares": 0.0,
+            "risk_pct": 0.0,
+            "allowed": False,
+            "reason": f"Лимит риска портфеля (50% в рынке): доступно ${remaining_portfolio_capital:.2f} < мин. ордера $1.08"
+        }
+
+    # Процент риска от баланса по рейтингу надежности
+    if conf_score >= 90.0:
+        risk_pct = 0.10  # 10% от капитала
+    elif conf_score >= 80.0:
+        risk_pct = 0.07  # 7% от капитала
+    elif conf_score >= 70.0:
+        risk_pct = 0.05  # 5% от капитала
+    else:
+        return {
+            "cost_usd": 0.0, "shares": 0.0, "risk_pct": 0.0,
+            "allowed": False, "reason": f"Рейтинг ({conf_score:.0f}/100) ниже порога входа (70)"
+        }
+
+    target_cost = round(balance * risk_pct, 2)
+    min_order_usd = 1.08
+    if target_cost < min_order_usd:
+        target_cost = min_order_usd
+
+    # Не превышаем остаток лимита портфеля и свободный кэш
+    target_cost = min(target_cost, remaining_portfolio_capital, balance)
+    target_cost = round(target_cost, 2)
+
+    if target_cost < min_order_usd:
+        return {
+            "cost_usd": 0.0,
+            "shares": 0.0,
+            "risk_pct": 0.0,
+            "allowed": False,
+            "reason": f"Недостаточно свободного капитала (${target_cost:.2f}) для минимального ордера ($1.08)"
+        }
+
+    shares = round(target_cost / (price_cents / 100.0), 2)
+    # Минимальный объем Polymarket: не менее 5 долей при низкой цене
+    if shares < 5.0 and price_cents <= 20.0:
+        shares = 5.0
+        target_cost = round(shares * (price_cents / 100.0), 2)
+
+    actual_risk_pct = round((target_cost / balance) * 100.0, 1)
+
+    return {
+        "cost_usd": target_cost,
+        "shares": shares,
+        "risk_pct": actual_risk_pct,
+        "allowed": True,
+        "reason": f"Риск {actual_risk_pct}% от депозита (${target_cost:.2f})"
+    }
 
 
 def delete_position(position_id: int, user_id: int) -> bool:
@@ -760,6 +912,14 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
     today_losses = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) <= 0)
     sign_today = "+" if today_pnl_usd >= 0 else ""
 
+    p_bal = get_paper_balance(user_id) if user_id else {
+        "initial_deposit": 50.0, "total_equity": 50.0, "free_balance": 50.0,
+        "open_allocated_usd": 0.0, "roi_percent": 0.0, "closed_pnl_usd": 0.0
+    }
+    roi_sign = "+" if p_bal["roi_percent"] >= 0 else ""
+    daily_roi_pct = (today_pnl_usd / p_bal["initial_deposit"] * 100.0) if p_bal["initial_deposit"] > 0 else 0.0
+    daily_roi_sign = "+" if daily_roi_pct >= 0 else ""
+
     lines = [
         "=" * 80,
         " ДНЕВНОЙ АУДИТОРСКИЙ ОТЧЕТ ДЕЙСТВИЙ РОБОТА WEATHER ALPHA ENGINE",
@@ -776,10 +936,15 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
         f" • Закрыто реальных сделок: {len(sells_real)}",
         f" • Закрыто бумажных тестов: {len(sells_paper)}",
         f" • Дневной PnL (закрытые сегодня): {sign_today}${today_pnl_usd:.2f} USDC (Побед: {today_wins} | Потерь: {today_losses})",
+        f" • Дневная доходность: {daily_roi_sign}{daily_roi_pct:.1f}% от базового депозита (${p_bal['initial_deposit']:.2f})",
         f" • Отклонено кандидатов (фильтры/скип): {skips_count}",
         f" • Ошибок биржи/отказов: {len(errors)}",
         "",
-        "💰 2. ФИНАНСОВЫЕ ПОКАЗАТЕЛИ (ПО ВСЕЙ ИСТОРИИ):",
+        "💰 2. ФИНАНСОВЫЕ ПОКАЗАТЕЛИ И РИСК-МЕНЕДЖМЕНТ:",
+        f" • Базовый банкролл: ${p_bal['initial_deposit']:.2f} USDC",
+        f" • Текущий капитал (Equity): ${p_bal['total_equity']:.2f} USDC (Свободно: ${p_bal['free_balance']:.2f} | В сделках: ${p_bal['open_allocated_usd']:.2f})",
+        f" • Общий ROI (доходность): {roi_sign}{p_bal['roi_percent']}%",
+        f" • Модель риск-менеджмента: Динамический риск 5-10% от депозита (Kelly-fractional, лимит портфеля 50%)",
         f" • Реальный винрейт: {real_s.get('winrate', 0.0)}% (Побед: {real_s.get('wins', 0)} / Потерь: {real_s.get('losses', 0)})",
         f" • Реальный PnL: ${real_s.get('total_pnl_usd', 0.0):.2f} USDC",
         f" • Бумажный винрейт: {paper_s.get('winrate', 0.0)}% (Побед: {paper_s.get('wins', 0)} / Потерь: {paper_s.get('losses', 0)})",
@@ -810,9 +975,10 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
                     lines.append(f"   Инфо: {det.get('note')}")
 
             elif atype == "BUY_REAL":
+                risk_info = f" ({det.get('risk_pct')}% риска)" if det.get("risk_pct") else ""
                 lines.append(f"\n[{time_label} ХБР] ⚡ АВТОПОКУПКА (РЕАЛЬНАЯ СДЕЛКА НА POLYMARKET)")
                 lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена входа: {price:.0f}¢")
-                lines.append(f"   Сумма ордера: ${det.get('amount_usd', 1.08):.2f} USDC (контрактов: ~{det.get('shares', 0):.2f})")
+                lines.append(f"   Сумма ордера: ${det.get('amount_usd', 1.08):.2f} USDC{risk_info} (контрактов: ~{det.get('shares', 0):.2f})")
                 lines.append(f"   Рейтинг надежности: {det.get('conf_score', 0)}/100 ({det.get('conf_label', '')})")
                 if det.get("ai_verdict"):
                     lines.append(f"   🧠 Вердикт нейросети (Gemini AI): {det.get('ai_verdict')}")
@@ -823,8 +989,11 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
                         lines.append(f"     • {r}")
 
             elif atype == "BUY_PAPER":
+                risk_info = f" ({det.get('risk_pct')}% депозита)" if det.get("risk_pct") else ""
+                cost_info = f" | Сумма: ${det.get('amount_usd', 0.0):.2f} USDC{risk_info}" if det.get("amount_usd") else ""
+                shares_info = f" (долей: ~{det.get('shares', 0):.2f})" if det.get("shares") else ""
                 lines.append(f"\n[{time_label} ХБР] 📝 АВТОПОКУПКА (БУМАЖНЫЙ ТЕСТ)")
-                lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена входа: {price:.0f}¢")
+                lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена входа: {price:.0f}¢{cost_info}{shares_info}")
                 lines.append(f"   Рейтинг надежности: {det.get('conf_score', 0)}/100 ({det.get('conf_label', '')})")
                 lines.append(f"   Причина теста: {det.get('paper_reason', 'Тестовый режим или вторичный кандидат')}")
                 if det.get("ai_verdict"):
@@ -845,7 +1014,7 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
                 lines.append(f"\n[{time_label} ХБР] 📝 ЗАКРЫТИЕ БУМАЖНОГО ТЕСТА")
                 lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена выхода: {price:.0f}¢")
                 lines.append(f"   Причина закрытия: {det.get('reason', 'Плановый выход')}")
-                lines.append(f"   Результат: PnL {det.get('pnl_str', '0%')}")
+                lines.append(f"   Результат: PnL {det.get('pnl_str', '0%')} ({det.get('pnl_usd', '$0.00')})")
 
             elif atype == "SKIP":
                 outcomes_str = f" ({outcomes})" if outcomes else ""
