@@ -1972,7 +1972,17 @@ async def run_position_monitor(bot: Bot) -> None:
                     # Закрываем сделку как архивную ТОЛЬКО если дата станции строго опережает target_date
                     # (например, в Мадриде уже наступил следующий календарный день)
                     if target_date and target_date < local_date_str:
-                        await asyncio.to_thread(close_position_with_exit, pos["id"], 0.0)
+                        await asyncio.to_thread(
+                            close_position_with_exit,
+                            pos["id"],
+                            0.0,
+                            "Рынок завершен (экспирация)"
+                        )
+                        try:
+                            from state_sync import sync_state_to_telegram
+                            await sync_state_to_telegram(bot)
+                        except Exception:
+                            pass
                         continue
 
                     try:

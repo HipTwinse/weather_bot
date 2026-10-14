@@ -37,3 +37,12 @@ def test_export_and_import_state_payload():
     actions = get_daily_actions(user_id=test_uid)
     assert any(a["action_type"] == "SCAN" for a in actions)
 
+    # Очистка тестовых данных
+    import sqlite3
+    from database import DB_PATH
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM user_positions WHERE user_id = ?", (test_uid,))
+        conn.execute("DELETE FROM daily_actions_log WHERE user_id = ?", (test_uid,))
+        conn.execute("DELETE FROM user_wallets WHERE user_id = ?", (test_uid,))
+        conn.commit()
+

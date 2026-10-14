@@ -422,7 +422,9 @@ def get_trading_stats(user_id: int) -> Dict[str, Any]:
         
         cursor.execute("""
             SELECT id, icao, outcomes, target_date, entry_price, exit_price, exit_reason,
-                   pnl_cents, pnl_percent, shares, COALESCE(is_paper, 0) AS is_paper, status, closed_at
+                   pnl_cents, pnl_percent, shares, COALESCE(is_paper, 0) AS is_paper, status,
+                   closed_at, created_at,
+                   datetime(COALESCE(closed_at, created_at), '+10 hours') AS local_khv_time
             FROM user_positions
             WHERE user_id = ? AND status = 'CLOSED'
             ORDER BY id DESC
@@ -468,7 +470,8 @@ def delete_position(position_id: int, user_id: int) -> bool:
         cursor = conn.cursor()
         cursor.execute("""
             UPDATE user_positions
-            SET status = 'CLOSED'
+            SET status = 'CLOSED',
+                closed_at = COALESCE(closed_at, CURRENT_TIMESTAMP)
             WHERE id = ? AND user_id = ?
         """, (position_id, user_id))
         conn.commit()

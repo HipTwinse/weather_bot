@@ -1208,7 +1208,14 @@ def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
 
 
 def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
-    """Формирует подробный отчет по статистике и винрейту сделок."""
+    """Формирует подробный отчет по статистике и винрейту сделок с разбивкой по времени."""
+    import zoneinfo
+    from datetime import datetime
+
+    khv_tz = zoneinfo.ZoneInfo("Asia/Vladivostok")
+    now_khv = datetime.now(khv_tz)
+    today_khv_str = now_khv.strftime("%Y-%m-%d")
+
     stats = get_trading_stats(user_id)
     real_s = stats.get("real", {})
     paper_s = stats.get("paper", {})
@@ -1219,9 +1226,27 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
     real_pnl_str = f"{'+' if real_s.get('total_pnl_usd', 0) >= 0 else ''}${real_s.get('total_pnl_usd', 0):.2f} USDC"
     paper_pnl_str = f"{'+' if paper_s.get('total_pnl_usd', 0) >= 0 else ''}${paper_s.get('total_pnl_usd', 0):.2f} USDC"
 
+    # Подсчет результатов именно за сегодня (по местному времени Хабаровска UTC+10)
+    today_trades = [
+        t for t in recent_trades
+        if str(t.get("local_khv_time") or t.get("closed_at") or "").startswith(today_khv_str)
+        or str(t.get("target_date") or "") == today_khv_str
+    ]
+    today_pnl_cents = sum((float(t.get("pnl_cents") or 0.0) * float(t.get("shares") or 1.0)) for t in today_trades)
+    today_wins = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) > 0)
+    today_losses = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) <= 0)
+    sign_today = "+" if today_pnl_cents >= 0 else ""
+    today_pnl_usd = today_pnl_cents / 100.0
+
+    today_summary_str = (
+        f"<b>{sign_today}${today_pnl_usd:.2f} USDC</b> (Побед: {today_wins} | Потерь: {today_losses})"
+        if today_trades else "<i>сделок пока не закрыто</i>"
+    )
+
     lines = [
         "📊 <b>ДЕТАЛЬНАЯ СТАТИСТИКА ТОРГОВЛИ</b>\n",
         f"🎯 <b>Текущий режим бота:</b> <b>{mode_label}</b>",
+        f"📅 <b>Итог за сегодня ({now_khv.strftime('%d.%m')}):</b> {today_summary_str}",
         "━━━━━━━━━━━━━━━━━━━━",
         "⚡ <b>БОЕВАЯ ТОРГОВЛЯ (РЕАЛЬНЫЕ ДЕНЬГИ):</b>",
         f"• Закрыто сделок: <b>{real_s.get('total', 0)}</b> (Побед: {real_s.get('wins', 0)} | Потерь: {real_s.get('losses', 0)})",
@@ -1249,10 +1274,33 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
             icon = "✅" if pnl_c > 0 else "🛑"
             sign = "+" if pnl_c >= 0 else ""
             reason = t.get("exit_reason") or "Плановое закрытие"
+
+            time_label = ""
+            raw_time = t.get("local_khv_time") or t.get("closed_at")
+            if raw_time:
+                try:
+                    if " " in str(raw_time):
+                        dt_part, tm_part = str(raw_time).split(" ", 1)
+                        t_date = datetime.strptime(dt_part, "%Y-%m-%d").date()
+                        hh_mm = tm_part[:5]
+                        if t_date == now_khv.date():
+                            time_label = f"Сегодня {hh_mm}"
+                        elif (now_khv.date() - t_date).days == 1:
+                            time_label = f"Вчера {hh_mm}"
+                        else:
+                            time_label = f"{t_date.strftime('%d.%m')} {hh_mm}"
+                    else:
+                        time_label = str(raw_time)[:10]
+                except Exception:
+                    time_label = str(raw_time)[:16]
+            elif t.get("target_date"):
+                time_label = f"рынок {t.get('target_date')}"
+
+            time_prefix = f"🕒 <i>{time_label}</i> | " if time_label else ""
             lines.append(
                 f"{tag} {icon} <b>{city}</b> (<code>{outcomes}</code>): "
                 f"<b>{sign}{pnl_c:.0f}¢ ({sign}{pnl_p:.0f}%)</b>\n"
-                f"   └ <i>Причина:</i> {reason}"
+                f"   └ {time_prefix}<i>Причина:</i> {reason}"
             )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
