@@ -515,6 +515,9 @@ ALL_RADAR_CITIES_MAP = {
 # Кэш метеоданных для защиты NOAA и Open-Meteo от частых опросов: icao -> {"ts": float, "noaa_data": dict, "forecast_data": dict}
 _WEATHER_METRICS_CACHE: Dict[str, Dict[str, Any]] = {}
 
+# Таймер дебаунса для защиты от выбивания стопов маркетмейкером: pos_id -> timestamp_начала_падения
+_POSITION_DROP_TRACKER: Dict[int, float] = {}
+
 
 async def collect_city_metrics(icao: str) -> Dict[str, Any]:
     """Собирает полный набор метеометрик и моделей по одному городу с кэшированием погоды."""
@@ -922,20 +925,42 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
         )
 
         target_temp = extract_temp_value(target_outcomes)
+        peak_price = max(float(user_position.get("peak_price") or entry_price), cur_price)
+        trailing_active = int(user_position.get("trailing_active") or 0)
 
-        # 1. Триггер Тейк-Профита (Take-Profit Alert: реальный профит >= +35% или >= +14¢, либо супер-цена >= 75¢)
-        if (entry_price > 0 and (((cur_price - entry_price) / entry_price >= 0.35 and (cur_price - entry_price) >= 10.0) or (cur_price - entry_price) >= 14.0)) or cur_price >= 75.0:
+        # 1. Тейк-Профит и Трейлинг-замок:
+        if cur_price >= 75.0:
             verdict = (
-                f"🚨 <b>ТЕЙК-ПРОФИТ (ВЫХОДИ ЛИМИТКОЙ)</b> — Цель импульса закрыта ({pnl_str}). "
+                f"🚨 <b>ТЕЙК-ПРОФИТ (ВЫХОДИ ЛИМИТКОЙ)</b> — Цена в стакане достигла {cur_price:.0f}¢ ({pnl_str}). "
                 f"До экспирации не сидеть! Сбрасывай страйк по лимитке в стакан прямо сейчас!"
             )
-        # 2. Триггер Тайм-Стопа (по достижении сезонного часа отсечки)
+        elif trailing_active and (peak_price - cur_price) >= 5.0 and cur_price > entry_price:
+            verdict = (
+                f"🎉 <b>ТРЕЙЛИНГ-ТЕЙК (ЗАМОК ПРИБЫЛИ)</b> — Откат от пика {peak_price:.0f}¢ до {cur_price:.0f}¢ ({pnl_str}). "
+                f"Выход на откате для фиксации прибыли!"
+            )
+        elif trailing_active and cur_price <= entry_price:
+            verdict = (
+                f"🛡️ <b>БЕЗУБЫТОК ПОСЛЕ ТРЕЙЛИНГА</b> — Цена вернулась к входу {entry_price:.0f}¢ (пик был {peak_price:.0f}¢). "
+                f"Сброс позиции в ноль для защиты капитала."
+            )
+        # 2. Триггеры Перегрева и Пробития страйка:
+        elif target_temp is not None and temp_c is not None and temp_c >= target_temp and local_time_val <= 13.5 and rate_val >= 0.2:
+            verdict = (
+                f"☀️ <b>РАННИЙ ПЕРЕГРЕВ СТРАЙКА ({temp_c:.1f}°C)</b> — Цель достигнута до 13:30 LT при активном солнце (+{rate_val:.1f}°C/ч). "
+                f"Овершут неизбежен, сбрасывай страйк на пике цены!"
+            )
+        elif target_temp is not None and temp_c is not None and temp_c > target_temp:
+            verdict = (
+                f"🛑 <b>ЦЕЛЬ ПРОБИТА ВВЕРХ ({temp_c:.1f}°C > {target_temp:.0f}°C)</b> — Страйк математически сгорел, спасение остатка!"
+            )
+        # 3. Триггер Сезонного Тайм-Стопа:
         elif (local_time_val >= heating_cutoff or "Окно закрыто" in rem_hours) and (target_temp and temp_c and temp_c < target_temp):
             cutoff_m = int((heating_cutoff % 1) * 60)
             verdict = (
                 f"⏱️ <b>ТАЙМ-СТОП ({int(heating_cutoff)}:{cutoff_m:02d} LT)</b> — Сброс в рынок для спасения остаточной стоимости! Окно инсоляции закрыто, цель не пробита."
             )
-        # 3. Триггер Физического слома (обложные осадки / плотный Stratus при отставании от цели >= 1.5°C):
+        # 4. Триггер Физического слома:
         elif is_blocking_rain_and_clouds(raw_metar) and (target_temp is None or temp_c is None or (target_temp - temp_c) >= 1.5):
             verdict = (
                 f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — На станцию вышли обложные осадки / плотный низкий Stratus!"
@@ -944,14 +969,13 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
             verdict = (
                 f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — После полудня темп затух под низкой облачностью, отставание от цели {target_temp - temp_c:.1f}°C критично!"
             )
-        # 4. Триггер Неблагоприятного отбора (Adverse Selection — дневное падение цены на >= 8¢ в стакане):
+        # 5. Триггер Неблагоприятного отбора (Adverse Selection — дневное падение цены на >= 8¢ в стакане):
         elif entry_price > 0 and (entry_price - cur_price) >= 8.0 and local_time_val >= 10.5:
             drop_cents = entry_price - cur_price
             verdict = (
                 f"⚠️ <b>ТРЕВОГА (ПАДЕНИЕ СТАКАНА: -{drop_cents:.0f}¢)</b> — Рынок прайсит свежий радар (adverse selection). Проверь облачность и будь готов к выходу!"
             )
-        # 5. Утреннее развитие и удержание:
-        # ВАЖНО: До 12:30 LT утреннее замедление или высокая облачность НЕ инвалидируют позицию!
+        # 6. Утреннее развитие и удержание:
         elif local_time_val < 12.5:
             if rate_val < 0.4 and local_hour >= 9:
                 verdict = (
@@ -1189,9 +1213,12 @@ async def check_and_execute_auto_sell(
     heating_cutoff, _ = get_seasonal_heating_cutoff(local_dt.month, icao=icao)
     target_temp = extract_temp_value(target_outcomes)
 
-    # 1. Активация трейлинга: только при реальном профите от цены входа (+35% и >= +10¢, либо >= +14¢)
+    # 1. Активация трейлинга: при уверенном профите от цены входа (+20% и >= +7¢, либо прирост >= +12¢)
     if not trailing_active:
-        if entry_price > 0 and (((cur_price - entry_price) / entry_price >= 0.35 and (cur_price - entry_price) >= 10.0) or (cur_price - entry_price) >= 14.0):
+        if entry_price > 0 and (
+            ((cur_price - entry_price) / entry_price >= 0.20 and (cur_price - entry_price) >= 7.0)
+            or (cur_price - entry_price) >= 12.0
+        ):
             trailing_active = 1
             await asyncio.to_thread(update_position_trailing, pos_id, peak_price, 1)
 
@@ -1200,15 +1227,40 @@ async def check_and_execute_auto_sell(
 
     trigger_reason = None
 
+    # Дебаунс падения стакана для защиты от выбивания маркетмейкером (>= 45 секунд)
+    is_drop_condition = (
+        entry_price > 0
+        and cur_price < entry_price
+        and ((entry_price - cur_price) >= 12.0 or ((entry_price - cur_price) / entry_price) >= 0.25)
+    )
+    if is_drop_condition:
+        first_drop = _POSITION_DROP_TRACKER.setdefault(pos_id, time.time())
+        drop_duration = time.time() - first_drop
+    else:
+        _POSITION_DROP_TRACKER.pop(pos_id, None)
+        first_drop = None
+        drop_duration = 0.0
+
     # Триггер А-0: Абсолютный Тейк-Профит (фиксация при супер-цене >= 75¢)
     if cur_price >= 75.0:
         trigger_reason = f"🚨 ТЕЙК-ПРОФИТ (ЦЕЛЬ ВЫШЕ 75¢): Цена в стакане {cur_price:.0f}¢, фиксация сверхприбыли"
 
-    # Триггер А: Трейлинг-выход (замок прибыли сработал на откате 5–6¢ от пика, строго в плюсе относительно входа)
+    # Триггер А-1: Трейлинг-выход (замок прибыли сработал на откате 5¢ от пика, строго в плюсе относительно входа)
     elif trailing_active and (peak_price - cur_price) >= 5.0 and cur_price > entry_price and cur_price > 0:
         trigger_reason = f"🎉 ТРЕЙЛИНГ-ТЕЙК (ЗАМОК ПРИБЫЛИ): Пик был {peak_price:.0f}¢, выход на откате по {cur_price:.0f}¢"
 
-    # Триггер Б: Превышение температуры (цель пробита вверх, исход математически сгорел)
+    # Триггер А-2: Безубыток после трейлинга (Breakeven Lock: возврат к цене входа или ниже после активации трейлинга)
+    elif trailing_active and cur_price <= entry_price and cur_price > 0:
+        trigger_reason = f"🛡️ БЕЗУБЫТОК ПОСЛЕ ТРЕЙЛИНГА (BREAKEVEN LOCK): Возврат к цене входа {entry_price:.0f}¢ (пик был {peak_price:.0f}¢), защита капитала"
+
+    # Триггер Б-1: Ранний перегрев страйка (до 13:30 LT станция уже на цели, овершут неизбежен прогревом солнца)
+    elif target_temp is not None and temp_c is not None and temp_c >= target_temp and local_time_val <= 13.5 and rate_val >= 0.2:
+        trigger_reason = (
+            f"☀️ РАННИЙ ПЕРЕГРЕВ СТРАЙКА ({temp_c:.1f}°C при цели {target_temp:.0f}°C в {local_dt.strftime('%H:%M')} LT): "
+            f"Пик солнца впереди (+{rate_val:.1f}°C/ч), фиксация прибыли перед овершутом"
+        )
+
+    # Триггер Б-2: Превышение температуры (цель пробита вверх, исход математически сгорел)
     elif target_temp is not None and temp_c is not None and temp_c > target_temp:
         trigger_reason = f"🛑 ЦЕЛЬ ПРОБИТА ВВЕРХ ({temp_c:.1f}°C > {target_temp:.0f}°C): Страйк {target_outcomes} сгорел, спасение остатка"
 
@@ -1223,25 +1275,19 @@ async def check_and_execute_auto_sell(
     elif 12.5 <= local_time_val <= heating_cutoff and (rate_val < 0.4 and has_real_low_cloud(raw_metar) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
         trigger_reason = "🛑 ПОГОДНЫЙ ПАРАШЮТ: Затухание темпа под плотной облачностью"
 
-    # Триггер Д: Стоп-лосс / Защита от неблагоприятного отбора (глубокий обвал стакана >= 15¢ и >= 35% при подтвержденном риске слома погоды)
-    elif (
-        entry_price > 0
-        and (entry_price - cur_price) >= 15.0
-        and (entry_price - cur_price) / entry_price >= 0.35
-        and local_time_val >= 11.5
-        and target_temp is not None
-        and temp_c is not None
-        and (
-            (temp_c >= target_temp and rate_val >= 0.6)
-            or (local_time_val >= 12.5 and (target_temp - temp_c) >= 1.5 and rate_val < 0.5)
-        )
-    ):
+    # Триггер Д: Анти-манипуляция Стоп-Лосс (устойчивый обвал стакана >= 12¢ или >= 25% держится >= 45 сек)
+    elif is_drop_condition and drop_duration >= 45.0:
         drop_cents = entry_price - cur_price
         drop_pct = (drop_cents / entry_price) * 100
-        trigger_reason = f"🛑 СТОП-ЛОСС (ОБВАЛ СТАКАНА НА -{drop_cents:.0f}¢ / -{drop_pct:.0f}%): Сброс позиции для спасения депозита (вход: {entry_price:.0f}¢, сейчас: {cur_price:.0f}¢)"
+        trigger_reason = (
+            f"🛑 АНТИ-МАНИПУЛЯЦИЯ СТОП-ЛОСС (-{drop_cents:.0f}¢ / -{drop_pct:.0f}% держится {int(drop_duration)}с): "
+            f"Подтвержденный обвал стакана, спасение депозита (вход: {entry_price:.0f}¢, сейчас: {cur_price:.0f}¢)"
+        )
 
     if not trigger_reason:
         return None
+
+    _POSITION_DROP_TRACKER.pop(pos_id, None)
 
     is_paper = int(pos.get("is_paper") or 0)
     if is_paper:

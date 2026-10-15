@@ -1185,7 +1185,7 @@ def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
                 text_sections.append(
                     f"• <b>{city_label}</b>: <code>{p_out}</code> "
                     f"(вход: <b>{p_entry:.0f}¢</b> | <b>${cost_usd:.2f} USDC</b>{shares_str}{conf_s})\n"
-                    f"  └ <i>Дата:</i> <code>{pos['target_date']}</code> | 🛡️ Трейлинг + Погодный парашют"
+                    f"  └ <i>Дата:</i> <code>{pos['target_date']}</code> | 🛡️ Трейлинг + Безубыток + Анти-манипуляция"
                 )
                 buttons.append([
                     InlineKeyboardButton(text=f"⚡ AI: {pos['icao']}", callback_data=f"express_scan:{pos['icao']}"),
@@ -1205,7 +1205,7 @@ def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
                 text_sections.append(
                     f"• <b>{city_label}</b>: <code>{p_out}</code> "
                     f"(вход: <b>{p_entry:.0f}¢</b> | <b>${cost_usd:.2f} USDC</b>{shares_str}{conf_s})\n"
-                    f"  └ <i>Дата:</i> <code>{pos['target_date']}</code> | 🧪 Тестовая позиция"
+                    f"  └ <i>Дата:</i> <code>{pos['target_date']}</code> | 🧪 Тест | 🛡️ Трейлинг + Безубыток + Анти-манипуляция"
                 )
                 buttons.append([
                     InlineKeyboardButton(text=f"⚡ AI: {pos['icao']}", callback_data=f"express_scan:{pos['icao']}"),
