@@ -3,12 +3,12 @@
 
 Регламент работы:
 1. Синхронизация с METAR (строго 2 раза в час):
-   Европейские станции выпускают сводки в :00 и :30 (в NOAA поступают к :02 и :32).
-   Дайджест отправляется строго в :02 и :32 минуты каждого часа (ХБР / UTC).
-   Никакого спама при перезапусках: сон точно рассчитывается до ближайшей точки :02 или :32.
+   Европейские и азиатские станции выпускают сводки в :00 и :30 (в NOAA гарантированно поступают к :07 и :37).
+   Дайджест отправляется строго в :07 и :37 минут каждого часа (ХБР / UTC).
+   Никакого спама при перезапусках: сон точно рассчитывается до ближайшей точки :07 или :37.
 2. Тайм-фильтр:
    Активен строго с 10:00 до 00:00 по времени Хабаровска (UTC+10).
-   В ночные часы (00:00–10:00 ХБР) сканер спит до 10:02.
+   В ночные часы (00:00–10:00 ХБР) сканер спит до 10:07.
 3. Устранение ложного СКИПа из-за ночного выхолаживания:
    - Если местное время станции LT < 09:00: расчет темпа и триггер физического слома
      НЕ переводят рынок в СКИП. Фиксируется только утренняя база (Morning Floor),
@@ -16,9 +16,9 @@
    - Триггер физического слома прогрева (темп < +0.4°C/ч при BKN/OVC) активируется
      СТРОГО в окне активной дневной инсоляции: с 10:30 LT до 15:00 LT.
 4. Единый дайджест:
-   Все 4 города (Лондон, Париж, Милан, Мадрид) объединяются в ОДИН пост.
-   - Первое сообщение дня (10:02 ХБР): «🌅 НОВЫЙ ТОРГОВЫЙ ДЕНЬ | БАЗОВЫЙ ПРОГНОЗ ([ДАТА])».
-   - Последующие (каждые :02 и :32): «🔄 ОБНОВЛЕНИЕ НА HH:MM ХБР | ДИНАМИКА».
+   Все избранные города объединяются в ОДИН пост.
+   - Первое сообщение дня (10:07 ХБР): «🌅 НОВЫЙ ТОРГОВЫЙ ДЕНЬ | БАЗОВЫЙ ПРОГНОЗ ([ДАТА])».
+   - Последующие (каждые :07 и :37): «🔄 ОБНОВЛЕНИЕ НА HH:MM ХБР | ДИНАМИКА».
 5. Персонализация позиций (positions.db):
    При наличии открытой сделки блок города дополняется PnL, триггерами Тейк-Профита (>= +35% / >= 60¢),
    Тайм-Стопа (13:30 LT) и дневного физического слома. Без сделки слово «CASHOUT» не используется.
@@ -150,49 +150,49 @@ def is_khv_active_hours() -> bool:
 
 def get_next_sleep_seconds(now: datetime) -> Tuple[float, datetime, str]:
     """
-    Рассчитывает целевое время следующей контрольной точки (:02 или :32)
+    Рассчитывает целевое время следующей контрольной точки (:07 или :37)
     и точное количество секунд сна до неё.
-    С буфером в 2 секунды (:02:02 / :32:02) для гарантированного попадания в NOAA METAR.
+    С буфером в 2 секунды (:07:02 / :37:02) для гарантированного получения самых свежих данных NOAA METAR.
     Учитывает торговое окно 10:00 - 24:00 ХБР:
-    - Ночью (после 23:32:02 и до 10:02:02 ХБР) сканер спит строго до утренней точки 10:02:02!
+    - Ночью (после 23:37:02 и до 10:07:02 ХБР) сканер спит строго до утренней точки 10:07:02!
     """
-    # 1. Если сейчас глухая ночь (00:00 - 09:59 ХБР): спим до 10:02:02 сегодня
+    # 1. Если сейчас глухая ночь (00:00 - 09:59 ХБР): спим до 10:07:02 сегодня
     if now.hour < 10:
-        target = now.replace(hour=10, minute=2, second=2, microsecond=0)
+        target = now.replace(hour=10, minute=7, second=2, microsecond=0)
         sleep_secs = max(1.0, (target - now).total_seconds())
         slot_key = target.strftime("%Y-%m-%d %H:%M")
         return sleep_secs, target, slot_key
 
-    # 2. Если сейчас 23:32 или позже: последний дневной цикл завершен, спим до 10:02:02 завтра
-    if now.hour == 23 and (now.minute > 32 or (now.minute == 32 and now.second >= 2)):
+    # 2. Если сейчас 23:37 или позже: последний дневной цикл завершен, спим до 10:07:02 завтра
+    if now.hour == 23 and (now.minute > 37 or (now.minute == 37 and now.second >= 2)):
         tomorrow = now + timedelta(days=1)
-        target = tomorrow.replace(hour=10, minute=2, second=2, microsecond=0)
+        target = tomorrow.replace(hour=10, minute=7, second=2, microsecond=0)
         sleep_secs = max(1.0, (target - now).total_seconds())
         slot_key = target.strftime("%Y-%m-%d %H:%M")
         return sleep_secs, target, slot_key
 
-    # 3. Внутри активного торгового окна (10:00 - 23:32):
-    if now.minute < 2 or (now.minute == 2 and now.second < 2):
-        target = now.replace(minute=2, second=2, microsecond=0)
-    elif now.minute < 32 or (now.minute == 32 and now.second < 2):
-        target = now.replace(minute=32, second=2, microsecond=0)
+    # 3. Внутри активного торгового окна (10:00 - 23:37):
+    if now.minute < 7 or (now.minute == 7 and now.second < 2):
+        target = now.replace(minute=7, second=2, microsecond=0)
+    elif now.minute < 37 or (now.minute == 37 and now.second < 2):
+        target = now.replace(minute=37, second=2, microsecond=0)
     else:
         next_hour = now + timedelta(hours=1)
         if next_hour.hour < 10 or next_hour.day != now.day:
-            target = next_hour.replace(hour=10, minute=2, second=2, microsecond=0)
+            target = next_hour.replace(hour=10, minute=7, second=2, microsecond=0)
         else:
-            target = next_hour.replace(minute=2, second=2, microsecond=0)
+            target = next_hour.replace(minute=7, second=2, microsecond=0)
 
     sleep_secs = (target - now).total_seconds()
     if sleep_secs <= 0.1:
-        if now.minute < 32:
-            target = now.replace(minute=32, second=2, microsecond=0)
+        if now.minute < 37:
+            target = now.replace(minute=37, second=2, microsecond=0)
         else:
             next_hour = now + timedelta(hours=1)
             if next_hour.hour < 10 or next_hour.day != now.day:
-                target = next_hour.replace(hour=10, minute=2, second=2, microsecond=0)
+                target = next_hour.replace(hour=10, minute=7, second=2, microsecond=0)
             else:
-                target = next_hour.replace(minute=2, second=2, microsecond=0)
+                target = next_hour.replace(minute=7, second=2, microsecond=0)
         sleep_secs = max(1.0, (target - now).total_seconds())
 
     slot_key = target.strftime("%Y-%m-%d %H:%M")
@@ -2398,7 +2398,7 @@ async def run_auto_scanner(bot: Bot) -> None:
     В 23:32 формирует и рассылает дневной аудиторский отчет и уходит в ночной сон до 10:02.
     """
     global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT, _LAST_AUDIT_REPORT_DATE, _LAST_1900_BRIEFING_DATE
-    logger.info("🚀 Консолидированный автосканер запущен (Окно: 10:00 - 24:00 ХБР, METAR: :02 и :32).")
+    logger.info("🚀 Консолидированный автосканер запущен (Окно: 10:00 - 24:00 ХБР, METAR: :07 и :37).")
 
     # Запускаем непрерывный высокочастотный мониторинг позиций (каждые 15 сек при наличии сделок)
     asyncio.create_task(run_position_monitor(bot))
@@ -2407,24 +2407,24 @@ async def run_auto_scanner(bot: Bot) -> None:
         try:
             now_khv = datetime.now(KHV_TZ)
 
-            # 1. Проверяем контрольную точку (:02 или :32) только если мы в активных часах
+            # 1. Проверяем контрольную точку (:07 или :37) только если мы в активных часах
             current_checkpoint_slot: Optional[str] = None
             if is_khv_active_hours():
-                if now_khv.minute in (2, 3):
-                    current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:02"
-                elif now_khv.minute in (32, 33):
-                    current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:32"
+                if now_khv.minute in (7, 8):
+                    current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:07"
+                elif now_khv.minute in (37, 38):
+                    current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:37"
 
             # 2. Если мы в контрольной точке И дайджест для этого слота еще не отправлялся — отправляем!
             if current_checkpoint_slot and current_checkpoint_slot != _LAST_SENT_SLOT:
                 today_khv_str = now_khv.strftime("%Y-%m-%d")
 
-                # Утренний базовый пост отправляется на первом слоте 10:00 ХБР
+                # Утренний базовый пост отправляется на первом слоте 10:00 ХБР (10:07)
                 is_morning_base = False
                 if now_khv.hour == 10 and _LAST_MORNING_DIGEST_DATE != today_khv_str:
                     is_morning_base = True
                     _LAST_MORNING_DIGEST_DATE = today_khv_str
-                    logger.info("🌅 Формирование утреннего базового прогноза (10:02 ХБР)...")
+                    logger.info("🌅 Формирование утреннего базового прогноза (10:07 ХБР)...")
                 else:
                     logger.info(f"🔄 Сбор планового METAR-обновления ({current_checkpoint_slot} ХБР)...")
 
@@ -2453,7 +2453,7 @@ async def run_auto_scanner(bot: Bot) -> None:
                                     "rem_hours_str": cm.get("rem_hours_str", "Н/Д"),
                                     "orderbook": cm.get("orderbook", []),
                                     "user_position": None,
-                                },
+                                    },
                             )
                     except Exception as trk_err:
                         logger.debug(f"Не удалось зафиксировать срез в daily_tracker: {trk_err}")
@@ -2466,8 +2466,8 @@ async def run_auto_scanner(bot: Bot) -> None:
                 _LAST_SENT_SLOT = current_checkpoint_slot
                 logger.info(f"✅ Дайджест {current_checkpoint_slot} ХБР успешно разослан.")
 
-                # 3. Если это завершающий вечерний цикл дня (23:32 ХБР) — формируем и рассылаем дневной отчет
-                if now_khv.hour == 23 and now_khv.minute in (32, 33) and _LAST_AUDIT_REPORT_DATE != today_khv_str:
+                # 3. Если это завершающий вечерний цикл дня (23:37 ХБР) — формируем и рассылаем дневной отчет
+                if now_khv.hour == 23 and now_khv.minute in (37, 38) and _LAST_AUDIT_REPORT_DATE != today_khv_str:
                     _LAST_AUDIT_REPORT_DATE = today_khv_str
                     logger.info("🌙 Торговое окно 10:00-24:00 закрывается. Отправка итогового аудиторского отчета за день...")
                     try:
