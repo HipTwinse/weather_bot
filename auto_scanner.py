@@ -1778,7 +1778,8 @@ async def check_and_execute_auto_buy(
                     f"🛡️ <b>НЕЙРОСЕТЬ ОТКЛОНИЛА СДЕЛКУ (ЗАЩИТА ДЕПОЗИТА)</b>\n\n"
                     f"• <b>Локация:</b> {cand['city_name']}\n"
                     f"• <b>Исход:</b> <code>{cand['outcomes']}</code> (цена: <b>{cand['price_cents']:.0f}¢</b>)\n"
-                    f"• <b>Сумма теста:</b> <b>${trade_cost:.2f} USDC</b> (доля: <b>{risk_pct}%</b> от депозита)\n"
+                    f"• <b>Баланс кошелька:</b> <b>${effective_balance:.2f} USDC</b> (свободно: <b>${free_cash:.2f} USDC</b>)\n"
+                    f"• <b>Сайз теста:</b> <b>${trade_cost:.2f} USDC</b> (доля: <b>{risk_pct}%</b> от депозита | ~{shares:.2f} шт.)\n"
                     f"• <b>Рейтинг формулы:</b> {cand['conf_score']:.0f}/100 (математический фильтр был пройден)\n"
                     f"• <b>Вердикт AI-синоптика:</b> 🛑 <i>{ai_reason}</i>\n\n"
                     f"💡 <i>Реальная покупка отменена для защиты баланса! Исход переведен в бумажный тест (${trade_cost:.2f} USDC) для проверки точности нейросети.</i>"
@@ -1834,7 +1835,8 @@ async def check_and_execute_auto_buy(
                         f"• <b>Локация:</b> {cand['city_name']}\n"
                         f"• <b>Выбранный исход:</b> <code>{cand['outcomes']}</code>\n"
                         f"• <b>Цена входа:</b> <b>{cand['price_cents']:.0f}¢</b>\n"
-                        f"• <b>Сумма ордера:</b> <b>${trade_cost:.2f} USDC</b> (доля: <b>{risk_pct}%</b> от баланса, ~{shares:.2f} долей)\n"
+                        f"• <b>Баланс кошелька:</b> <b>${effective_balance:.2f} USDC</b> (свободно: <b>${free_cash:.2f} USDC</b>)\n"
+                        f"• <b>Сайз позиции:</b> <b>${trade_cost:.2f} USDC</b> (доля: <b>{risk_pct}%</b> от баланса | ~{shares:.2f} шт.)\n"
                         f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n"
                         f"• <b>AI-валидация:</b> 🟢 <b>ОДОБРЕНО НЕЙРОСЕТЬЮ</b> (<i>{ai_reason}</i>)\n\n"
                         f"<b>Факторы выбора:</b>\n{reasons_str}\n\n"
@@ -1903,6 +1905,7 @@ async def check_and_execute_auto_buy(
                     cand["conf_score"],
                 )
                 open_allocated += trade_cost
+                free_cash = max(0.0, effective_balance - open_allocated)
                 if mode == "PAPER":
                     reason_note = f"Режим бота: 🧪 ТЕСТ (риск {risk_pct}% от банка)"
                 elif not has_pk:
@@ -1936,7 +1939,8 @@ async def check_and_execute_auto_buy(
                     f"• <b>Локация:</b> {cand['city_name']}\n"
                     f"• <b>Исход:</b> <code>{cand['outcomes']}</code>\n"
                     f"• <b>Виртуальная цена входа:</b> <b>{cand['price_cents']:.0f}¢</b>\n"
-                    f"• <b>Сумма ордера:</b> <b>${trade_cost:.2f} USDC</b> (доля: <b>{risk_pct}%</b> от депозита, ~{shares:.2f} долей)\n"
+                    f"• <b>Виртуальный баланс:</b> <b>${effective_balance:.2f} USDC</b> (свободно: <b>${free_cash:.2f} USDC</b>)\n"
+                    f"• <b>Сайз позиции:</b> <b>${trade_cost:.2f} USDC</b> (доля: <b>{risk_pct}%</b> от депозита | ~{shares:.2f} шт.)\n"
                     f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n"
                     f"{ai_paper_line}"
                     f"• <b>Причина виртуального входа:</b> <i>{reason_note}</i>\n"

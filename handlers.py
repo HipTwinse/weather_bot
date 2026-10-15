@@ -1249,15 +1249,17 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
     ]
     today_pnl_cents = sum((float(t.get("pnl_cents") or 0.0) * float(t.get("shares") or 1.0)) for t in today_trades)
     today_wins = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) > 0)
-    today_losses = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) <= 0)
-    sign_today = "+" if today_pnl_cents >= 0 else ""
+    today_losses = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) < 0)
+    today_be = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) == 0)
+    sign_today = "+" if today_pnl_cents > 0 else ""
     today_pnl_usd = today_pnl_cents / 100.0
     daily_roi_pct = (today_pnl_usd / p_bal["initial_deposit"] * 100.0) if p_bal["initial_deposit"] > 0 else 0.0
-    daily_roi_sign = "+" if daily_roi_pct >= 0 else ""
+    daily_roi_sign = "+" if daily_roi_pct > 0 else ""
 
+    be_str = f" | В ноль: {today_be}" if today_be else ""
     today_summary_str = (
         f"<b>{sign_today}${today_pnl_usd:.2f} USDC ({daily_roi_sign}{daily_roi_pct:.1f}%)</b> "
-        f"(Побед: {today_wins} | Потерь: {today_losses})"
+        f"(Побед: {today_wins} | Потерь: {today_losses}{be_str})"
         if today_trades else "<i>сделок пока не закрыто</i>"
     )
 
@@ -1281,13 +1283,42 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
         f"• Винрейт (Win Rate): <b>{paper_s.get('winrate', 0.0):.1f}%</b>",
         f"• Риск-модель: <b>Динамический 5-10% от банка (Kelly)</b>\n",
         "━━━━━━━━━━━━━━━━━━━━",
-        "📋 <b>ПОСЛЕДНИЕ ЗАКРЫТЫЕ СДЕЛКИ:</b>",
     ]
+
+    # Раздел активных сделок прямо в статистике
+    real_positions, paper_positions = get_user_positions_split(user_id)
+    all_active = real_positions + paper_positions
+    lines.append(f"📌 <b>АКТИВНЫЕ СДЕЛКИ В РЫНКЕ ({len(all_active)}):</b>")
+    if not all_active:
+        lines.append("<i>Сейчас активных сделок нет (бот вне рынка / ожидает вход)</i>\n")
+    else:
+        for p in all_active:
+            p_tag = "🧪" if p.get("is_paper") else "⚡"
+            city_name = ALL_RADAR_CITIES.get(p.get("icao", ""), p.get("icao", ""))
+            strike = p.get("outcomes", "")
+            e_price = float(p.get("entry_price") or 0.0)
+            sh = float(p.get("shares") or 1.0)
+            cost = (e_price * sh) / 100.0 if sh > 0 else 0.0
+            conf = float(p.get("confidence_score") or 0.0)
+            t_date = p.get("target_date", "")
+            lines.append(
+                f"{p_tag} <b>{city_name}</b> (<code>{strike}</code> | {t_date}): "
+                f"вход <b>{e_price:.0f}¢</b> [<b>${cost:.2f}</b>, ~{sh:.2f} шт.] (надежность: {conf:.0f}/100)"
+            )
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("📋 <b>ПОСЛЕДНИЕ ЗАКРЫТЫЕ СДЕЛКИ:</b>")
 
     if not recent_trades:
         lines.append("<i>История закрытых сделок пока пуста. После фиксации первой прибыли или стоп-лосса здесь появится разбор.</i>")
     else:
-        for t in recent_trades[:7]:
+        from datetime import timedelta
+        yesterday_khv_date = now_khv.date() - timedelta(days=1)
+        yesterday_khv_str = yesterday_khv_date.strftime("%Y-%m-%d")
+
+        last_day_group = None
+        for t in recent_trades[:8]:
             tag = "🧪" if t.get("is_paper") else "⚡"
             city = ALL_RADAR_CITIES.get(t.get("icao", ""), t.get("icao", ""))
             outcomes = t.get("outcomes", "")
@@ -1297,33 +1328,49 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
             pnl_usd = (pnl_c * shares) / 100.0
             entry_p = float(t.get("entry_price") or 0.0)
             cost_usd = (entry_p * shares) / 100.0 if shares > 0 else 0.0
-            icon = "✅" if pnl_c > 0 else "🛑"
-            sign_usd = "+" if pnl_usd >= 0 else ""
-            sign_p = "+" if pnl_p >= 0 else ""
+            icon = "✅" if pnl_c > 0 else ("⚪" if pnl_c == 0 else "🛑")
+            sign_usd = "+" if pnl_usd > 0 else ""
+            sign_p = "+" if pnl_p > 0 else ""
             reason = t.get("exit_reason") or "Плановое закрытие"
 
-            time_label = ""
             raw_time = t.get("local_khv_time") or t.get("closed_at")
+            trade_day_str = ""
+            time_hm = ""
             if raw_time:
                 try:
-                    if " " in str(raw_time):
-                        dt_part, tm_part = str(raw_time).split(" ", 1)
-                        t_date = datetime.strptime(dt_part, "%Y-%m-%d").date()
-                        hh_mm = tm_part[:5]
-                        if t_date == now_khv.date():
-                            time_label = f"Сегодня {hh_mm}"
-                        elif (now_khv.date() - t_date).days == 1:
-                            time_label = f"Вчера {hh_mm}"
-                        else:
-                            time_label = f"{t_date.strftime('%d.%m')} {hh_mm}"
+                    s_raw = str(raw_time)
+                    if " " in s_raw:
+                        dt_part, tm_part = s_raw.split(" ", 1)
+                        trade_day_str = dt_part
+                        time_hm = tm_part[:5]
                     else:
-                        time_label = str(raw_time)[:10]
+                        trade_day_str = s_raw[:10]
                 except Exception:
-                    time_label = str(raw_time)[:16]
+                    trade_day_str = str(raw_time)[:10]
             elif t.get("target_date"):
-                time_label = f"рынок {t.get('target_date')}"
+                trade_day_str = str(t.get("target_date"))
 
-            time_prefix = f"🕒 <i>{time_label}</i> | " if time_label else ""
+            # Визуальный разделитель между днями
+            if trade_day_str:
+                if trade_day_str == today_khv_str:
+                    current_group = "today"
+                    header_line = "─── 📅 Сегодня ───"
+                elif trade_day_str == yesterday_khv_str:
+                    current_group = "yesterday"
+                    header_line = "─── 📅 Вчера ───"
+                else:
+                    current_group = trade_day_str
+                    try:
+                        d_obj = datetime.strptime(trade_day_str, "%Y-%m-%d").date()
+                        header_line = f"─── 📅 {d_obj.strftime('%d.%m')} ───"
+                    except Exception:
+                        header_line = f"─── 📅 {trade_day_str} ───"
+
+                if current_group != last_day_group:
+                    lines.append(header_line)
+                    last_day_group = current_group
+
+            time_prefix = f"🕒 <i>{time_hm}</i> | " if time_hm else ""
             cost_str = f" [вход: ${cost_usd:.2f}]" if cost_usd > 0 else ""
             lines.append(
                 f"{tag} {icon} <b>{city}</b> (<code>{outcomes}</code>): "

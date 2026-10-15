@@ -125,12 +125,12 @@ async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -
 
             # Восстановление базы данных и активных сделок из облачного сейфа Telegram
             try:
-                from state_sync import restore_state_from_telegram, sync_state_to_telegram
+                from state_sync import restore_state_from_telegram
                 restored = await restore_state_from_telegram(bot)
                 if restored:
                     logger.info("💾 Состояние успешно восстановлено из облачного сейфа Telegram.")
                 else:
-                    await sync_state_to_telegram(bot)
+                    logger.warning("ℹ️ Сейф Telegram не был восстановлен при старте. Перезапись сейфа отменена для защиты открытых позиций.")
             except Exception as e_safe:
                 logger.warning(f"Ошибка инициализации облачного сейфа: {e_safe}")
 

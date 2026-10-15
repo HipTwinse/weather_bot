@@ -427,7 +427,7 @@ def get_trading_stats(user_id: int) -> Dict[str, Any]:
                    datetime(COALESCE(closed_at, created_at), '+10 hours') AS local_khv_time
             FROM user_positions
             WHERE user_id = ? AND status = 'CLOSED'
-            ORDER BY id DESC
+            ORDER BY COALESCE(closed_at, created_at) DESC, id DESC
         """, (user_id,))
         rows = [dict(r) for r in cursor.fetchall()]
 
@@ -441,7 +441,8 @@ def get_trading_stats(user_id: int) -> Dict[str, Any]:
                     "total_pnl_usd": 0.0, "avg_win_cents": 0.0, "avg_loss_cents": 0.0
                 }
             wins = [t for t in trades if (t.get("pnl_cents") or 0.0) > 0]
-            losses = [t for t in trades if (t.get("pnl_cents") or 0.0) <= 0]
+            losses = [t for t in trades if (t.get("pnl_cents") or 0.0) < 0]
+            breakevens = [t for t in trades if (t.get("pnl_cents") or 0.0) == 0]
             total_pnl_cents = sum((t.get("pnl_cents") or 0.0) * (float(t.get("shares") or 1.0)) for t in trades)
             winrate = round(len(wins) / len(trades) * 100.0, 1)
             avg_win = round(sum(t.get("pnl_cents") or 0.0 for t in wins) / len(wins), 1) if wins else 0.0
@@ -450,6 +451,7 @@ def get_trading_stats(user_id: int) -> Dict[str, Any]:
                 "total": len(trades),
                 "wins": len(wins),
                 "losses": len(losses),
+                "breakevens": len(breakevens),
                 "winrate": winrate,
                 "total_pnl_usd": round(total_pnl_cents / 100.0, 2),
                 "avg_win_cents": avg_win,
