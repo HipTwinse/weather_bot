@@ -1297,6 +1297,9 @@ async def check_and_execute_auto_sell(
         profit_usd = (cur_price - entry_price) * float(pos.get("shares") or 2.5) / 100.0
         profit_str = f"{'+' if profit_usd >= 0 else ''}${profit_usd:.2f}"
 
+        p_bal = await asyncio.to_thread(get_paper_balance, user_id)
+        roi_sign = "+" if p_bal["roi_percent"] >= 0 else ""
+
         await asyncio.to_thread(
             record_daily_action,
             user_id, "SELL_PAPER", icao, target_outcomes, cur_price,
@@ -1304,6 +1307,7 @@ async def check_and_execute_auto_sell(
                 "reason": trigger_reason,
                 "pnl_str": pnl_str,
                 "pnl_usd": profit_str,
+                "balance_after": f"${p_bal['total_equity']:.2f} USDC",
             }
         )
 
@@ -1313,7 +1317,8 @@ async def check_and_execute_auto_sell(
             f"• <b>Локация:</b> {city_name}\n"
             f"• <b>Исход:</b> <code>{target_outcomes}</code>\n"
             f"• <b>Вход:</b> <code>{entry_price:.0f}¢</code> | <b>Выход:</b> <b>{cur_price:.0f}¢</b>\n"
-            f"• <b>Результат:</b> <b>{pnl_str}</b> (Виртуальный PnL: <b>{profit_str}</b>)\n\n"
+            f"• <b>Результат:</b> <b>{pnl_str}</b> (Виртуальный PnL: <b>{profit_str}</b>)\n"
+            f"• <b>Итоговый банкролл:</b> <b>${p_bal['total_equity']:.2f} USDC</b> (свободно: <code>${p_bal['free_balance']:.2f}</code> | ROI: <b>{roi_sign}{p_bal['roi_percent']}%</b>)\n\n"
             f"📊 <i>Сделка зафиксирована в базе и добавлена в статистику винрейта.</i>"
         )
         try:
@@ -1391,6 +1396,21 @@ async def check_and_execute_auto_sell(
         profit_usd = (cur_price - entry_price) * shares / 100.0
         profit_str = f"{'+' if profit_usd >= 0 else ''}${profit_usd:.2f}"
 
+        real_bal_line = ""
+        bal_val_str = ""
+        try:
+            from clob_trader import get_wallet_collateral_balance
+            real_bal = await asyncio.to_thread(
+                get_wallet_collateral_balance,
+                wallet.get("private_key", ""),
+                wallet_address=wallet.get("wallet_address", ""),
+                proxy_address=proxy_addr,
+            )
+            real_bal_line = f"• <b>Итоговый баланс:</b> <b>${real_bal:.2f} USDC</b>\n"
+            bal_val_str = f"${real_bal:.2f} USDC"
+        except Exception:
+            pass
+
         await asyncio.to_thread(
             record_daily_action,
             user_id, "SELL_REAL", icao, target_outcomes, cur_price,
@@ -1399,6 +1419,7 @@ async def check_and_execute_auto_sell(
                 "pnl_str": pnl_str,
                 "pnl_usd": profit_str,
                 "shares": shares,
+                "balance_after": bal_val_str,
             }
         )
 
@@ -1408,7 +1429,8 @@ async def check_and_execute_auto_sell(
             f"• <b>Локация:</b> {city_name}\n"
             f"• <b>Исход:</b> <code>{target_outcomes}</code>\n"
             f"• <b>Объем:</b> <code>{shares:.2f} контрактов</code>\n"
-            f"• <b>Цена выхода:</b> <b>{cur_price:.0f}¢</b> (Вход: <code>{entry_price:.0f}¢</code> | Результат: <b>{pnl_str}</b>)\n\n"
+            f"• <b>Цена выхода:</b> <b>{cur_price:.0f}¢</b> (Вход: <code>{entry_price:.0f}¢</code> | Результат: <b>{pnl_str}</b> | PnL: <b>{profit_str}</b>)\n"
+            f"{real_bal_line}\n"
             f"💰 <i>Средства возвращены на твой баланс в Predy/Polymarket. Сделка автоматически закрыта.</i>"
         )
         try:

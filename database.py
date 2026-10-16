@@ -1007,16 +1007,18 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
                         lines.append(f"     • {r}")
 
             elif atype == "SELL_REAL":
+                bal_info = f" | Баланс после сделки: {det.get('balance_after')}" if det.get('balance_after') else ""
                 lines.append(f"\n[{time_label} ХБР] ⚡ АВТОПРОДАЖА (РЕАЛЬНОЕ ЗАКРЫТИЕ НА БИРЖЕ)")
                 lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена выхода: {price:.0f}¢")
                 lines.append(f"   Причина закрытия: {det.get('reason', 'Плановый выход')}")
-                lines.append(f"   Результат сделки: PnL {det.get('pnl_str', '0%')} ({det.get('pnl_usd', '$0.00')})")
+                lines.append(f"   Результат сделки: PnL {det.get('pnl_str', '0%')} ({det.get('pnl_usd', '$0.00')}){bal_info}")
 
             elif atype == "SELL_PAPER":
+                bal_info = f" | Баланс после сделки: {det.get('balance_after')}" if det.get('balance_after') else ""
                 lines.append(f"\n[{time_label} ХБР] 📝 ЗАКРЫТИЕ БУМАЖНОГО ТЕСТА")
                 lines.append(f"   Локация: {icao} | Исход: {outcomes} | Цена выхода: {price:.0f}¢")
                 lines.append(f"   Причина закрытия: {det.get('reason', 'Плановый выход')}")
-                lines.append(f"   Результат: PnL {det.get('pnl_str', '0%')} ({det.get('pnl_usd', '$0.00')})")
+                lines.append(f"   Результат: PnL {det.get('pnl_str', '0%')} ({det.get('pnl_usd', '$0.00')}){bal_info}")
 
             elif atype == "SKIP":
                 outcomes_str = f" ({outcomes})" if outcomes else ""

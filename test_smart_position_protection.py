@@ -75,6 +75,9 @@ def test_anti_manipulation_stop_loss_debounce():
         assert trigger_sustained is not None
         assert "АНТИ-МАНИПУЛЯЦИЯ СТОП-ЛОСС" in trigger_sustained
         assert pos_id not in _POSITION_DROP_TRACKER
+        bot.send_message.assert_called_once()
+        msg_text = bot.send_message.call_args[0][1]
+        assert "Итоговый банкролл:" in msg_text
 
         delete_position(pos_id, test_uid)
 
