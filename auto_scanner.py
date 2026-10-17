@@ -423,6 +423,45 @@ def is_blocking_rain_and_clouds(raw_metar: str) -> bool:
     return False
 
 
+def check_weather_deterioration(
+    raw_metar: str,
+    temp_c: Optional[float],
+    target_temp: Optional[float],
+    rate_val: float,
+    local_time_val: float,
+    heating_cutoff: float,
+) -> Tuple[bool, str]:
+    """
+    Проверяет, подтверждается ли просадка стакана реальным ухудшением погоды.
+    Используется умным стоп-лоссом: стакан сигнализирует о возможном риске,
+    но финальный вердикт на выход выносится ТОЛЬКО при реальной деградации метеоусловий.
+
+    Если погода солнечная, прогрев идет нормальным темпом и осадков нет —
+    просадка цены считается манипуляцией маркетмейкера или нехваткой ликвидности,
+    и бот удерживает позицию.
+    """
+    # 1. Блокирующие осадки (дождь, морось, снег) или плотный туман
+    if is_blocking_rain_and_clouds(raw_metar):
+        return True, "блокирующие осадки или плотный туман"
+
+    # 2. Низкая плотная облачность (Stratus <= 3000 ft) при затухающем темпе прогрева
+    if has_real_low_cloud(raw_metar) and rate_val < 0.4:
+        return True, "низкая плотная облачность при слабом прогреве"
+
+    if target_temp is not None and temp_c is not None:
+        gap = target_temp - temp_c
+        # 3. Полная остановка или спад прогрева в дневное время при отставании от страйка
+        if gap >= 1.0 and local_time_val >= 11.5 and rate_val <= 0.1:
+            return True, f"прогрев остановился ({rate_val:+.1f}°C/ч при отставании {gap:.1f}°C)"
+
+        # 4. Вторая половина дня: времени до заката мало, а разрыв непреодолим
+        rem_hours = max(0.0, heating_cutoff - local_time_val)
+        if rem_hours <= 1.5 and gap > 1.5 and rate_val < 0.5:
+            return True, f"нехватка времени до конца окна (осталось {rem_hours:.1f}ч, отставание {gap:.1f}°C)"
+
+    return False, ""
+
+
 def get_strike_for_temp(target_val: float) -> int:
     """
     Определяет целочисленный страйк Polymarket для непрерывной целевой температуры.
@@ -1275,14 +1314,28 @@ async def check_and_execute_auto_sell(
     elif 12.5 <= local_time_val <= heating_cutoff and (rate_val < 0.4 and has_real_low_cloud(raw_metar) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
         trigger_reason = "🛑 ПОГОДНЫЙ ПАРАШЮТ: Затухание темпа под плотной облачностью"
 
-    # Триггер Д: Анти-манипуляция Стоп-Лосс (устойчивый обвал стакана >= 12¢ или >= 25% держится >= 45 сек)
+    # Триггер Д: Умный стоп-лосс (сигнал стакана >= 12¢ или >= 25% держится >= 45 сек + МЕТЕО-ВЕРИФИКАЦИЯ)
+    # Стакан используется как ранний сигнал тревоги, но финальный вердикт выносит только реальная погода.
     elif is_drop_condition and drop_duration >= 45.0:
-        drop_cents = entry_price - cur_price
-        drop_pct = (drop_cents / entry_price) * 100
-        trigger_reason = (
-            f"🛑 АНТИ-МАНИПУЛЯЦИЯ СТОП-ЛОСС (-{drop_cents:.0f}¢ / -{drop_pct:.0f}% держится {int(drop_duration)}с): "
-            f"Подтвержденный обвал стакана, спасение депозита (вход: {entry_price:.0f}¢, сейчас: {cur_price:.0f}¢)"
+        is_bad_weather, bad_weather_reason = check_weather_deterioration(
+            raw_metar=raw_metar,
+            temp_c=temp_c,
+            target_temp=target_temp,
+            rate_val=rate_val,
+            local_time_val=local_time_val,
+            heating_cutoff=heating_cutoff,
         )
+        if is_bad_weather:
+            drop_cents = entry_price - cur_price
+            drop_pct = (drop_cents / entry_price) * 100
+            trigger_reason = (
+                f"🛑 СТОП-ЛОСС ПО СИГНАЛУ СТАКАНА + ПОГОДА (-{drop_cents:.0f}¢ / -{drop_pct:.0f}% держится {int(drop_duration)}с): "
+                f"Обвал стакана подтвержден погодой ({bad_weather_reason}), спасение депозита"
+            )
+        else:
+            # Погода отличная (солнце, прогрев в темпе, осадков нет).
+            # Защита от маркетмейкера: игнорируем ложную просадку стакана!
+            pass
 
     if not trigger_reason:
         return None

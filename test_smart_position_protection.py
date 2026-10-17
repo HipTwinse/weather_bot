@@ -69,11 +69,20 @@ def test_anti_manipulation_stop_loss_debounce():
         assert trigger_rec is None
         assert pos_id not in _POSITION_DROP_TRACKER, "После выкупа шпильки таймер дебаунса должен сброситься!"
 
-        # 3. Реальный sustained обвал: цена упала до 30¢ и держится 50 секунд
-        _POSITION_DROP_TRACKER[pos_id] = time.time() - 50.0  # Имитируем удержание 50 секунд
-        trigger_sustained = await check_and_execute_auto_sell(bot, city_data_drop, pos)
+        # 3. Обвал стакана при СОЛНЕЧНОЙ погоде (манипуляция маркетмейкера):
+        # Цена упала до 32¢ и держится 50 секунд, но погода ясная и прогрев идет (+0.4°C/ч).
+        # Бот НЕ должен выходить и не должен давать маркетмейкеру выбить позицию!
+        _POSITION_DROP_TRACKER[pos_id] = time.time() - 50.0
+        trigger_sunny = await check_and_execute_auto_sell(bot, city_data_drop, pos)
+        assert trigger_sunny is None, "При солнечной погоде и нормальном прогреве просадка стакана должна игнорироваться!"
+
+        # 4. Обвал стакана ПОДТВЕРЖДЕН УХУДШЕНИЕМ ПОГОДЫ (полная остановка прогрева в полдень):
+        # Осадков нет, но прогрев затух до нуля (0.0°C/ч при отставании 3.0°C)
+        city_data_bad_weather = dict(city_data_drop)
+        city_data_bad_weather["rate_val"] = 0.0
+        trigger_sustained = await check_and_execute_auto_sell(bot, city_data_bad_weather, pos)
         assert trigger_sustained is not None
-        assert "АНТИ-МАНИПУЛЯЦИЯ СТОП-ЛОСС" in trigger_sustained
+        assert "СТОП-ЛОСС ПО СИГНАЛУ СТАКАНА + ПОГОДА" in trigger_sustained
         assert pos_id not in _POSITION_DROP_TRACKER
         bot.send_message.assert_called_once()
         msg_text = bot.send_message.call_args[0][1]
