@@ -649,7 +649,7 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
     }
 
 
-def get_priority_target(
+def _calc_raw_priority_target(
     icao: str,
     models: Dict[str, float],
     avg_peak: float,
@@ -798,6 +798,39 @@ def get_priority_target(
     else:
         val = icon_val if icon_val is not None else avg_peak
         return val, f"ICON/Консенсус ({val:.1f}°C)"
+
+
+def get_priority_target(
+    icao: str,
+    models: Dict[str, float],
+    avg_peak: float,
+    raw_metar: str = "",
+    local_dt: Optional[datetime] = None,
+    current_temp: Optional[float] = None,
+    rate_val: float = 0.0,
+    heating_cutoff: Optional[float] = None,
+) -> Tuple[float, str]:
+    """
+    Определяет приоритетный целевой пик температуры на базе физических законов KB v8.0.
+    Включает динамическую привязку к термометру метеостанции: фактический максимум дня
+    не может быть ниже уже зафиксированной на станции температуры.
+    Если город греется быстрее моделей, цель автоматически подтягивается по текущей динамике.
+    """
+    val, reason = _calc_raw_priority_target(icao, models, avg_peak, raw_metar, local_dt)
+
+    if current_temp is not None and current_temp > val:
+        local_time_val = (local_dt.hour + local_dt.minute / 60.0) if local_dt else 12.0
+        cutoff = heating_cutoff if heating_cutoff is not None else 14.5
+        rem_h = max(0.0, cutoff - local_time_val)
+        if rate_val > 0.2 and rem_h >= 0.5:
+            additional_boost = min(1.5, round(rate_val * min(rem_h, 1.5), 1))
+            val = round(current_temp + additional_boost, 1)
+            reason = f"Факт+Динамика ({val:.1f}°C, факт {current_temp:.1f}°C перегнал модели)"
+        else:
+            val = round(current_temp, 1)
+            reason = f"Факт дня ({val:.1f}°C, модели занизили)"
+
+    return val, reason
 
 
 _get_priority_target = get_priority_target
@@ -1033,7 +1066,10 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
     else:
         has_blocking_weather = is_blocking_rain_and_clouds(raw_metar)
 
-        target_val, priority_name = _get_priority_target(icao, models, avg_peak, raw_metar, local_dt=local_dt)
+        target_val, priority_name = _get_priority_target(
+            icao, models, avg_peak, raw_metar,
+            local_dt=local_dt, current_temp=temp_c, rate_val=rate_val, heating_cutoff=heating_cutoff
+        )
         target_strike = get_strike_for_temp(target_val)
         fav_candidate = None
         best_diff = 999.0
@@ -1699,17 +1735,22 @@ async def check_and_execute_auto_buy(
                 continue
 
             target_val, priority_name = _get_priority_target(
-                icao, models, cm.get("avg_peak", 20.0), raw_metar, local_dt=local_dt
+                icao, models, cm.get("avg_peak", 20.0), raw_metar,
+                local_dt=local_dt, current_temp=temp_c, rate_val=rate_val, heating_cutoff=heating_cutoff
             )
             target_strike = get_strike_for_temp(target_val)
             strike_str = f"{target_strike}°C"
 
             # Проверка текущей температуры против страйка
             if temp_c is not None and temp_c >= target_strike:
+                if rate_val <= 0.2 or local_time_val >= (heating_cutoff - 1.0):
+                    reason_msg = f"Фактический пик дня уже сформирован ({temp_c:.1f}°C), дневной прогрев завершен"
+                else:
+                    reason_msg = f"Температура уже {temp_c:.1f}°C (цель {target_strike}°C взята)"
                 await asyncio.to_thread(
                     record_daily_action,
                     uid, "SKIP", icao, strike_str, 0.0,
-                    {"reason": f"Температура уже {temp_c:.1f}°C (цель {target_strike}°C взята)"}
+                    {"reason": reason_msg}
                 )
                 continue
 
@@ -2219,8 +2260,10 @@ async def generate_midday_standby_briefing(
         avg_peak = cm.get("avg_peak", 20.0)
         orderbook = cm.get("orderbook", [])
 
+        heating_cutoff, _ = get_seasonal_heating_cutoff(local_dt.month, icao=icao) if local_dt else (14.5, "")
         target_val, priority_name = _get_priority_target(
-            icao, models, avg_peak, raw_metar, local_dt=local_dt
+            icao, models, avg_peak, raw_metar,
+            local_dt=local_dt, current_temp=temp_c, rate_val=rate_val, heating_cutoff=heating_cutoff
         )
         target_strike = get_strike_for_temp(target_val)
         strike_str = f"{target_strike}°C"
