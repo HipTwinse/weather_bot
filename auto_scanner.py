@@ -763,6 +763,10 @@ def _calc_raw_priority_target(
             base = icon_val if icon_val is not None else (ecm_val if ecm_val is not None else avg_peak)
         if wdir is not None and 80 <= wdir <= 160 and wspd and wspd >= 8:
             return base, f"ICON+ECMWF ({base:.1f}°C, Бриз залива)"
+        if wdir is not None and 180 <= wdir <= 240 and wspd and wspd >= 12:
+            boost = 1.0 if (wspd >= 16 or (raw_metar and "G" in raw_metar)) else 0.6
+            val = round(base + boost, 1)
+            return val, f"ICON+ECMWF+{boost:.1f}°C ({val:.1f}°C, Южная адвекция {wspd}kt)"
         if is_calm:
             return round(base + 0.3, 1), f"ICON+ECMWF+0.3°C ({base+0.3:.1f}°C, Токио UHI)"
         return base, f"ICON+ECMWF ({base:.1f}°C, Токио)"
@@ -818,17 +822,26 @@ def get_priority_target(
     """
     val, reason = _calc_raw_priority_target(icao, models, avg_peak, raw_metar, local_dt)
 
-    if current_temp is not None and current_temp > val:
+    if current_temp is not None:
         local_time_val = (local_dt.hour + local_dt.minute / 60.0) if local_dt else 12.0
         cutoff = heating_cutoff if heating_cutoff is not None else 14.5
         rem_h = max(0.0, cutoff - local_time_val)
-        if rate_val > 0.2 and rem_h >= 0.5:
-            additional_boost = min(1.5, round(rate_val * min(rem_h, 1.5), 1))
-            val = round(current_temp + additional_boost, 1)
-            reason = f"Факт+Динамика ({val:.1f}°C, факт {current_temp:.1f}°C перегнал модели)"
-        else:
-            val = round(current_temp, 1)
-            reason = f"Факт дня ({val:.1f}°C, модели занизили)"
+        if current_temp > val:
+            if rate_val > 0.2 and rem_h >= 0.5:
+                additional_boost = min(1.5, round(rate_val * min(rem_h, 1.5), 1))
+                val = round(current_temp + additional_boost, 1)
+                reason = f"Факт+Динамика ({val:.1f}°C, факт {current_temp:.1f}°C перегнал модели)"
+            else:
+                val = round(current_temp, 1)
+                reason = f"Факт дня ({val:.1f}°C, модели занизили)"
+        elif rate_val >= 0.6 and rem_h >= 1.5:
+            # Утренний разгон: текущая температура еще чуть ниже модели,
+            # но сильный утренний темп при активном солнце гарантированно выносит пик выше базовой цели
+            projected_rise = rate_val * min(rem_h, 2.5) * 0.7
+            projected_peak = round(current_temp + projected_rise, 1)
+            if projected_peak >= val + 0.6:
+                val = projected_peak
+                reason = f"Утренний разгон ({val:.1f}°C, темп +{rate_val:.1f}°C/ч выносит выше моделей)"
 
     return val, reason
 
@@ -897,7 +910,7 @@ def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[
             "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
             "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
         )
-    elif favorite_candidate and 20.0 <= favorite_candidate["price_cents"] <= 64.0 and cand_conf >= 70.0:
+    elif favorite_candidate and 20.0 <= favorite_candidate["price_cents"] <= 55.0 and cand_conf >= 70.0:
         fav_title = html.escape(str(favorite_candidate["title"]))
         local_time_val = local_dt.hour + local_dt.minute / 60.0
         entry_hint = "Сразу по рынку / в упор к Best Ask" if local_time_val >= 9.5 else "Утренняя лимитка в спред"
@@ -1124,7 +1137,7 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
                     "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
                     "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
                 )
-            elif fav_candidate and 20.0 <= fav_candidate["price_cents"] <= 64.0 and cand_conf >= 70.0:
+            elif fav_candidate and 20.0 <= fav_candidate["price_cents"] <= 55.0 and cand_conf >= 70.0:
                 cand_title = html.escape(str(fav_candidate['title']))
                 entry_hint = "сразу по рынку" if local_time_val >= 9.5 else "утренняя лимитка в спред"
                 status_desc = (
@@ -1146,7 +1159,7 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
                     "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
                     "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
                 )
-            elif fav_candidate and 20.0 <= fav_candidate["price_cents"] <= 64.0 and cand_conf >= 70.0:
+            elif fav_candidate and 20.0 <= fav_candidate["price_cents"] <= 55.0 and cand_conf >= 70.0:
                 cand_title = html.escape(str(fav_candidate['title']))
                 entry_hint = "сразу по рынку" if local_time_val >= 9.5 else "утренняя лимитка в спред"
                 status_desc = (
@@ -1602,16 +1615,16 @@ def calculate_candidate_confidence(
         score += 10.0
 
     # 3. Ценовой диапазон токена в стакане
-    if 25.0 <= cand_price_cents <= 58.0:
+    if 25.0 <= cand_price_cents <= 50.0:
         score += 20.0
         reasons.append(f"Оптимальный диапазон входа ({cand_price_cents:.0f}¢)")
-    elif 58.0 < cand_price_cents <= 64.0:
-        score += 15.0
+    elif 50.0 < cand_price_cents <= 55.0:
+        score += 12.0
         reasons.append(f"Высокая рыночная вероятность победы ({cand_price_cents:.0f}¢)")
     elif 18.0 <= cand_price_cents < 25.0:
         score += 10.0
         reasons.append(f"Дешевый токен с высоким плечом ({cand_price_cents:.0f}¢)")
-    elif cand_price_cents > 64.0:
+    elif cand_price_cents > 55.0:
         score -= 25.0
         reasons.append(f"Рынок перегрет маркетмейкером ({cand_price_cents:.0f}¢)")
     elif cand_price_cents < 15.0:
@@ -1754,6 +1767,20 @@ async def check_and_execute_auto_buy(
                 )
                 continue
 
+            # Защита от утренней ловушки овершута:
+            # Если до закрытия окна прогрева еще более 1.5 часов (rem_h >= 1.5),
+            # а до целевого страйка осталось <= 0.7°C при высоком темпе (rate_val >= 0.7°C/ч),
+            # этот одиночный страйк будет неизбежно пробит вверх задолго до пика дня!
+            rem_h_entry = max(0.0, heating_cutoff - local_time_val)
+            if temp_c is not None and rem_h_entry >= 1.5 and rate_val >= 0.7:
+                if (target_strike - temp_c) <= 0.7:
+                    await asyncio.to_thread(
+                        record_daily_action,
+                        uid, "SKIP", icao, strike_str, 0.0,
+                        {"reason": f"Ловушка овершута: до страйка {strike_str} всего {target_strike - temp_c:.1f}°C при темпе +{rate_val:.1f}°C/ч и {rem_h_entry:.1f}ч солнца впереди"}
+                    )
+                    continue
+
             # Максимально допустимый разрыв прогрева до цели:
             # При ясном солнце (CAVOK/CLR) или для Мадрида/Анкары (LEMD/LTAC) дневной прогрев на плато достигает 9-11°C
             is_clear_sky = any(c in raw_metar for c in ["CAVOK", "CLR", "SKC"])
@@ -1785,12 +1812,12 @@ async def check_and_execute_auto_buy(
             token_id = matched_item.get("token_id", "")
             title = matched_item.get("title", strike_str)
 
-            # Отсекаем неликвид дешевле 20¢ и перегретый рынок дороже 64¢
-            if price_cents < 20.0 or price_cents > 64.0:
+            # Отсекаем неликвид дешевле 20¢ и перегретый рынок дороже 55¢ (защита риск-профиля)
+            if price_cents < 20.0 or price_cents > 55.0:
                 await asyncio.to_thread(
                     record_daily_action,
                     uid, "SKIP", icao, strike_str, price_cents,
-                    {"reason": f"Цена вне рабочего диапазона 20-64¢ ({price_cents:.0f}¢)"}
+                    {"reason": f"Цена вне рабочего диапазона 20-55¢ ({price_cents:.0f}¢)"}
                 )
                 continue
 
@@ -2307,8 +2334,8 @@ async def generate_midday_standby_briefing(
             obstacle = f"Нужный исход на бирже стоит всего {price_cents:.0f}¢ (дешевле минимального порога 20¢). Сама биржа пока почти не верит в этот прогрев, ликвидность слабая."
             watching = "Появится ли реальный покупательский спрос в стакане по мере потепления."
             watching_short = "подтянется спрос в стакане"
-        elif price_cents > 64.0:
-            obstacle = f"Контракт уже перегрет ({price_cents:.0f}¢, выше потолка 64¢). Потенциал прибыли мал, а риск отката при паузе прогрева слишком велик."
+        elif price_cents > 55.0:
+            obstacle = f"Контракт уже перегрет ({price_cents:.0f}¢, выше потолка 55¢). Потенциал прибыли мал, а риск отката при паузе прогрева слишком велик."
             watching = "Возможный откат цены в стакане для безопасного входа или возможность взять соседний страйк."
             watching_short = "скорректируется цена"
         elif temp_c is not None and temp_gap > max_allowed_gap:
