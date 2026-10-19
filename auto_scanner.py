@@ -1726,7 +1726,7 @@ async def check_and_execute_auto_buy(
                 )
                 continue
 
-            if local_time_val >= (heating_cutoff - 1.0) or local_time_val >= 14.5 or "Окно закрыто" in rem_hours_str:
+            if local_time_val >= (heating_cutoff - 1.0) or "Окно закрыто" in rem_hours_str:
                 await asyncio.to_thread(
                     record_daily_action,
                     uid, "SKIP", icao, "", 0.0,
