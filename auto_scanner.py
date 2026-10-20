@@ -218,9 +218,10 @@ async def send_daily_audit_file(bot: Bot, date_str: str = "") -> None:
             doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
             caption = (
                 f"📄 <b>ИТОГОВЫЙ АУДИТОРСКИЙ ОТЧЕТ ЗА ДЕНЬ</b>\n\n"
+                f"Босс, сделал отчет! День закрыт, всё сделано как положено.\n"
                 f"• Дата: <code>{filename.replace('weather_bot_report_', '').replace('.txt', '')}</code>\n"
                 f"• Полный журнал всех проверок, сделок, причин выходов и балансов сохранен в файле выше.\n"
-                f"🌙 <i>Торговое окно завершено (10:00 - 24:00 ХБР). Сканер уходит в ночной режим сна до 10:00 утра.</i>"
+                f"🌙 <i>Торговое окно завершено (10:00 - 24:00 ХБР). Сканер уходит спать, маркетмейкеры могут перевести дух до 10:00 утра.</i>"
             )
             await bot.send_document(uid, document=doc_file, caption=caption, parse_mode="HTML")
             logger.info(f"Дневной отчет успешно отправлен пользователю {uid}.")
@@ -1430,14 +1431,14 @@ async def check_and_execute_auto_sell(
         )
 
         paper_notify = (
-            f"📝 <b>БУМАЖНАЯ СДЕЛКА ЗАКРЫТА (ТЕСТ БЕЗ РИСКА)</b>\n\n"
+            f"📝 <b>Босс, закрыл сделку, всё сделано как положено!</b>\n\n"
             f"• <b>Причина:</b> {trigger_reason}\n"
             f"• <b>Локация:</b> {city_name}\n"
             f"• <b>Исход:</b> <code>{target_outcomes}</code>\n"
             f"• <b>Вход:</b> <code>{entry_price:.0f}¢</code> | <b>Выход:</b> <b>{cur_price:.0f}¢</b>\n"
             f"• <b>Результат:</b> <b>{pnl_str}</b> (Виртуальный PnL: <b>{profit_str}</b>)\n"
             f"• <b>Итоговый банкролл:</b> <b>${p_bal['total_equity']:.2f} USDC</b> (свободно: <code>${p_bal['free_balance']:.2f}</code> | ROI: <b>{roi_sign}{p_bal['roi_percent']}%</b>)\n\n"
-            f"📊 <i>Сделка зафиксирована в базе и добавлена в статистику винрейта.</i>"
+            f"📊 <i>Сделка зафиксирована в базе. Статистика не врет, в отличие от рыночной толпы.</i>"
         )
         try:
             await bot.send_message(user_id, paper_notify, parse_mode="HTML")
@@ -1542,14 +1543,14 @@ async def check_and_execute_auto_sell(
         )
 
         notify_text = (
-            f"⚡ <b>АВТОПРОДАЖА УСПЕШНО ИСПОЛНЕНА!</b>\n\n"
+            f"⚡ <b>Босс, автопродажа исполнена, всё сделано как положено!</b>\n\n"
             f"• <b>Причина:</b> {trigger_reason}\n"
             f"• <b>Локация:</b> {city_name}\n"
             f"• <b>Исход:</b> <code>{target_outcomes}</code>\n"
             f"• <b>Объем:</b> <code>{shares:.2f} контрактов</code>\n"
             f"• <b>Цена выхода:</b> <b>{cur_price:.0f}¢</b> (Вход: <code>{entry_price:.0f}¢</code> | Результат: <b>{pnl_str}</b> | PnL: <b>{profit_str}</b>)\n"
             f"{real_bal_line}\n"
-            f"💰 <i>Средства возвращены на твой баланс в Predy/Polymarket. Сделка автоматически закрыта.</i>"
+            f"💰 <i>Прибыль на базе. Пока остальные гадают по облакам, мы считаем USDC.</i>"
         )
         try:
             await bot.send_message(user_id, notify_text, parse_mode="HTML")
@@ -2036,7 +2037,7 @@ async def check_and_execute_auto_buy(
                     )
                     reasons_str = "\n".join(f"• {r}" for r in cand["conf_reasons"])
                     buy_msg = (
-                        f"⚡ <b>АВТОПОКУПКА УСПЕШНО ИСПОЛНЕНА! (РЕАЛЬНАЯ СДЕЛКА)</b>\n\n"
+                        f"⚡ <b>Босс, ордер исполнен! Вошли в рынок на опережение толпы:</b>\n\n"
                         f"• <b>Локация:</b> {cand['city_name']}\n"
                         f"• <b>Выбранный исход:</b> <code>{cand['outcomes']}</code>\n"
                         f"• <b>Цена входа:</b> <b>{cand['price_cents']:.0f}¢</b>\n"
@@ -2045,7 +2046,7 @@ async def check_and_execute_auto_buy(
                         f"• <b>Рейтинг надежности:</b> {cand['conf_label']} (<b>{cand['conf_score']:.0f}/100</b>)\n"
                         f"• <b>AI-валидация:</b> 🟢 <b>ОДОБРЕНО НЕЙРОСЕТЬЮ</b> (<i>{ai_reason}</i>)\n\n"
                         f"<b>Факторы выбора:</b>\n{reasons_str}\n\n"
-                        f"🛡️ <i>Сделка взята под радарную защиту: активны трейлинг (+35%) и безусловный стоп-лосс (-8¢).</i>"
+                        f"🛡️ <i>Сделка на радарной защите: если маркетмейкер дернется — встретит наш стоп или тейк.</i>"
                     )
                     try:
                         await bot.send_message(uid, buy_msg, parse_mode="HTML")
@@ -2140,7 +2141,7 @@ async def check_and_execute_auto_buy(
                 reasons_str = "\n".join(f"• {r}" for r in cand["conf_reasons"])
                 ai_paper_line = f"• <b>AI-валидация:</b> {'🟢 ОДОБРЕНО' if is_ai_approved else '🛑 ВЕТО'} (<i>{ai_reason}</i>)\n" if (idx == 0 and cand["conf_score"] >= 75.0) else ""
                 paper_msg = (
-                    f"📝 <b>ОФОРМЛЕНА БУМАЖНАЯ СДЕЛКА (ТЕСТ БЕЗ РИСКА)</b>\n\n"
+                    f"📝 <b>Босс, взял новую бумажную цель, всё сделано как положено!</b>\n\n"
                     f"• <b>Локация:</b> {cand['city_name']}\n"
                     f"• <b>Исход:</b> <code>{cand['outcomes']}</code>\n"
                     f"• <b>Виртуальная цена входа:</b> <b>{cand['price_cents']:.0f}¢</b>\n"
@@ -2150,7 +2151,7 @@ async def check_and_execute_auto_buy(
                     f"{ai_paper_line}"
                     f"• <b>Причина виртуального входа:</b> <i>{reason_note}</i>\n"
                     f"<b>Факторы выбора:</b>\n{reasons_str}\n\n"
-                    f"📊 <i>Бот сопровождает позицию по риск-менеджменту и зафиксирует PnL в статистику.</i>"
+                    f"📊 <i>Бот ведет позицию. Маркетмейкерам приготовиться.</i>"
                 )
                 try:
                     await bot.send_message(uid, paper_msg, parse_mode="HTML")

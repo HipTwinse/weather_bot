@@ -915,7 +915,8 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     register_subscriber(message.from_user.id, message.from_user.username or "")
     welcome_text = (
-        "👋 <b>Weather Alpha Engine v8.0 активен!</b>\n\n"
+        "👋 <b>Босс, Weather Alpha Engine на связи!</b>\n"
+        "Пока рыночная толпа гадает на кофейной гуще, наши метеорадары сканируют атмосферу до десятых долей градуса. Всё под контролем, маркетмейкеры уже нервничают в сторонке. Чем займемся?\n\n"
         "🔄 <b>Свежий дайджест (/digest):</b> Сводка по 6 городам и твоим сделкам прямо сейчас.\n"
         "🧭 <b>Почему вне рынка? (/standby):</b> Разбор, чего ждет бот и где готовит вход.\n"
         "📌 <b>Мои позиции (/positions):</b> Контроль открытых сделок, PnL и режим торговли.\n"
@@ -931,11 +932,11 @@ async def cmd_start(message: Message, state: FSMContext):
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
     help_text = (
-        "📖 <b>Все команды и кнопки Weather Alpha Engine v8.0 (полная синхронизация):</b>\n\n"
+        "📖 <b>Босс, вот пульт управления Weather Alpha Engine:</b>\n\n"
         "• <b>🔄 Свежий дайджест</b> или /digest — мгновенная сводка по всем городам\n"
-        "• <b>🧭 Почему вне рынка?</b> или /standby — почему бот ждет и какие условия нужны для входа\n"
+        "• <b>🧭 Почему вне рынка?</b> или /standby — почему сидим на заборе и чего ждем\n"
         "• <b>📌 Мои позиции</b> или /positions — открытые сделки (реальные и бумажные)\n"
-        "• <b>📊 Статистика</b> или /stats — общий счет побед/поражений и PnL\n"
+        "• <b>📊 Статистика</b> или /stats — наш счет побед против толпы и чистый PnL\n"
         "• <b>🤖 AI Аналитик</b> или /ai — глубокий AI-разбор любого города\n"
         "• <b>🌍 Избранные города</b> или /cities — быстрый опрос метеостанций (METAR)\n"
         "• <b>🔍 Сканировать маркет</b> или /scan — разбор ссылки с Polymarket / Preddy\n"
@@ -1132,12 +1133,12 @@ def _render_positions_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
             pass
 
     if trading_mode == "REAL":
-        mode_header = "⚡ <b>РЕЖИМ: БОЕВОЙ (Деньги + бумага при нехватке)</b>"
+        mode_header = "⚡ <b>Босс, наши боевые позиции (Деньги в деле):</b>"
         mode_btn = "🧪 Переключить в ТЕСТ"
         auto_text = "🟢 Автопродажа активна" if has_pk else "🟡 Только сигналы (отправь /set_key)"
         wallet_info = f"💰 <b>Баланс:</b> <code>${balance:.2f} USDC</code> | 🛡️ <b>Защита:</b> {auto_text}"
     else:
-        mode_header = "🧪 <b>РЕЖИМ: ТЕСТ (Только бумага, без риска депозита)</b>"
+        mode_header = "🧪 <b>Босс, наши позиции на тесте (Ни цента риска):</b>"
         mode_btn = "⚡ Переключить в БОЕВОЙ"
         p_bal = get_paper_balance(user_id)
         roi_sign = "+" if p_bal["roi_percent"] >= 0 else ""
@@ -1264,7 +1265,7 @@ def _render_trading_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]
     )
 
     lines = [
-        "📊 <b>ДЕТАЛЬНАЯ СТАТИСТИКА ТОРГОВЛИ</b>\n",
+        "📊 <b>Босс, вот статистика. Цифры не врут, в отличие от прогноза погоды на ТВ:</b>\n",
         f"🎯 <b>Текущий режим бота:</b> <b>{mode_label}</b>",
         f"📅 <b>Итог за сегодня ({now_khv.strftime('%d.%m')}):</b> {today_summary_str}",
         "━━━━━━━━━━━━━━━━━━━━",
@@ -1482,14 +1483,14 @@ async def process_back_to_positions(callback: CallbackQuery):
 
 @router.callback_query(F.data == "download_day_report")
 async def process_download_day_report(callback: CallbackQuery):
-    await callback.answer("Формирую аудиторский отчет...")
+    await callback.answer("Босс, формирую аудиторский отчет...")
     user_id = callback.from_user.id
     report_text, filename = generate_daily_audit_report("", user_id=user_id)
     doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
     caption = (
-        f"📄 <b>АУДИТОРСКИЙ ОТЧЕТ ДЕЙСТВИЙ РОБОТА</b>\n\n"
+        f"📄 <b>Босс, сделал отчет!</b>\n\n"
         f"• Файл: <code>{filename}</code>\n"
-        f"• Включает полную хронологию сканирования, сделок, отказов и причин выхода за сегодня."
+        f"• Все ходы записаны, цифры подшиты до цента. Толпа на бирже может только завидовать."
     )
     await callback.message.answer_document(document=doc_file, caption=caption, parse_mode="HTML")
 
@@ -1503,9 +1504,9 @@ async def cmd_download_day_report(message: Message, state: FSMContext):
     report_text, filename = generate_daily_audit_report("", user_id=user_id)
     doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
     caption = (
-        f"📄 <b>АУДИТОРСКИЙ ОТЧЕТ ДЕЙСТВИЙ РОБОТА</b>\n\n"
+        f"📄 <b>Босс, сделал отчет!</b>\n\n"
         f"• Файл: <code>{filename}</code>\n"
-        f"• Включает полную хронологию сканирования, сделок, отказов и причин выхода за сегодня."
+        f"• Все ходы записаны, цифры подшиты до цента. Толпа на бирже может только завидовать."
     )
     await message.answer_document(document=doc_file, caption=caption, parse_mode="HTML")
 
@@ -1516,7 +1517,7 @@ async def cmd_force_digest(message: Message, state: FSMContext):
     """Выдает свежий 30-минутный сводный дайджест по всем городам по прямому запросу пользователя."""
     await state.clear()
     register_subscriber(message.from_user.id, message.from_user.username or "")
-    status_msg = await message.answer("🔄 <i>Считываю актуальные сводки METAR и моделей по городам...</i>", parse_mode="HTML")
+    status_msg = await message.answer("🔄 <i>Босс, сканирую горизонт... Метеостанции докладывают обстановку, стаканы трещат.</i>", parse_mode="HTML")
     try:
         from auto_scanner import (
             collect_city_metrics,
@@ -1609,7 +1610,7 @@ async def cmd_force_digest(message: Message, state: FSMContext):
 async def cmd_standby_explanation(message: Message, state: FSMContext):
     """Выдает подробный синоптический разбор: почему бот пока вне рынка, за чем следит и где вероятнее всего зайдет."""
     await state.clear()
-    wait_msg = await message.answer("🧭 <i>Формирую разбор рынков: почему бот пока вне рынка и за чем следит...</i>", parse_mode="HTML")
+    wait_msg = await message.answer("🧭 <i>Босс, сканирую радары... Сейчас объясню, почему мы сидим на заборе и не кормим маркетмейкеров.</i>", parse_mode="HTML")
     try:
         from auto_scanner import (
             collect_city_metrics,
@@ -1825,7 +1826,7 @@ def _render_wallet_view(user_id: int) -> Tuple[str, Optional[InlineKeyboardMarku
             ],
         ]
     )
-    text = "👛 <b>ПОДКЛЮЧЕННЫЙ КОШЕЛЕК POLYMARKET:</b>\n\n" + "\n".join(addr_info)
+    text = "👛 <b>Босс, вот состояние твоего кошелька:</b>\n\n" + "\n".join(addr_info)
     return text, kb
 
 
