@@ -788,6 +788,22 @@ def _calc_raw_priority_target(
                 base = round((icon_val + ecm_val) / 2.0, 1)
         else:
             base = icon_val if icon_val is not None else avg_peak
+
+        # 1. Морской бриз Желтого моря (запад/северо-запад 240-340°): холодная вода сдерживает прогрев
+        if wdir is not None and 240 <= wdir <= 340 and wspd and wspd >= 6:
+            return base, f"ICON+ECMWF ({base:.1f}°C, Бриз Желтого моря)"
+
+        # 2. Материковый вынос с Корейского полуострова (север/восток/юго-восток 010-130°):
+        # При ясной погоде (CAVOK/CLR/Cirrus без низких облаков) морской эффект выключен,
+        # остров прогревается как суша (+1.5...+2.0°C выше морских моделей)
+        if wdir is not None and 10 <= wdir <= 130 and (has_cirrus or "CAVOK" in raw_metar) and not has_low_cloud:
+            boost = 2.0 if ("CAVOK" in raw_metar or "CLR" in raw_metar) else 1.5
+            val = round(base + boost, 1)
+            return val, f"ICON+ECMWF+{boost:.1f}°C ({val:.1f}°C, Материковый вынос Сеул)"
+
+        if is_calm:
+            return round(base + 0.4, 1), f"ICON+ECMWF+0.4°C ({base+0.4:.1f}°C, Штиль/Ламинар Инчхон)"
+
         return base, f"ICON+ECMWF ({base:.1f}°C, Инчхон)"
 
     elif icao == "LTAC":

@@ -69,3 +69,23 @@ def test_price_ceiling_confidence_scoring():
     )
     assert any("Рынок перегрет маркетмейкером" in r for r in reasons_high)
     assert score_high < score_ok
+
+
+def test_seoul_continental_wind_warm_boost():
+    """Проверяет, что при ветре с материка (северо-восток 010-130°) и чистом небе (CAVOK) Сеул получает буст +2.0°C."""
+    models = {
+        "icon_global": 17.0,
+        "ecmwf_hres": 17.0,
+    }
+    
+    # 1. Ветер с Желтого моря (28008KT) - морской бриз, базовая цель
+    metar_sea = "METAR RKSI 200400Z 28008KT CAVOK 16/11 Q1019 NOSIG"
+    val_sea, reason_sea = _calc_raw_priority_target("RKSI", models, 17.0, metar_sea)
+    assert val_sea == 17.0
+    assert "Бриз Желтого моря" in reason_sea
+
+    # 2. Ветер с материка (04008KT) при CAVOK - прогрев суши +2.0°C
+    metar_land = "METAR RKSI 200000Z 04008KT CAVOK 14/11 Q1019 NOSIG"
+    val_land, reason_land = _calc_raw_priority_target("RKSI", models, 17.0, metar_land)
+    assert val_land == 19.0
+    assert "Материковый вынос Сеул" in reason_land
