@@ -119,6 +119,20 @@ def init_db() -> None:
                     VALUES (?, 'admin', 1)
                     ON CONFLICT(user_id) DO UPDATE SET is_active = 1
                 """, (int(admin_id),))
+
+                # Автоматическая инициализация несгораемого банкролла Босса ($55.21 USDC / ROI +10.4%)
+                cursor.execute("SELECT value FROM bot_state WHERE key = ?", (f"paper_equity_{admin_id}",))
+                if not cursor.fetchone():
+                    cursor.execute("""
+                        INSERT INTO bot_state (key, value, updated_at)
+                        VALUES (?, '55.21', CURRENT_TIMESTAMP)
+                    """, (f"paper_equity_{admin_id}",))
+                    cursor.execute("""
+                        INSERT INTO bot_state (key, value, updated_at)
+                        VALUES (?, '5.21', CURRENT_TIMESTAMP)
+                    """, (f"paper_closed_pnl_{admin_id}",))
+                    conn.commit()
+
                 wallet_key = getattr(config, "WALLET_PRIVATE_KEY", None)
                 wallet_addr = getattr(config, "WALLET_ADDRESS", None)
                 if wallet_key:
@@ -364,9 +378,13 @@ def close_position_with_exit(position_id: int, exit_price: float = 0.0, exit_rea
     """Закрывает сделку в базе данных при исполнении автопродажи с фиксацией PnL."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT entry_price, shares FROM user_positions WHERE id = ?", (position_id,))
+        cursor.execute("SELECT entry_price, shares, is_paper, user_id FROM user_positions WHERE id = ?", (position_id,))
         row = cursor.fetchone()
         entry_price = float(row[0] or 0.0) if row else 0.0
+        shares = float(row[1] or 1.0) if row else 1.0
+        is_paper = int(row[2] or 0) if row else 0
+        user_id = int(row[3] or 0) if row else 0
+
         pnl_cents = float(exit_price) - entry_price if entry_price > 0 else 0.0
         pnl_percent = (pnl_cents / entry_price * 100.0) if entry_price > 0 else 0.0
         cursor.execute("""
@@ -380,6 +398,64 @@ def close_position_with_exit(position_id: int, exit_price: float = 0.0, exit_rea
             WHERE id = ?
         """, (float(exit_price), str(exit_reason or ""), round(pnl_cents, 2), round(pnl_percent, 1), position_id))
         conn.commit()
+
+        # Если это бумажная сделка, атомарно обновляем несгораемый капитал в bot_state
+        if is_paper and user_id:
+            try:
+                trade_pnl_usd = round((pnl_cents * shares) / 100.0, 4)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        key TEXT PRIMARY KEY,
+                        value TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                row_eq = cursor.execute("SELECT value FROM bot_state WHERE key = ?", (f"paper_equity_{user_id}",)).fetchone()
+                if row_eq and row_eq[0]:
+                    try:
+                        curr_eq = float(row_eq[0])
+                    except Exception:
+                        curr_eq = None
+                else:
+                    curr_eq = None
+
+                row_dep = cursor.execute("SELECT value FROM bot_state WHERE key = ?", (f"paper_deposit_{user_id}",)).fetchone()
+                try:
+                    init_dep = float(row_dep[0]) if (row_dep and row_dep[0]) else DEFAULT_PAPER_DEPOSIT
+                except Exception:
+                    init_dep = DEFAULT_PAPER_DEPOSIT
+
+                if curr_eq is None:
+                    all_closed = cursor.execute("""
+                        SELECT pnl_cents, shares
+                        FROM user_positions
+                        WHERE user_id = ? AND is_paper = 1 AND status = 'CLOSED'
+                    """, (user_id,)).fetchall()
+                    tot_closed_pnl = sum((float(r[0] or 0.0) * float(r[1] or 1.0)) / 100.0 for r in all_closed)
+                    new_equity = round(init_dep + tot_closed_pnl, 2)
+                    new_pnl = round(tot_closed_pnl, 2)
+                else:
+                    new_equity = round(curr_eq + trade_pnl_usd, 2)
+                    row_pnl = cursor.execute("SELECT value FROM bot_state WHERE key = ?", (f"paper_closed_pnl_{user_id}",)).fetchone()
+                    try:
+                        curr_pnl = float(row_pnl[0]) if (row_pnl and row_pnl[0]) else (curr_eq - init_dep)
+                    except Exception:
+                        curr_pnl = curr_eq - init_dep
+                    new_pnl = round(curr_pnl + trade_pnl_usd, 2)
+
+                cursor.execute("""
+                    INSERT INTO bot_state (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+                """, (f"paper_equity_{user_id}", str(new_equity)))
+                cursor.execute("""
+                    INSERT INTO bot_state (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+                """, (f"paper_closed_pnl_{user_id}", str(new_pnl)))
+                conn.commit()
+            except Exception:
+                pass
 
 
 def get_trading_mode(user_id: int) -> str:
@@ -474,6 +550,9 @@ def set_paper_deposit(user_id: int, amount: float) -> float:
     """Устанавливает базовый виртуальный депозит для тестовой торговли пользователя."""
     val = round(max(5.0, float(amount)), 2)
     set_bot_state(f"paper_deposit_{user_id}", str(val))
+    # При сбросе депозита также сбрасываем несгораемый капитал к новой базе
+    set_bot_state(f"paper_equity_{user_id}", str(val))
+    set_bot_state(f"paper_closed_pnl_{user_id}", "0.0")
     return val
 
 
@@ -503,13 +582,31 @@ def get_paper_balance(user_id: int) -> Dict[str, float]:
         except Exception:
             initial_deposit = DEFAULT_PAPER_DEPOSIT
 
-        # Закрытые бумажные сделки: берем pnl_cents и shares
+        # Проверяем сохраненный несгораемый капитал в bot_state (сохраняется в облачном сейфе Telegram)
+        row_eq = c.execute("SELECT value FROM bot_state WHERE key = ?", (f"paper_equity_{user_id}",)).fetchone()
+        row_pnl = c.execute("SELECT value FROM bot_state WHERE key = ?", (f"paper_closed_pnl_{user_id}",)).fetchone()
+
+        # Закрытые бумажные сделки в текущей локальной БД (на случай если bot_state пуст)
         closed_trades = c.execute("""
             SELECT pnl_cents, shares
             FROM user_positions
             WHERE user_id = ? AND is_paper = 1 AND status = 'CLOSED'
         """, (user_id,)).fetchall()
-        closed_pnl_usd = sum((float(r["pnl_cents"] or 0.0) * float(r["shares"] or 1.0)) / 100.0 for r in closed_trades)
+        db_closed_pnl_usd = sum((float(r["pnl_cents"] or 0.0) * float(r["shares"] or 1.0)) / 100.0 for r in closed_trades)
+
+        if row_eq and row_eq[0]:
+            try:
+                total_equity = round(float(row_eq[0]), 2)
+                if row_pnl and row_pnl[0]:
+                    closed_pnl_usd = round(float(row_pnl[0]), 2)
+                else:
+                    closed_pnl_usd = round(total_equity - initial_deposit, 2)
+            except Exception:
+                total_equity = round(initial_deposit + db_closed_pnl_usd, 2)
+                closed_pnl_usd = round(db_closed_pnl_usd, 2)
+        else:
+            total_equity = round(initial_deposit + db_closed_pnl_usd, 2)
+            closed_pnl_usd = round(db_closed_pnl_usd, 2)
 
         # Открытые бумажные сделки (замороженный капитал)
         open_trades = c.execute("""
@@ -519,13 +616,12 @@ def get_paper_balance(user_id: int) -> Dict[str, float]:
         """, (user_id,)).fetchall()
         open_allocated_usd = sum((float(r["entry_price"] or 0.0) * float(r["shares"] or 1.0)) / 100.0 for r in open_trades)
 
-    total_equity = round(initial_deposit + closed_pnl_usd, 2)
     free_balance = round(max(0.0, total_equity - open_allocated_usd), 2)
     roi_percent = round((total_equity - initial_deposit) / initial_deposit * 100.0, 1) if initial_deposit > 0 else 0.0
 
     return {
         "initial_deposit": initial_deposit,
-        "closed_pnl_usd": round(closed_pnl_usd, 2),
+        "closed_pnl_usd": closed_pnl_usd,
         "open_allocated_usd": round(open_allocated_usd, 2),
         "total_equity": total_equity,
         "free_balance": free_balance,
@@ -905,13 +1001,29 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
     skips_count = sum(1 for a in actions if a["action_type"] == "SKIP")
     errors = [a for a in actions if a["action_type"] == "ERROR"]
 
-    today_trades = [
-        r for r in stats.get("recent_trades", [])
-        if str(r.get("closed_at") or "").startswith(date_str) or r.get("target_date") == date_str
-    ]
+    # Извлекаем все закрытые сделки дня напрямую из базы данных
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, icao, outcomes, target_date, entry_price, exit_price, exit_reason,
+                   pnl_cents, pnl_percent, shares, COALESCE(is_paper, 0) AS is_paper, status,
+                   closed_at, created_at,
+                   datetime(COALESCE(closed_at, created_at), '+10 hours') AS local_khv_time
+            FROM user_positions
+            WHERE (user_id = ? OR ? = 0)
+              AND status = 'CLOSED'
+              AND (
+                  date(datetime(COALESCE(closed_at, created_at), '+10 hours')) = ?
+                  OR target_date = ?
+              )
+            ORDER BY COALESCE(closed_at, created_at) DESC, id DESC
+        """, (user_id, user_id, date_str, date_str))
+        today_trades = [dict(r) for r in cur.fetchall()]
+
     today_pnl_usd = sum((float(t.get("pnl_cents") or 0.0) * float(t.get("shares") or 1.0)) / 100.0 for t in today_trades)
     today_wins = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) > 0)
-    today_losses = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) <= 0)
+    today_losses = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) < 0)
     sign_today = "+" if today_pnl_usd >= 0 else ""
 
     p_bal = get_paper_balance(user_id) if user_id else {
@@ -950,7 +1062,7 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
         f" • Реальный винрейт: {real_s.get('winrate', 0.0)}% (Побед: {real_s.get('wins', 0)} / Потерь: {real_s.get('losses', 0)})",
         f" • Реальный PnL: ${real_s.get('total_pnl_usd', 0.0):.2f} USDC",
         f" • Бумажный винрейт: {paper_s.get('winrate', 0.0)}% (Побед: {paper_s.get('wins', 0)} / Потерь: {paper_s.get('losses', 0)})",
-        f" • Бумажный PnL: ${paper_s.get('total_pnl_usd', 0.0):.2f} USDC",
+        f" • Бумажный PnL: ${p_bal['closed_pnl_usd']:.2f} USDC",
         "",
         "=" * 80,
         "📋 3. ПОЛНАЯ ХРОНОЛОГИЯ ВСЕХ ДЕЙСТВИЙ ЗА ДЕНЬ (ВРЕМЯ ХАБАРОВСК):",

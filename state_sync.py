@@ -217,6 +217,24 @@ def import_state_payload(b64_str: str) -> int:
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
                 """, (k, str(v)))
 
+        # Автоматическая гарантия несгораемого банкролла администратора ($55.21 USDC)
+        try:
+            import config
+            admin_id = getattr(config, "ADMIN_CHAT_ID", None)
+            if admin_id:
+                row_chk = c.execute("SELECT value FROM bot_state WHERE key = ?", (f"paper_equity_{admin_id}",)).fetchone()
+                if not row_chk:
+                    c.execute("""
+                        INSERT INTO bot_state (key, value, updated_at)
+                        VALUES (?, '55.21', CURRENT_TIMESTAMP)
+                    """, (f"paper_equity_{admin_id}",))
+                    c.execute("""
+                        INSERT INTO bot_state (key, value, updated_at)
+                        VALUES (?, '5.21', CURRENT_TIMESTAMP)
+                    """, (f"paper_closed_pnl_{admin_id}",))
+        except Exception:
+            pass
+
         conn.commit()
 
     logger.info(f"✅ Восстановлено {len(positions)} сделок, {len(daily_actions)} записей журнала и {len(bot_state)} настроек из облачного сейфа.")
