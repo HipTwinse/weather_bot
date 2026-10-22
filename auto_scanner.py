@@ -148,6 +148,25 @@ def is_khv_active_hours() -> bool:
     return 10 <= now_khv.hour < 24
 
 
+def get_current_digest_slot(now_khv: datetime) -> Optional[str]:
+    """
+    Определяет текущий актуальный 30-минутный слот (:07 или :37) в торговом окне 10:00 - 24:00 ХБР.
+    Покрывает непрерывный диапазон времени, исключая пропуски из-за сетевых задержек или перезапусков сервера.
+    """
+    if not is_khv_active_hours():
+        return None
+    if 7 <= now_khv.minute < 37:
+        return f"{now_khv.strftime('%Y-%m-%d %H')}:07"
+    elif now_khv.minute >= 37:
+        return f"{now_khv.strftime('%Y-%m-%d %H')}:37"
+    else:
+        # До 07 минут текущего часа (например, 11:02) актуальным слотом является :37 предыдущего часа
+        prev_hour = now_khv - timedelta(hours=1)
+        if prev_hour.hour < 10:
+            return None
+        return f"{prev_hour.strftime('%Y-%m-%d %H')}:37"
+
+
 def get_next_sleep_seconds(now: datetime) -> Tuple[float, datetime, str]:
     """
     Рассчитывает целевое время следующей контрольной точки (:07 или :37)
@@ -2608,6 +2627,16 @@ async def run_auto_scanner(bot: Bot) -> None:
     global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT, _LAST_AUDIT_REPORT_DATE, _LAST_1900_BRIEFING_DATE
     logger.info("🚀 Консолидированный автосканер запущен (Окно: 10:00 - 24:00 ХБР, METAR: :07 и :37).")
 
+    # Инициализация последнего отправленного слота из постоянного хранилища SQLite
+    if not _LAST_SENT_SLOT:
+        try:
+            saved_slot = get_bot_state("last_sent_digest_slot")
+            if saved_slot:
+                _LAST_SENT_SLOT = saved_slot
+                logger.info(f"💾 Восстановлен последний отправленный слот дайджеста: {_LAST_SENT_SLOT}")
+        except Exception:
+            pass
+
     # Запускаем непрерывный высокочастотный мониторинг позиций (каждые 15 сек при наличии сделок)
     asyncio.create_task(run_position_monitor(bot))
 
@@ -2615,21 +2644,16 @@ async def run_auto_scanner(bot: Bot) -> None:
         try:
             now_khv = datetime.now(KHV_TZ)
 
-            # 1. Проверяем контрольную точку (:07 или :37) только если мы в активных часах
-            current_checkpoint_slot: Optional[str] = None
-            if is_khv_active_hours():
-                if now_khv.minute in (7, 8):
-                    current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:07"
-                elif now_khv.minute in (37, 38):
-                    current_checkpoint_slot = f"{now_khv.strftime('%Y-%m-%d %H')}:37"
+            # 1. Определяем текущий непрерывный 30-минутный слот (:07 или :37)
+            current_checkpoint_slot = get_current_digest_slot(now_khv)
 
-            # 2. Если мы в контрольной точке И дайджест для этого слота еще не отправлялся — отправляем!
+            # 2. Если слот активен И дайджест для этого слота еще не отправлялся — отправляем!
             if current_checkpoint_slot and current_checkpoint_slot != _LAST_SENT_SLOT:
                 today_khv_str = now_khv.strftime("%Y-%m-%d")
 
                 # Утренний базовый пост отправляется на первом слоте 10:00 ХБР (10:07)
                 is_morning_base = False
-                if now_khv.hour == 10 and _LAST_MORNING_DIGEST_DATE != today_khv_str:
+                if now_khv.hour == 10 and current_checkpoint_slot.endswith(":07") and _LAST_MORNING_DIGEST_DATE != today_khv_str:
                     is_morning_base = True
                     _LAST_MORNING_DIGEST_DATE = today_khv_str
                     logger.info("🌅 Формирование утреннего базового прогноза (10:07 ХБР)...")
@@ -2670,12 +2694,16 @@ async def run_auto_scanner(bot: Bot) -> None:
                 # Отправка дайджеста
                 await send_consolidated_digest(bot, cities_metrics, is_morning_base, now_khv)
 
-                # Защита от повторной отправки в этом же слоте
+                # Защита от повторной отправки в этом же слоте + фиксация в хранилище
                 _LAST_SENT_SLOT = current_checkpoint_slot
+                try:
+                    set_bot_state("last_sent_digest_slot", current_checkpoint_slot)
+                except Exception:
+                    pass
                 logger.info(f"✅ Дайджест {current_checkpoint_slot} ХБР успешно разослан.")
 
                 # 3. Если это завершающий вечерний цикл дня (23:37 ХБР) — формируем и рассылаем дневной отчет
-                if now_khv.hour == 23 and now_khv.minute in (37, 38) and _LAST_AUDIT_REPORT_DATE != today_khv_str:
+                if now_khv.hour == 23 and now_khv.minute >= 37 and _LAST_AUDIT_REPORT_DATE != today_khv_str:
                     _LAST_AUDIT_REPORT_DATE = today_khv_str
                     logger.info("🌙 Торговое окно 10:00-24:00 закрывается. Отправка итогового аудиторского отчета за день...")
                     try:
