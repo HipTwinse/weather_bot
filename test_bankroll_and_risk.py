@@ -76,6 +76,57 @@ def test_calculate_risk_managed_order_size():
     assert res_capped["shares"] == 0.0
 
 
+def test_micro_deposit_bootstrap_rule():
+    """Тест разгона микро-депозита (< $5.00 по правилу Босса)."""
+    # 1. Баланс $1.38 (как сейчас на кошельке) без открытых сделок -> РАЗРЕШЕНО войти на $1.25
+    res_micro = calculate_risk_managed_order_size(
+        balance=1.38,
+        conf_score=85,
+        price_cents=35.0,
+        max_portfolio_exposure_pct=0.50,
+        open_positions_allocated_usd=0.0
+    )
+    assert res_micro["allowed"] is True
+    assert res_micro["cost_usd"] == 1.25
+    assert res_micro["shares"] == round(1.25 / 0.35, 2)
+    assert "Разгон микро-депозита" in res_micro["reason"]
+
+    # 2. Если уже есть открытая позиция при балансе < $5 -> запрещено (лимит 1 сделка)
+    res_micro_locked = calculate_risk_managed_order_size(
+        balance=1.38,
+        conf_score=85,
+        price_cents=35.0,
+        max_portfolio_exposure_pct=0.50,
+        open_positions_allocated_usd=1.25
+    )
+    assert res_micro_locked["allowed"] is False
+    assert "уже открыта позиция" in res_micro_locked["reason"]
+
+    # 3. Если баланс ниже биржевого минимума $1.08 (например $0.80) -> отказ
+    res_too_small = calculate_risk_managed_order_size(
+        balance=0.80,
+        conf_score=85,
+        price_cents=35.0,
+        max_portfolio_exposure_pct=0.50,
+        open_positions_allocated_usd=0.0
+    )
+    assert res_too_small["allowed"] is False
+    assert "ниже минимального биржевого ордера" in res_too_small["reason"]
+
+    # 4. Если баланс перешагнул $5.00 ($5.50) -> автоматически включается стандартный риск-менеджмент
+    res_standard = calculate_risk_managed_order_size(
+        balance=5.50,
+        conf_score=95,
+        price_cents=25.0,
+        max_portfolio_exposure_pct=0.50,
+        open_positions_allocated_usd=0.0
+    )
+    assert res_standard["allowed"] is True
+    # При $5.50 10% = $0.55 < $1.08 min, поэтому берется min_order $1.08
+    assert res_standard["cost_usd"] == 1.08
+    assert "Риск" in res_standard["reason"]
+
+
 def test_paper_balance_calculation_and_storage():
     init_db()
     user_id = 999999123

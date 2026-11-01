@@ -1918,6 +1918,15 @@ async def check_and_execute_auto_buy(
             free_cash = p_bal["free_balance"]
 
         for idx, cand in enumerate(candidates):
+            # При разгоне микро-депозита (< $5.00) капитал концентрируется строго в топ-1 сделке
+            if effective_balance < 5.0 and idx > 0:
+                await asyncio.to_thread(
+                    record_daily_action,
+                    uid, "SKIP", cand["icao"], cand["outcomes"], cand["price_cents"],
+                    {"reason": "Микро-депозит (<$5.00): капитал сконцентрирован в топ-1 сделке", "conf_score": cand["conf_score"]}
+                )
+                continue
+
             # Проверяем мани-менеджмент и допустимый размер позиции
             sizing = calculate_risk_managed_order_size(
                 balance=effective_balance,
@@ -1939,8 +1948,9 @@ async def check_and_execute_auto_buy(
             shares = sizing["shares"]
             risk_pct = sizing["risk_pct"]
 
-            # В реальную сделку допускается топ-кандидат с рейтингом >= 80.0 при наличии свободных средств
-            is_top_pick = (cand["conf_score"] >= 80.0 and free_cash >= trade_cost)
+            # В реальную сделку допускается топ-кандидат с рейтингом >= 75.0 (при микро-балансе <$5) или >= 80.0
+            min_conf_thresh = 75.0 if effective_balance < 5.0 else 80.0
+            is_top_pick = (cand["conf_score"] >= min_conf_thresh and free_cash >= trade_cost)
 
             # === AI-ВАЛИДАЦИЯ НЕЙРОСЕТЬЮ (GEMINI RISK VALIDATION) ===
             from gemini_analyzer import validate_candidate_ai

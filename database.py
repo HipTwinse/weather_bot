@@ -647,6 +647,10 @@ def calculate_risk_managed_order_size(
        - Минимальный размер ордера на Polymarket CLOB: $1.08 USDC (или min 5 долей).
        - Максимальный лимит на одну позицию: не более 12% от общего баланса.
        - Лимит общего риска портфеля: сумма всех открытых сделок не более 50% от баланса.
+    3. Специальный режим разгона микро-депозита (баланс < $5.00 по правилу Босса):
+       - До $5.00 строгий 50% лимит портфеля снимается, разрешается вход в одну топ-сделку
+         на минимальный биржевой ордер (~$1.08-$1.25) при наличии свободных средств.
+       - После перешагивания $5.00 автоматически включается полный стандартный риск-менеджмент.
     """
     if balance <= 0 or price_cents <= 0:
         return {
@@ -654,10 +658,53 @@ def calculate_risk_managed_order_size(
             "allowed": False, "reason": "Нулевой баланс или некорректная цена"
         }
 
+    min_order_usd = 1.08
+
+    # === РЕЖИМ РАЗГОНА МИКРО-ДЕПОЗИТА (БАЛАНС МЕНЬШЕ $5.00) ===
+    if balance < 5.0:
+        if open_positions_allocated_usd > 0.0:
+            return {
+                "cost_usd": 0.0, "shares": 0.0, "risk_pct": 0.0,
+                "allowed": False,
+                "reason": f"Микро-депозит (<$5.00): уже открыта позиция (${open_positions_allocated_usd:.2f}), лимит 1 сделка"
+            }
+        if balance < min_order_usd:
+            return {
+                "cost_usd": 0.0, "shares": 0.0, "risk_pct": 0.0,
+                "allowed": False,
+                "reason": f"Баланс (${balance:.2f}) ниже минимального биржевого ордера Polymarket ($1.08)"
+            }
+        if conf_score < 75.0:
+            return {
+                "cost_usd": 0.0, "shares": 0.0, "risk_pct": 0.0,
+                "allowed": False,
+                "reason": f"Микро-депозит (<$5.00): требуется рейтинг надежности >= 75 (сейчас {conf_score:.0f})"
+            }
+
+        target_cost = round(min(balance, 1.25), 2)
+        if target_cost < min_order_usd:
+            target_cost = round(min_order_usd, 2)
+        target_cost = min(target_cost, balance)
+
+        shares = round(target_cost / (price_cents / 100.0), 2)
+        if shares < 5.0 and price_cents <= 20.0:
+            shares = 5.0
+            target_cost = round(shares * (price_cents / 100.0), 2)
+
+        actual_risk_pct = round((target_cost / balance) * 100.0, 1)
+        return {
+            "cost_usd": target_cost,
+            "shares": shares,
+            "risk_pct": actual_risk_pct,
+            "allowed": True,
+            "reason": f"🚀 Разгон микро-депозита (<$5): вход в топ-сигнал (${target_cost:.2f} / {actual_risk_pct}% банка)"
+        }
+
+    # === СТАНДАРТНЫЙ РИСК-МЕНЕДЖМЕНТ (БАЛАНС >= $5.00) ===
     # Лимит совокупного риска портфеля (не более 50% в рынке одновременно)
     max_allowed_portfolio_capital = balance * max_portfolio_exposure_pct
     remaining_portfolio_capital = max(0.0, max_allowed_portfolio_capital - open_positions_allocated_usd)
-    if remaining_portfolio_capital < 1.08:
+    if remaining_portfolio_capital < min_order_usd:
         return {
             "cost_usd": 0.0,
             "shares": 0.0,
@@ -680,7 +727,6 @@ def calculate_risk_managed_order_size(
         }
 
     target_cost = round(balance * risk_pct, 2)
-    min_order_usd = 1.08
     if target_cost < min_order_usd:
         target_cost = min_order_usd
 
