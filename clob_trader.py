@@ -26,14 +26,54 @@ POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
 
 
-def _derive_and_set_api_creds(client: ClobClient):
+# Глобальный кеш учетных записей CLOB (чтобы избежать лишних вызовов и повторных дериваций)
+_CLOB_CREDS_CACHE: Dict[str, Any] = {}
+
+
+def _derive_and_set_api_creds(client: ClobClient) -> Any:
     """Генерирует или восстанавливает API-ключи CLOB V2 и устанавливает их в клиенте."""
-    derive_fn = getattr(client, "create_or_derive_api_key", None) or getattr(
-        client, "create_or_derive_api_creds", None
-    )
-    creds = derive_fn() if derive_fn else None
+    signer_addr = ""
+    if hasattr(client, "signer") and hasattr(client.signer, "address"):
+        signer_addr = str(client.signer.address).lower()
+    elif hasattr(client, "key"):
+        signer_addr = str(client.key)
+
+    cache_key = f"{signer_addr}_{getattr(client, 'funder', '')}"
+    if cache_key in _CLOB_CREDS_CACHE:
+        try:
+            creds = _CLOB_CREDS_CACHE[cache_key]
+            client.set_api_creds(creds)
+            return creds
+        except Exception:
+            pass
+
+    creds = None
+    # 1. Пробуем восстановить существующие ключи через create_or_derive_api_key / derive_api_key
+    for fn_name in ("create_or_derive_api_key", "derive_api_key"):
+        fn = getattr(client, fn_name, None)
+        if fn:
+            try:
+                creds = fn()
+                if creds:
+                    break
+            except Exception as e:
+                logger.debug(f"Метод {fn_name} завершился с ошибкой: {e}")
+
+    # 2. Если восстановление не удалось (например, 400 Could not derive api key на прокси-кошельке),
+    # создаем активный API-ключ через create_api_key (работает гарантированно)
+    if not creds and hasattr(client, "create_api_key"):
+        try:
+            creds = client.create_api_key()
+        except Exception as e:
+            logger.warning(f"Ошибка вызова create_api_key: {e}")
+
     if creds:
-        client.set_api_creds(creds)
+        try:
+            client.set_api_creds(creds)
+            _CLOB_CREDS_CACHE[cache_key] = creds
+        except Exception as e:
+            logger.warning(f"Ошибка set_api_creds: {e}")
+
     return creds
 
 # Публичные RPC-узлы Polygon для ончейн-проверок баланса

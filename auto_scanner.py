@@ -787,6 +787,10 @@ def _calc_raw_priority_target(
             boost = 1.0 if (wspd >= 16 or (raw_metar and "G" in raw_metar)) else 0.6
             val = round(base + boost, 1)
             return val, f"ICON+ECMWF+{boost:.1f}°C ({val:.1f}°C, Южная адвекция {wspd}kt)"
+        if any(c in raw_metar for c in ["CAVOK", "CLR", "SKC"]):
+            # Ясное солнце в Ханеде без охлаждающего морского бриза перегревает полосу на +0.8°C к шельфовым моделям
+            val = round(base + 0.8, 1)
+            return val, f"ICON+ECMWF+0.8°C ({val:.1f}°C, Солнце Ханеда)"
         if is_calm:
             return round(base + 0.3, 1), f"ICON+ECMWF+0.3°C ({base+0.3:.1f}°C, Токио UHI)"
         return base, f"ICON+ECMWF ({base:.1f}°C, Токио)"
@@ -1805,15 +1809,20 @@ async def check_and_execute_auto_buy(
 
             # Защита от утренней ловушки овершута:
             # Если до закрытия окна прогрева еще более 1.5 часов (rem_h >= 1.5),
-            # а до целевого страйка осталось <= 0.7°C при высоком темпе (rate_val >= 0.7°C/ч),
-            # этот одиночный страйк будет неизбежно пробит вверх задолго до пика дня!
+            # а до целевого страйка остался слишком маленький зазор для текущего темпа прогрева:
+            # 1. Жесткий барьер: gap <= 0.7°C при темпе >= 0.7°C/ч
+            # 2. Динамический барьер утреннего перегрева: при темпе >= 1.2°C/ч и rem_h >= 2.0ч
+            #    минимально ожидаемый прирост (rate_val * min(rem_h, 2.0) * 0.5) превышает gap.
             rem_h_entry = max(0.0, heating_cutoff - local_time_val)
             if temp_c is not None and rem_h_entry >= 1.5 and rate_val >= 0.7:
-                if (target_strike - temp_c) <= 0.7:
+                gap = target_strike - temp_c
+                min_projected_rise = rate_val * min(rem_h_entry, 2.0) * 0.5
+                is_dynamic_overshoot = (rem_h_entry >= 2.0 and rate_val >= 1.2 and gap < min_projected_rise)
+                if gap <= 0.7 or is_dynamic_overshoot:
                     await asyncio.to_thread(
                         record_daily_action,
                         uid, "SKIP", icao, strike_str, 0.0,
-                        {"reason": f"Ловушка овершута: до страйка {strike_str} всего {target_strike - temp_c:.1f}°C при темпе +{rate_val:.1f}°C/ч и {rem_h_entry:.1f}ч солнца впереди"}
+                        {"reason": f"Ловушка овершута: до страйка {strike_str} всего {gap:.1f}°C при темпе +{rate_val:.1f}°C/ч и {rem_h_entry:.1f}ч солнца впереди"}
                     )
                     continue
 
