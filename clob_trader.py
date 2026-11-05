@@ -25,6 +25,21 @@ logger = logging.getLogger("ClobTrader")
 POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
 
+# Поддержка выделенного прокси для обхода геоблокировок Polymarket (Ирландия / Нидерланды)
+POLYMARKET_PROXY = os.getenv("POLYMARKET_PROXY", "").strip() or os.getenv("CLOB_PROXY", "").strip()
+if POLYMARKET_PROXY:
+    try:
+        import httpx
+        from py_clob_client_v2.http_helpers import helpers as _clob_helpers
+        try:
+            _custom_client = httpx.Client(proxy=POLYMARKET_PROXY, timeout=30.0, follow_redirects=True)
+        except TypeError:
+            _custom_client = httpx.Client(proxies=POLYMARKET_PROXY, timeout=30.0, follow_redirects=True)
+        _clob_helpers._http_client = _custom_client
+        logger.info(f"Polymarket CLOB переключен на выделенный прокси: {POLYMARKET_PROXY.split('@')[-1]}")
+    except Exception as e_prox:
+        logger.error(f"Не удалось настроить прокси для Polymarket CLOB: {e_prox}")
+
 
 # Глобальный кеш учетных записей CLOB (чтобы избежать лишних вызовов и повторных дериваций)
 _CLOB_CREDS_CACHE: Dict[str, Any] = {}
