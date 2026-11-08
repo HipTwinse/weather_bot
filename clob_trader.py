@@ -27,7 +27,19 @@ POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
 
 # Поддержка выделенного прокси для обхода геоблокировок Polymarket (Ирландия / Нидерланды)
-POLYMARKET_PROXY = os.getenv("POLYMARKET_PROXY", "").strip() or os.getenv("CLOB_PROXY", "").strip()
+raw_proxy = os.getenv("POLYMARKET_PROXY", "").strip() or os.getenv("CLOB_PROXY", "").strip()
+POLYMARKET_PROXY = ""
+if raw_proxy:
+    parts = raw_proxy.split(":")
+    if len(parts) == 4 and "@" not in raw_proxy and not raw_proxy.startswith(("http", "socks")):
+        # Автоматическая нормализация формата ip:port:user:pass (типичный Webshare)
+        ip, port, user, pwd = parts
+        POLYMARKET_PROXY = f"http://{user}:{pwd}@{ip}:{port}"
+    elif not raw_proxy.startswith(("http://", "https://", "socks5://", "socks5h://")):
+        POLYMARKET_PROXY = "http://" + raw_proxy
+    else:
+        POLYMARKET_PROXY = raw_proxy
+
 if POLYMARKET_PROXY:
     try:
         import httpx
