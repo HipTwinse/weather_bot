@@ -77,7 +77,11 @@ from clob_trader import (
 
 logger = logging.getLogger("AutoScanner")
 
-KHV_TZ = zoneinfo.ZoneInfo("Asia/Vladivostok")  # Хабаровск UTC+10
+try:
+    KHV_TZ = zoneinfo.ZoneInfo("Asia/Vladivostok")  # Хабаровск UTC+10
+except Exception:
+    from datetime import timezone
+    KHV_TZ = timezone(timedelta(hours=10))
 
 TARGET_CITIES = {
     "EGLC": "🇬🇧 Лондон (EGLC)",
@@ -143,64 +147,38 @@ def sanitize_telegram_html(text: str) -> str:
 
 
 def is_khv_active_hours() -> bool:
-    """Проверяет, попадает ли время Хабаровска в торговое окно 10:00 - 00:00."""
-    now_khv = datetime.now(KHV_TZ)
-    return 10 <= now_khv.hour < 24
+    """Круглосуточный режим 24/7 без ночной спячки."""
+    return True
 
 
 def get_current_digest_slot(now_khv: datetime) -> Optional[str]:
     """
-    Определяет текущий актуальный 30-минутный слот (:07 или :37) в торговом окне 10:00 - 24:00 ХБР.
+    Определяет текущий актуальный 30-минутный слот (:07 или :37) в круглосуточном режиме 24/7.
     Покрывает непрерывный диапазон времени, исключая пропуски из-за сетевых задержек или перезапусков сервера.
     """
-    if not is_khv_active_hours():
-        return None
     if 7 <= now_khv.minute < 37:
         return f"{now_khv.strftime('%Y-%m-%d %H')}:07"
     elif now_khv.minute >= 37:
         return f"{now_khv.strftime('%Y-%m-%d %H')}:37"
     else:
-        # До 07 минут текущего часа (например, 11:02) актуальным слотом является :37 предыдущего часа
+        # До 07 минут текущего часа актуальным слотом является :37 предыдущего часа
         prev_hour = now_khv - timedelta(hours=1)
-        if prev_hour.hour < 10:
-            return None
         return f"{prev_hour.strftime('%Y-%m-%d %H')}:37"
 
 
 def get_next_sleep_seconds(now: datetime) -> Tuple[float, datetime, str]:
     """
     Рассчитывает целевое время следующей контрольной точки (:07 или :37)
-    и точное количество секунд сна до неё.
+    и точное количество секунд сна до неё в круглосуточном режиме 24/7.
     С буфером в 2 секунды (:07:02 / :37:02) для гарантированного получения самых свежих данных NOAA METAR.
-    Учитывает торговое окно 10:00 - 24:00 ХБР:
-    - Ночью (после 23:37:02 и до 10:07:02 ХБР) сканер спит строго до утренней точки 10:07:02!
     """
-    # 1. Если сейчас глухая ночь (00:00 - 09:59 ХБР): спим до 10:07:02 сегодня
-    if now.hour < 10:
-        target = now.replace(hour=10, minute=7, second=2, microsecond=0)
-        sleep_secs = max(1.0, (target - now).total_seconds())
-        slot_key = target.strftime("%Y-%m-%d %H:%M")
-        return sleep_secs, target, slot_key
-
-    # 2. Если сейчас 23:37 или позже: последний дневной цикл завершен, спим до 10:07:02 завтра
-    if now.hour == 23 and (now.minute > 37 or (now.minute == 37 and now.second >= 2)):
-        tomorrow = now + timedelta(days=1)
-        target = tomorrow.replace(hour=10, minute=7, second=2, microsecond=0)
-        sleep_secs = max(1.0, (target - now).total_seconds())
-        slot_key = target.strftime("%Y-%m-%d %H:%M")
-        return sleep_secs, target, slot_key
-
-    # 3. Внутри активного торгового окна (10:00 - 23:37):
     if now.minute < 7 or (now.minute == 7 and now.second < 2):
         target = now.replace(minute=7, second=2, microsecond=0)
     elif now.minute < 37 or (now.minute == 37 and now.second < 2):
         target = now.replace(minute=37, second=2, microsecond=0)
     else:
         next_hour = now + timedelta(hours=1)
-        if next_hour.hour < 10 or next_hour.day != now.day:
-            target = next_hour.replace(hour=10, minute=7, second=2, microsecond=0)
-        else:
-            target = next_hour.replace(minute=7, second=2, microsecond=0)
+        target = next_hour.replace(minute=7, second=2, microsecond=0)
 
     sleep_secs = (target - now).total_seconds()
     if sleep_secs <= 0.1:
@@ -208,10 +186,7 @@ def get_next_sleep_seconds(now: datetime) -> Tuple[float, datetime, str]:
             target = now.replace(minute=37, second=2, microsecond=0)
         else:
             next_hour = now + timedelta(hours=1)
-            if next_hour.hour < 10 or next_hour.day != now.day:
-                target = next_hour.replace(hour=10, minute=7, second=2, microsecond=0)
-            else:
-                target = next_hour.replace(minute=7, second=2, microsecond=0)
+            target = next_hour.replace(minute=7, second=2, microsecond=0)
         sleep_secs = max(1.0, (target - now).total_seconds())
 
     slot_key = target.strftime("%Y-%m-%d %H:%M")
@@ -1701,9 +1676,7 @@ async def check_and_execute_auto_buy(
     При include_standby=True дополнительно опрашивает резервные города (Сеул RKSI, Анкара LTAC)
     и включает их в отбор, если на Polymarket есть активный стакан котировок.
     """
-    if not is_khv_active_hours():
-        logger.info("Ночные часы ХБР (00:00 - 10:00): автопокупка заблокирована.")
-        return
+    # Круглосуточный режим: каждая метеостанция фильтруется по собственному местному солнечному окну (LT)
 
     all_metrics = list(cities_metrics)
     if include_standby:
@@ -2639,12 +2612,12 @@ async def send_consolidated_digest(
 async def run_auto_scanner(bot: Bot) -> None:
     """
     Основной цикл автоматического сканера.
-    Синхронизирован со сводками METAR строго 2 раза в час: ровно в :02 и :32 минуты.
-    Работает в торговом окне 10:00 - 24:00 по времени Хабаровска (UTC+10).
-    В 23:32 формирует и рассылает дневной аудиторский отчет и уходит в ночной сон до 10:02.
+    Синхронизирован со сводками METAR строго 2 раза в час: ровно в :07 и :37 минут.
+    Работает круглосуточно 24/7 (с учетом местного светового дня каждой станции).
+    В 23:37 формирует и рассылает дневной аудиторский отчет.
     """
     global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT, _LAST_AUDIT_REPORT_DATE, _LAST_1900_BRIEFING_DATE
-    logger.info("🚀 Консолидированный автосканер запущен (Окно: 10:00 - 24:00 ХБР, METAR: :07 и :37).")
+    logger.info("🚀 Консолидированный автосканер запущен (Круглосуточный режим 24/7, METAR: :07 и :37).")
 
     # Инициализация последнего отправленного слота из постоянного хранилища SQLite
     if not _LAST_SENT_SLOT:
