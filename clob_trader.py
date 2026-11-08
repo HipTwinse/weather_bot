@@ -27,33 +27,44 @@ POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
 
 # Поддержка выделенного прокси для обхода геоблокировок Polymarket (Ирландия / Нидерланды / Испания)
-raw_proxy = os.getenv("POLYMARKET_PROXY", "").strip() or os.getenv("CLOB_PROXY", "").strip()
-POLYMARKET_PROXY = ""
-if raw_proxy:
+_PROXY_SETUP_DONE = False
+
+
+def ensure_clob_proxy():
+    """Гарантирует подключение прокси перед любым обращением к Polymarket CLOB."""
+    global _PROXY_SETUP_DONE
+    raw_proxy = os.getenv("POLYMARKET_PROXY", "").strip() or os.getenv("CLOB_PROXY", "").strip()
+    if not raw_proxy:
+        return
+    proxy_url = ""
     parts = raw_proxy.split(":")
     if len(parts) == 4 and "@" not in raw_proxy and not raw_proxy.startswith(("http", "socks")):
-        # Автоматическая нормализация формата ip:port:user:pass (типичный Webshare)
         ip, port, user, pwd = parts
         proto = "socks5" if port in ("6641", "1080") or "socks" in raw_proxy.lower() else "http"
-        POLYMARKET_PROXY = f"{proto}://{user}:{pwd}@{ip}:{port}"
+        proxy_url = f"{proto}://{user}:{pwd}@{ip}:{port}"
     elif not raw_proxy.startswith(("http://", "https://", "socks5://", "socks5h://")):
         proto = "socks5" if ":6641" in raw_proxy or ":1080" in raw_proxy or "socks" in raw_proxy.lower() else "http"
-        POLYMARKET_PROXY = f"{proto}://" + raw_proxy
+        proxy_url = f"{proto}://" + raw_proxy
     else:
-        POLYMARKET_PROXY = raw_proxy
+        proxy_url = raw_proxy
 
-if POLYMARKET_PROXY:
-    try:
-        import httpx
-        from py_clob_client_v2.http_helpers import helpers as _clob_helpers
+    if proxy_url:
         try:
-            _custom_client = httpx.Client(proxy=POLYMARKET_PROXY, timeout=30.0, follow_redirects=True)
-        except TypeError:
-            _custom_client = httpx.Client(proxies=POLYMARKET_PROXY, timeout=30.0, follow_redirects=True)
-        _clob_helpers._http_client = _custom_client
-        logger.info(f"Polymarket CLOB переключен на выделенный прокси: {POLYMARKET_PROXY.split('@')[-1]}")
-    except Exception as e_prox:
-        logger.error(f"Не удалось настроить прокси для Polymarket CLOB: {e_prox}")
+            import httpx
+            from py_clob_client_v2.http_helpers import helpers as _clob_helpers
+            try:
+                _custom_client = httpx.Client(proxy=proxy_url, timeout=30.0, follow_redirects=True)
+            except TypeError:
+                _custom_client = httpx.Client(proxies=proxy_url, timeout=30.0, follow_redirects=True)
+            _clob_helpers._http_client = _custom_client
+            _PROXY_SETUP_DONE = True
+            logger.info(f"Polymarket CLOB успешно настроен через выделенный шлюз: {proxy_url.split('@')[-1]}")
+        except Exception as e_prox:
+            logger.error(f"Не удалось настроить прокси для Polymarket CLOB: {e_prox}")
+
+
+# Инициализируем при загрузке модуля
+ensure_clob_proxy()
 
 
 # Глобальный кеш учетных записей CLOB (чтобы избежать лишних вызовов и повторных дериваций)
@@ -62,6 +73,7 @@ _CLOB_CREDS_CACHE: Dict[str, Any] = {}
 
 def _derive_and_set_api_creds(client: ClobClient) -> Any:
     """Генерирует или восстанавливает API-ключи CLOB V2 и устанавливает их в клиенте."""
+    ensure_clob_proxy()
     signer_addr = ""
     if hasattr(client, "signer") and hasattr(client.signer, "address"):
         signer_addr = str(client.signer.address).lower()
@@ -387,6 +399,7 @@ def execute_market_sell(
     - signer: EOA address из приватного ключа
     - signatureType: 1 (Polymarket Proxy)
     """
+    ensure_clob_proxy()
     if not token_id:
         return False, "Не указан token_id для продажи", {}
 
@@ -486,6 +499,7 @@ def execute_market_buy(
     - Ограничение максимальной цены входа (max_price), чтобы не покупать перегретые токены.
     - Возвращает (успех, order_id_или_ошибка, детали).
     """
+    ensure_clob_proxy()
     if not token_id:
         return False, "Не указан token_id для покупки", {}
 
