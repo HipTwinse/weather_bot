@@ -8,3 +8,4 @@ aiohttp-socks>=0.8.4
 timezonefinder>=6.5.0
 py-clob-client>=0.34.0
 py-clob-client-v2>=1.2.0
+socksio>=1.0.0
