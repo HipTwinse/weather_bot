@@ -89,6 +89,9 @@ TARGET_CITIES = {
     "LIMC": "🇮🇹 Милан (LIMC)",
     "LEMD": "🇪🇸 Мадрид (LEMD)",
     "RJTT": "🇯🇵 Токио (RJTT)",
+    "KJFK": "🇺🇸 Нью-Йорк (KJFK)",
+    "KMIA": "🇺🇸 Майами (KMIA)",
+    "KORD": "🇺🇸 Чикаго (KORD)",
 }
 
 # Резервные города фонового радара автопокупки (проверяются на наличие ликвидного стакана и сильного сигнала)
@@ -117,14 +120,17 @@ express_scan_keyboard = InlineKeyboardMarkup(
         ],
         [
             InlineKeyboardButton(text="🇯🇵 Токио RJTT", callback_data="express_scan:RJTT"),
-            InlineKeyboardButton(text="🇰🇷 Сеул RKSI", callback_data="express_scan:RKSI"),
+            InlineKeyboardButton(text="🇺🇸 Нью-Йорк KJFK", callback_data="express_scan:KJFK"),
         ],
         [
-            InlineKeyboardButton(text="🇹🇷 Анкара LTAC", callback_data="express_scan:LTAC"),
+            InlineKeyboardButton(text="🇺🇸 Майами KMIA", callback_data="express_scan:KMIA"),
+            InlineKeyboardButton(text="🇺🇸 Чикаго KORD", callback_data="express_scan:KORD"),
+        ],
+        [
             InlineKeyboardButton(text="🧭 Почему вне рынка?", callback_data="btn_why_standby"),
+            InlineKeyboardButton(text="📌 Мои позиции", callback_data="open_my_positions"),
         ],
         [
-            InlineKeyboardButton(text="📌 Мои позиции", callback_data="open_my_positions"),
             InlineKeyboardButton(text="📊 Статистика", callback_data="view_trading_stats"),
         ],
     ]
@@ -206,16 +212,31 @@ async def send_daily_audit_file(bot: Bot, date_str: str = "") -> None:
         except (ValueError, TypeError):
             pass
 
+    # Формируем компактный срез динамики ключевых городов дня для подписи
+    city_dyn_lines = []
+    try:
+        from database import get_city_daily_summary
+        for c_icao in TARGET_CITIES.keys():
+            s = get_city_daily_summary(date_str, c_icao)
+            if s and s.get("max_temp") is not None:
+                lbl = ALL_RADAR_CITIES_MAP.get(c_icao, c_icao)
+                city_dyn_lines.append(f"• <b>{lbl}</b>: {s['start_temp']:.1f}°C ➔ пик <b>{s['max_temp']:.1f}°C</b> ({s['delta']:+.1f}°C)")
+    except Exception as e_dyn_sum:
+        logger.debug(f"Не удалось собрать срез динамики городов: {e_dyn_sum}")
+
+    dyn_block = ("\n\n🌡️ <b>Суточный прогрев городов:</b>\n" + "\n".join(city_dyn_lines)) if city_dyn_lines else ""
+
     for uid in all_uids:
         try:
             report_text, filename = await asyncio.to_thread(generate_daily_audit_report, date_str, user_id=uid)
             doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
             caption = (
                 f"📄 <b>ИТОГОВЫЙ АУДИТОРСКИЙ ОТЧЕТ ЗА ДЕНЬ</b>\n\n"
-                f"Босс, сделал отчет! День закрыт, всё сделано как положено.\n"
-                f"• Дата: <code>{filename.replace('weather_bot_report_', '').replace('.txt', '')}</code>\n"
+                f"Босс, сделал отчет! Суточный цикл завершен, всё сделано как положено.\n"
+                f"• Дата: <code>{filename.replace('weather_bot_report_', '').replace('.txt', '')}</code>"
+                f"{dyn_block}\n\n"
                 f"• Полный журнал всех проверок, сделок, причин выходов и балансов сохранен в файле выше.\n"
-                f"🌙 <i>Торговое окно завершено (10:00 - 24:00 ХБР). Сканер уходит спать, маркетмейкеры могут перевести дух до 10:00 утра.</i>"
+                f"⚡ <i>Сканер ведет радар 24/7, непрерывно сопровождая рынки.</i>"
             )
             await bot.send_document(uid, document=doc_file, caption=caption, parse_mode="HTML")
             logger.info(f"Дневной отчет успешно отправлен пользователю {uid}.")
@@ -529,6 +550,25 @@ def _get_city_physics_note(icao: str, raw_metar: str, temp_c: Optional[float], l
     elif icao == "LTAC":
         return "Анкара (Эсенбога): сухое Анатолийское плато (~950 м). Сильная дневная амплитуда инсоляции (аналог Мадрида), приоритет ICON+ECMWF."
 
+    elif icao == "KJFK":
+        if wdir is not None and 130 <= wdir <= 220 and wspd and wspd >= 8:
+            return "Нью-Йорк (JFK): морской бриз Атлантики (SE/S) сдерживает прогрев полосы. Опора строго на ICON/ECMWF."
+        if wdir is not None and 270 <= wdir <= 340 and wspd and wspd >= 10:
+            return "Нью-Йорк (JFK): континентальный вынос с материка (NW/W) несет тепловой шлейф мегаполиса (+0.8°C к моделям)."
+        return "Нью-Йорк (JFK): стабильный прибрежный радиационный прогрев. Приоритет консенсуса ICON и ECMWF."
+
+    elif icao == "KMIA":
+        if has_cirrus and not has_low_cloud:
+            return "Майами: субтропическое солнце Флориды пробивает верхний ярус, стабильный подъем. Опора на ECMWF+ICON."
+        return "Майами: морской пассатный режим Атлантики, высокая влажность сглаживает скачки. Опора на консенсус."
+
+    elif icao == "KORD":
+        if wdir is not None and 30 <= wdir <= 110 and wspd and wspd >= 7:
+            return "Чикаго (О'Хара): холодный озерный бриз с оз. Мичиган (NE/E) резко режет прогрев полосы (-1.0°C)."
+        if wdir is not None and 230 <= wdir <= 300:
+            return "Чикаго (О'Хара): континентальный юго-западный ветер с прерий разгоняет дневной максимум (UHI активен)."
+        return "Чикаго (О'Хара): классический континентальный прогрев Среднего Запада. Лидер ICON/ECMWF."
+
     return "Синтез эмпирических физических законов KB v8.0."
 
 
@@ -539,6 +579,8 @@ ALL_RADAR_CITIES_MAP = {
     "LEMD": "🇪🇸 Мадрид (LEMD)",
     "EDDM": "🇩🇪 Мюнхен (EDDM)",
     "KJFK": "🇺🇸 Нью-Йорк (KJFK)",
+    "KMIA": "🇺🇸 Майами (KMIA)",
+    "KORD": "🇺🇸 Чикаго (KORD)",
     "RJTT": "🇯🇵 Токио (RJTT)",
     "RKSI": "🇰🇷 Сеул (RKSI)",
     "LTAC": "🇹🇷 Анкара (LTAC)",
@@ -1226,6 +1268,7 @@ async def _safe_send_digest(
             text=safe_text,
             parse_mode="HTML",
             reply_markup=reply_markup,
+            disable_notification=True,
         )
         send_success = True
     except Exception as html_err:
@@ -1241,6 +1284,7 @@ async def _safe_send_digest(
                 text=plain_text,
                 parse_mode=None,
                 reply_markup=reply_markup,
+                disable_notification=True,
             )
             logger.info(f"✅ Дайджест успешно доставлен в чат {chat_id} через Plain-Text fallback.")
             send_success = True
@@ -2657,6 +2701,23 @@ async def run_auto_scanner(bot: Bot) -> None:
                 for icao in TARGET_CITIES.keys():
                     cm = await collect_city_metrics(icao)
                     cities_metrics.append(cm)
+                    try:
+                        from database import record_city_dynamics
+                        cm_dt = cm.get("local_dt")
+                        if cm_dt and cm.get("temp_c") is not None:
+                            record_city_dynamics(
+                                target_date=today_khv_str,
+                                time_str=cm_dt.strftime("%H:%M LT"),
+                                icao=icao,
+                                temp_c=cm.get("temp_c"),
+                                rate_str=cm.get("rate_str", ""),
+                                rate_val=cm.get("rate_val", 0.0),
+                                peak_str=cm.get("peak_str", ""),
+                                raw_metar=cm.get("raw_metar", ""),
+                            )
+                    except Exception as dyn_err:
+                        logger.debug(f"Не удалось записать срез {icao} в city_daily_dynamics: {dyn_err}")
+
                     try:
                         from gemini_analyzer import daily_tracker
                         cm_dt = cm.get("local_dt")

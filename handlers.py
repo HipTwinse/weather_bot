@@ -111,6 +111,8 @@ ALL_RADAR_CITIES = {
     "LEMD": "🇪🇸 Мадрид (LEMD)",
     "EDDM": "🇩🇪 Мюнхен (EDDM)",
     "KJFK": "🇺🇸 Нью-Йорк (KJFK)",
+    "KMIA": "🇺🇸 Майами (KMIA)",
+    "KORD": "🇺🇸 Чикаго (KORD)",
     "RJTT": "🇯🇵 Токио (RJTT)",
     "RKSI": "🇰🇷 Сеул (RKSI)",
     "ZSPD": "🇨🇳 Шанхай (ZSPD)",
@@ -261,7 +263,9 @@ CITY_KEYWORD_MAP = {
     "EDDM": ["munich", "мюнхен", "eddm"],
     "LEMD": ["madrid", "мадрид", "lemd", "barajas"],
     "LIMC": ["milan", "милан", "limc", "malpensa"],
-    "KJFK": ["new york", "нью-йорк", "jfk", "kjfk"],
+    "KJFK": ["new york", "нью-йорк", "jfk", "kjfk", "nyc"],
+    "KMIA": ["miami", "майами", "kmia", "mia"],
+    "KORD": ["chicago", "чикаго", "kord", "ord"],
 }
 
 MONTH_NAMES = {

@@ -91,11 +91,33 @@ def export_state_payload() -> str:
                 FROM bot_state
             """).fetchall()
         ]
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS city_daily_dynamics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_date TEXT NOT NULL,
+                time_str TEXT NOT NULL,
+                icao TEXT NOT NULL,
+                temp_c REAL,
+                rate_str TEXT,
+                rate_val REAL,
+                peak_str TEXT,
+                raw_metar TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        city_dynamics = [
+            dict(r) for r in c.execute("""
+                SELECT target_date, time_str, icao, temp_c, rate_str, rate_val, peak_str, raw_metar
+                FROM city_daily_dynamics
+                ORDER BY id DESC LIMIT 50
+            """).fetchall()
+        ]
 
     # Динамический контроль размера под жесткий лимит сообщения Telegram (4096 символов)
-    for max_act, max_cl in [(40, 25), (25, 20), (15, 15), (0, 10)]:
+    for max_act, max_cl, max_dyn in [(40, 25, 50), (25, 20, 30), (15, 15, 15), (0, 10, 0)]:
         sub_actions = actions[:max_act]
         sub_positions = open_pos + closed_pos[:max_cl]
+        sub_dynamics = city_dynamics[:max_dyn]
         payload = {
             "version": 1,
             "updated_at": datetime.now().isoformat(),
@@ -104,6 +126,7 @@ def export_state_payload() -> str:
             "subscribers": subscribers,
             "daily_actions": sub_actions,
             "bot_state": bot_state,
+            "city_dynamics": sub_dynamics,
         }
         raw_bytes = json.dumps(payload, default=str, ensure_ascii=False).encode("utf-8")
         compressed = base64.b64encode(zlib.compress(raw_bytes, 9)).decode("ascii")
@@ -216,6 +239,31 @@ def import_state_payload(b64_str: str) -> int:
                     VALUES (?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
                 """, (k, str(v)))
+
+        city_dynamics = payload.get("city_dynamics", [])
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS city_daily_dynamics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_date TEXT NOT NULL,
+                time_str TEXT NOT NULL,
+                icao TEXT NOT NULL,
+                temp_c REAL,
+                rate_str TEXT,
+                rate_val REAL,
+                peak_str TEXT,
+                raw_metar TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        for cd in reversed(city_dynamics):
+            c.execute("""
+                INSERT INTO city_daily_dynamics (
+                    target_date, time_str, icao, temp_c, rate_str, rate_val, peak_str, raw_metar, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                cd.get("target_date"), cd.get("time_str"), cd.get("icao"), cd.get("temp_c"),
+                cd.get("rate_str"), cd.get("rate_val", 0.0), cd.get("peak_str"), cd.get("raw_metar")
+            ))
 
         # Автоматическая гарантия несгораемого банкролла администратора ($55.21 USDC)
         try:

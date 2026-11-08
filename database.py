@@ -107,6 +107,21 @@ def init_db() -> None:
                 PRIMARY KEY(user_id, icao, target_date)
             )
         """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS city_daily_dynamics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_date TEXT NOT NULL,
+                time_str TEXT NOT NULL,
+                icao TEXT NOT NULL,
+                temp_c REAL,
+                rate_str TEXT,
+                rate_val REAL,
+                peak_str TEXT,
+                raw_metar TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
 
         # Автоматическая регистрация администратора из config, если задан
@@ -1017,6 +1032,63 @@ def get_daily_actions(date_str: str = "", user_id: Optional[int] = None) -> List
         return rows
 
 
+def record_city_dynamics(
+    target_date: str,
+    time_str: str,
+    icao: str,
+    temp_c: Optional[float],
+    rate_str: str = "",
+    rate_val: float = 0.0,
+    peak_str: str = "",
+    raw_metar: str = "",
+) -> None:
+    """Записывает срез динамики города в базу данных."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO city_daily_dynamics (
+                target_date, time_str, icao, temp_c, rate_str, rate_val, peak_str, raw_metar, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (target_date, time_str, icao.upper().strip(), temp_c, rate_str, rate_val, peak_str, raw_metar))
+        conn.commit()
+
+
+def get_city_daily_summary(target_date: str, icao: str) -> Dict[str, Any]:
+    """Возвращает суточную динамику города: минимум, максимум, темп и историю точек."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT time_str, temp_c, rate_str, rate_val, peak_str, created_at
+            FROM city_daily_dynamics
+            WHERE target_date = ? AND icao = ? AND temp_c IS NOT NULL
+            ORDER BY id ASC
+        """, (target_date, icao.upper().strip()))
+        rows = [dict(r) for r in cursor.fetchall()]
+
+    if not rows:
+        return {}
+
+    temps = [r["temp_c"] for r in rows if r["temp_c"] is not None]
+    min_temp = min(temps) if temps else None
+    max_temp = max(temps) if temps else None
+    start_temp = temps[0] if temps else None
+    latest_temp = temps[-1] if temps else None
+    delta = round(max_temp - start_temp, 1) if (max_temp is not None and start_temp is not None) else 0.0
+
+    return {
+        "icao": icao.upper().strip(),
+        "date": target_date,
+        "points_count": len(rows),
+        "start_temp": start_temp,
+        "min_temp": min_temp,
+        "max_temp": max_temp,
+        "latest_temp": latest_temp,
+        "delta": delta,
+        "samples": rows[::max(1, len(rows) // 6)],
+    }
+
+
 def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[str, str]:
     """
     Формирует полный структурированный отчет обо всех действиях робота за день (дата по Хабаровску YYYY-MM-DD).
@@ -1086,7 +1158,7 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
         f" Дата (Хабаровск UTC+10): {date_str}",
         f" Торговый режим: {mode_label}",
         f" Торговый сейф/кошелек: {wallet_str}",
-        f" Торговое окно: 10:00 - 24:00 ХБР (Ночью бот спит)",
+        f" Торговый режим работы: Круглосуточный радар 24/7",
         "=" * 80,
         "",
         "📊 1. СВОДНЫЕ РЕЗУЛЬТАТЫ ДНЯ:",
@@ -1111,9 +1183,37 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
         f" • Бумажный PnL: ${p_bal['closed_pnl_usd']:.2f} USDC",
         "",
         "=" * 80,
-        "📋 3. ПОЛНАЯ ХРОНОЛОГИЯ ВСЕХ ДЕЙСТВИЙ ЗА ДЕНЬ (ВРЕМЯ ХАБАРОВСК):",
+        "🌡️ 3. СУТОЧНАЯ ДИНАМИКА ТЕМПЕРАТУР ПО ГОРОДАМ:",
         "=" * 80,
     ]
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT icao FROM city_daily_dynamics WHERE target_date = ? ORDER BY icao", (date_str,))
+        dyn_icaos = [r["icao"] for r in cur.fetchall()]
+
+    if not dyn_icaos:
+        lines.append(" Динамика метеостанций за текущий день в журнале отсутствует.")
+    else:
+        for d_icao in dyn_icaos:
+            summ = get_city_daily_summary(date_str, d_icao)
+            if summ and summ.get("max_temp") is not None:
+                samples = summ.get("samples", [])
+                samples_str = " ➔ ".join(f"{s['time_str']} ({s['temp_c']:.1f}°C)" for s in samples if s.get("temp_c") is not None)
+                lines.append(
+                    f" • {d_icao}: старт {summ['start_temp']:.1f}°C | минимум {summ['min_temp']:.1f}°C | пик дня {summ['max_temp']:.1f}°C "
+                    f"(прогрев: {summ['delta']:+.1f}°C, контрольных точек: {summ['points_count']})"
+                )
+                if samples_str:
+                    lines.append(f"   Траектория: {samples_str}")
+
+    lines.extend([
+        "",
+        "=" * 80,
+        "📋 4. ПОЛНАЯ ХРОНОЛОГИЯ ВСЕХ ДЕЙСТВИЙ ЗА ДЕНЬ (ВРЕМЯ ХАБАРОВСК):",
+        "=" * 80,
+    ])
 
     if not actions:
         lines.append(" За указанный день действий в журнале не зафиксировано.")
