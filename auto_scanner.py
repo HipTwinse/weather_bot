@@ -969,16 +969,14 @@ def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[
         )
     elif favorite_candidate and 20.0 <= favorite_candidate["price_cents"] <= 55.0 and cand_conf >= 70.0:
         fav_title = html.escape(str(favorite_candidate["title"]))
-        local_time_val = local_dt.hour + local_dt.minute / 60.0
-        entry_hint = "Сразу по рынку / в упор к Best Ask" if local_time_val >= 9.5 else "Утренняя лимитка в спред"
-        status_line = (
-            f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b>\n"
-            f"• Рекомендуемый исход: <code>{fav_title}</code> (цена <b>{favorite_candidate['price_cents']:.0f}¢</b> | надежность <b>{cand_conf:.0f}/100</b>)\n"
-            f"• Вход: {entry_hint} (днем просадки не высиживать!)\n"
-            f"• Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи."
-        )
+        status_line = f"🟢 <b>СИГНАЛ:</b> <code>{fav_title}</code> по <b>{favorite_candidate['price_cents']:.0f}¢</b> (надежность: <b>{cand_conf:.0f}/100</b>)"
     else:
-        status_line = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Ориентир корзины ≤ 75¢, одиночный Sniper 25¢–48¢)."
+        status_line = "🟡 <b>ОЖИДАНИЕ:</b> Радар на контроле (старт инсоляции)"
+
+    lines = [
+        f"📍 <b>{city_name}</b> (<code>{local_dt.strftime('%H:%M')} LT</code>)",
+        f"• Факт: <b>{temp_c if temp_c is not None else 'Н/Д'}°C</b> | Ожидаемый пик: <b>{peak_str}</b>",
+    ]
 
     if user_position:
         target_outcomes = user_position.get("outcomes", "Н/Д")
@@ -989,25 +987,16 @@ def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[
         pnl_val = round(((cur_price - entry_price) / entry_price) * 100, 1) if entry_price > 0 else 0.0
         pnl_str = f"{'+' if pnl_val >= 0 else ''}{pnl_val:.0f}%"
         safe_outcomes = html.escape(str(target_outcomes))
-        pos_line = (
-            f"💼 <b>ВАША ПОЗИЦИЯ:</b> <code>{safe_outcomes}</code> "
-            f"(вход: <code>{entry_price:.0f}¢</code> | сейчас в стакане: <code>{cur_price:.0f}¢</code> | PnL: <b>{pnl_str}</b>)\n"
-            f"👉 <b>ВЕРДИКТ:</b> 🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> (Утренний план в силе, ожидание старта инсоляции)"
-        )
-        status_line = f"{pos_line}\n\n{status_line}"
+        lines.append(f"• 💼 <b>Позиция:</b> <code>{safe_outcomes}</code> (вход: <code>{entry_price:.0f}¢</code> | стакан: <code>{cur_price:.0f}¢</code> | PnL: <b>{pnl_str}</b>)")
+        lines.append("• 👉 <b>Вердикт:</b> 🟢 <b>ДЕРЖАТЬ</b> (утренний план в силе)")
+    else:
+        lines.append(f"• {status_line}")
 
-    return (
-        f"📍 <b>{city_name}</b> (Время: <code>{local_dt.strftime('%H:%M')} LT</code>)\n"
-        f"• Факт METAR: <code>{temp_c if temp_c is not None else 'Н/Д'}°C</code>\n"
-        f"• Модели: ECMWF: {ecmwf_s} | GFS: {gfs_s} | ICON: {icon_s} | GEM: {gem_s}\n"
-        f"• Ожидаемый пик: <b>{peak_str}</b> (Опора: {priority_name})\n"
-        f"• Драйвер: <i>{physics_note}</i>\n"
-        f"{status_line}"
-    )
+    return "\n".join(lines)
 
 
 def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[Dict[str, Any]]) -> str:
-    """Формирует блок города для регулярного обновления динамики (:02 и :32)."""
+    """Формирует компактный блок города для регулярного обновления динамики (:07 и :37)."""
     icao = city_data["icao"]
     city_name = city_data["city_name"]
     local_dt = city_data["local_dt"]
@@ -1018,7 +1007,6 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
     rem_hours = city_data["rem_hours_str"]
     peak_str = city_data["peak_str"]
     avg_peak = city_data.get("avg_peak", 20.0)
-    physics_note = city_data["physics_note"]
     raw_metar = city_data["raw_metar"]
     orderbook = city_data["orderbook"]
 
@@ -1027,31 +1015,19 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
     local_time_val = local_hour + local_min / 60.0
     heating_cutoff, season_label = get_seasonal_heating_cutoff(local_dt.month, icao=icao)
 
-    models_line = None
-    if models:
-        ecmwf_s = f"{models.get('ecmwf_hres', 'Н/Д')}°C"
-        gfs_s = f"{models.get('gfs_global', 'Н/Д')}°C"
-        icon_s = f"{models.get('icon_global', 'Н/Д')}°C"
-        gem_s = f"{models.get('gem_global', 'Н/Д')}°C"
-        models_line = f"• Модели: ECMWF: {ecmwf_s} | GFS: {gfs_s} | ICON: {icon_s} | GEM: {gem_s}"
-
     lines = [
-        f"📍 <b>{city_name}</b> (<code>{local_dt.strftime('%H:%M')} LT</code> | Инсоляция: <b>{rem_hours}</b>)",
-        f"• Факт METAR: <code>{temp_c if temp_c is not None else 'Н/Д'}°C</code> (Темп: <b>{rate_str}</b>) | Ожидаемый пик: <b>{peak_str}</b>",
+        f"📍 <b>{city_name}</b> (<code>{local_dt.strftime('%H:%M')} LT</code> | {rem_hours})",
+        f"• Факт: <b>{temp_c if temp_c is not None else 'Н/Д'}°C</b> (темп: <b>{rate_str}</b>) | Ожидаемый пик: <b>{peak_str}</b>",
     ]
-    if models_line:
-        lines.append(models_line)
-    lines.append(f"• Физика: <i>{physics_note}</i>")
 
     # СЦЕНАРИЙ 1: У пользователя есть открытая сделка по этому городу
     if user_position:
         target_outcomes = user_position.get("outcomes", "Н/Д")
         entry_price = float(user_position.get("entry_price") or 0.0)
 
-        # Пытаемся получить актуальную цену из стакана
         cur_price = get_current_outcome_price(orderbook, target_outcomes)
         if cur_price is None:
-            cur_price = entry_price if entry_price > 0 else 35.0  # Разумный fallback
+            cur_price = entry_price if entry_price > 0 else 35.0
 
         if entry_price > 0:
             pnl_val = round(((cur_price - entry_price) / entry_price) * 100, 1)
@@ -1062,75 +1038,38 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
 
         safe_outcomes = html.escape(str(target_outcomes))
         lines.append(
-            f"💼 <b>ВАША ПОЗИЦИЯ:</b> <code>{safe_outcomes}</code> "
-            f"(вход: <code>{entry_price:.0f}¢</code> | сейчас в стакане: <code>{cur_price:.0f}¢</code> | PnL: <b>{pnl_str}</b>)"
+            f"• 💼 <b>Позиция:</b> <code>{safe_outcomes}</code> "
+            f"(вход: <code>{entry_price:.0f}¢</code> | сейчас: <code>{cur_price:.0f}¢</code> | PnL: <b>{pnl_str}</b>)"
         )
 
         target_temp = extract_temp_value(target_outcomes)
         peak_price = max(float(user_position.get("peak_price") or entry_price), cur_price)
         trailing_active = int(user_position.get("trailing_active") or 0)
 
-        # 1. Тейк-Профит и Трейлинг-замок:
+        # Компактные вердикты для сделки
         if cur_price >= 75.0:
-            verdict = (
-                f"🚨 <b>ТЕЙК-ПРОФИТ (ВЫХОДИ ЛИМИТКОЙ)</b> — Цена в стакане достигла {cur_price:.0f}¢ ({pnl_str}). "
-                f"До экспирации не сидеть! Сбрасывай страйк по лимитке в стакан прямо сейчас!"
-            )
+            verdict = f"🚨 <b>ТЕЙК-ПРОФИТ ({cur_price:.0f}¢, {pnl_str})</b> — Выходи лимиткой в стакан!"
         elif trailing_active and (peak_price - cur_price) >= 5.0 and cur_price > entry_price:
-            verdict = (
-                f"🎉 <b>ТРЕЙЛИНГ-ТЕЙК (ЗАМОК ПРИБЫЛИ)</b> — Откат от пика {peak_price:.0f}¢ до {cur_price:.0f}¢ ({pnl_str}). "
-                f"Выход на откате для фиксации прибыли!"
-            )
+            verdict = f"🎉 <b>ТРЕЙЛИНГ-ЗАМОК ({cur_price:.0f}¢, {pnl_str})</b> — Фиксация прибыли на откате!"
         elif trailing_active and cur_price <= entry_price:
-            verdict = (
-                f"🛡️ <b>БЕЗУБЫТОК ПОСЛЕ ТРЕЙЛИНГА</b> — Цена вернулась к входу {entry_price:.0f}¢ (пик был {peak_price:.0f}¢). "
-                f"Сброс позиции в ноль для защиты капитала."
-            )
-        # 2. Триггеры Перегрева и Пробития страйка:
+            verdict = f"🛡️ <b>БЕЗУБЫТОК</b> — Цена вернулась к {entry_price:.0f}¢, сброс в ноль"
         elif target_temp is not None and temp_c is not None and temp_c >= target_temp and local_time_val <= 13.5 and rate_val >= 0.2:
-            verdict = (
-                f"☀️ <b>РАННИЙ ПЕРЕГРЕВ СТРАЙКА ({temp_c:.1f}°C)</b> — Цель достигнута до 13:30 LT при активном солнце (+{rate_val:.1f}°C/ч). "
-                f"Овершут неизбежен, сбрасывай страйк на пике цены!"
-            )
+            verdict = f"☀️ <b>РАННИЙ ПЕРЕГРЕВ ({temp_c:.1f}°C)</b> — Страйк пробивается до 13:30, сброс на пике"
         elif target_temp is not None and temp_c is not None and temp_c > target_temp:
-            verdict = (
-                f"🛑 <b>ЦЕЛЬ ПРОБИТА ВВЕРХ ({temp_c:.1f}°C > {target_temp:.0f}°C)</b> — Страйк математически сгорел, спасение остатка!"
-            )
-        # 3. Триггер Сезонного Тайм-Стопа:
+            verdict = f"🛑 <b>ЦЕЛЬ ПРОБИТА ({temp_c:.1f}°C > {target_temp:.0f}°C)</b> — Страйк сгорел"
         elif (local_time_val >= heating_cutoff or "Окно закрыто" in rem_hours) and (target_temp and temp_c and temp_c < target_temp):
-            cutoff_m = int((heating_cutoff % 1) * 60)
-            verdict = (
-                f"⏱️ <b>ТАЙМ-СТОП ({int(heating_cutoff)}:{cutoff_m:02d} LT)</b> — Сброс в рынок для спасения остаточной стоимости! Окно инсоляции закрыто, цель не пробита."
-            )
-        # 4. Триггер Физического слома:
+            verdict = f"⏱️ <b>ТАЙМ-СТОП</b> — Окно закрыто, цель не взята, сброс в рынок"
         elif is_blocking_rain_and_clouds(raw_metar) and (target_temp is None or temp_c is None or (target_temp - temp_c) >= 1.5):
-            verdict = (
-                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — На станцию вышли обложные осадки / плотный низкий Stratus!"
-            )
+            verdict = f"🛑 <b>ИНВАЛИДАЦИЯ</b> — Осадки / низкий Stratus гасят прогрев"
         elif 12.5 <= local_time_val <= heating_cutoff and (rate_val < 0.4 and has_real_low_cloud(raw_metar) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
-            verdict = (
-                f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — После полудня темп затух под низкой облачностью, отставание от цели {target_temp - temp_c:.1f}°C критично!"
-            )
-        # 5. Триггер Неблагоприятного отбора (Adverse Selection — дневное падение цены на >= 8¢ в стакане):
+            verdict = f"🛑 <b>ИНВАЛИДАЦИЯ</b> — Темп затух под низкой облачностью"
         elif entry_price > 0 and (entry_price - cur_price) >= 8.0 and local_time_val >= 10.5:
             drop_cents = entry_price - cur_price
-            verdict = (
-                f"⚠️ <b>ТРЕВОГА (ПАДЕНИЕ СТАКАНА: -{drop_cents:.0f}¢)</b> — Рынок прайсит свежий радар (adverse selection). Проверь облачность и будь готов к выходу!"
-            )
-        # 6. Утреннее развитие и удержание:
-        elif local_time_val < 12.5:
-            if rate_val < 0.4 and local_hour >= 9:
-                verdict = (
-                    f"🟡 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННЯЯ ПАУЗА)</b> — Прогрев отстает, но солнечный полдень впереди (12:30–14:00 LT). Критической блокировки нет."
-                )
-            elif local_hour < 9:
-                verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННИЙ ПОЛ)</b> — До 09:00 LT идет предрассветное выхолаживание, старт инсоляции впереди."
-            else:
-                verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> — Темп прогрева в норме, инсоляция работает по плану."
+            verdict = f"⚠️ <b>ПАДЕНИЕ СТАКАНА (-{drop_cents:.0f}¢)</b> — Рынок прайсит радар, готовься к выходу"
         else:
-            verdict = "🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> — Темп прогрева в норме, инсоляция работает по плану."
+            verdict = f"🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> — Темп в норме, инсоляция работает по плану"
 
-        lines.append(f"👉 <b>ВЕРДИКТ:</b> {verdict}")
+        lines.append(f"• 👉 <b>Вердикт:</b> {verdict}")
 
     # СЦЕНАРИЙ 2: Позиции нет — оцениваем общий статус рынка
     else:
@@ -1172,62 +1111,43 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
                 local_hour=local_time_val,
             )
 
-        # 1. Раннее утро (LT < 09:00): расчет темпа не переводит в СКИП!
+        # Компактный статус рынка
         if local_hour < 9:
             if has_blocking_weather:
-                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Обложные осадки глушат утреннюю радиацию)"
+                status_desc = "⛔ <b>Вне рынка:</b> Обложные осадки глушат утреннюю радиацию"
             else:
-                status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Ожидание старта инсоляции)"
+                status_desc = "🟡 <b>Ожидание:</b> Предрассветный пол (старт инсоляции впереди)"
 
-        # 2. Окно дневной инсоляции закрыто:
         elif "Окно закрыто" in rem_hours or local_time_val >= heating_cutoff:
-            status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Дневной пик пройден)"
+            status_desc = "⛔ <b>Вне рынка:</b> Дневной пик прогрева пройден"
 
-        # 3. Активный дневной диапазон инсоляции:
         elif 10.5 <= local_time_val < heating_cutoff:
             if has_blocking_weather:
-                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Обложные осадки / плотный Stratus блокируют прогрев)"
+                status_desc = "⛔ <b>Вне рынка:</b> Осадки / плотный Stratus блокируют прогрев"
             elif local_time_val >= 12.5 and rate_val < 0.4 and has_real_low_cloud(raw_metar):
-                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Физический слом: после полудня темп ниже +0.4°C/ч под слоистой облачностью)"
+                status_desc = "⛔ <b>Вне рынка:</b> Темп затух (<+0.4°/ч) под слоистой облачностью"
             elif is_overheated:
-                status_desc = (
-                    "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
-                    "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
-                )
+                status_desc = "⛔ <b>Вне рынка:</b> Рынок перегрет маркетмейкером"
             elif fav_candidate and 20.0 <= fav_candidate["price_cents"] <= 55.0 and cand_conf >= 70.0:
                 cand_title = html.escape(str(fav_candidate['title']))
-                entry_hint = "сразу по рынку" if local_time_val >= 9.5 else "утренняя лимитка в спред"
-                status_desc = (
-                    f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b> "
-                    f"(Вход: <code>{cand_title}</code> {fav_candidate['price_cents']:.0f}¢, надежность {cand_conf:.0f}/100, {entry_hint}. "
-                    f"Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи)"
-                )
+                status_desc = f"🟢 <b>СИГНАЛ:</b> <code>{cand_title}</code> по <b>{fav_candidate['price_cents']:.0f}¢</b> (надежность: <b>{cand_conf:.0f}/100</b>)"
             elif rate_val >= 0.5:
-                status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Импульсный дневной прогрев)"
+                status_desc = "🟡 <b>Потенциал входа:</b> Импульсный дневной прогрев"
             else:
-                status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Мониторинг дневной динамики)"
+                status_desc = "🟡 <b>Мониторинг:</b> Фоновый контроль динамики"
 
-        # 4. Промежуток 09:00 - 10:30 LT (первый разогрев после восхода):
         else:
             if has_blocking_weather:
-                status_desc = "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b> (Осадки блокируют утренний прогрев)"
+                status_desc = "⛔ <b>Вне рынка:</b> Осадки блокируют утренний прогрев"
             elif is_overheated:
-                status_desc = (
-                    "⛔ <b>СТАТУС: ВНЕ РЫНКА (СКИП)</b>\n"
-                    "⚠️ <b>ПОКУПКА ОДИНОЧНОГО СТРАЙКА ЗДЕСЬ = СЛИВ ДЕПОЗИТА.</b> Рынок перегрет маркетмейкером, сиди на заборе."
-                )
+                status_desc = "⛔ <b>Вне рынка:</b> Рынок перегрет маркетмейкером"
             elif fav_candidate and 20.0 <= fav_candidate["price_cents"] <= 55.0 and cand_conf >= 70.0:
                 cand_title = html.escape(str(fav_candidate['title']))
-                entry_hint = "сразу по рынку" if local_time_val >= 9.5 else "утренняя лимитка в спред"
-                status_desc = (
-                    f"🟢 <b>СИГНАЛ: ОДИНОЧНЫЙ ИМПУЛЬС (SNIPER MOMENTUM)</b> "
-                    f"(Вход: <code>{cand_title}</code> {fav_candidate['price_cents']:.0f}¢, надежность {cand_conf:.0f}/100, {entry_hint}. "
-                    f"Цель: продажа токена толпе на дневном разгоне, а не удержание до ночи)"
-                )
+                status_desc = f"🟢 <b>СИГНАЛ:</b> <code>{cand_title}</code> по <b>{fav_candidate['price_cents']:.0f}¢</b> (надежность: <b>{cand_conf:.0f}/100</b>)"
             else:
-                status_desc = "🟡 <b>СТАТУС: ПОТЕНЦИАЛ ВХОДА</b> (Утренний разгон инсоляции)"
+                status_desc = "🟡 <b>Ожидание:</b> Утренний разгон инсоляции"
 
-        lines.append(f"👉 {status_desc}")
+        lines.append(f"• {status_desc}")
 
     return "\n".join(lines)
 
@@ -2558,7 +2478,7 @@ async def send_consolidated_digest(
             f"━━━━━━━━━━━━━━━━━━━━"
         )
         body_blocks = [build_morning_city_block(cm) for cm in cities_metrics if cm]
-        default_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(body_blocks)
+        default_msg = f"{header}\n\n" + "\n──────────────\n".join(body_blocks)
     else:
         header = (
             f"🔄 <b>ОБНОВЛЕНИЕ НА {time_khv_str} ХБР | ДИНАМИКА</b>\n"
@@ -2566,7 +2486,7 @@ async def send_consolidated_digest(
             f"━━━━━━━━━━━━━━━━━━━━"
         )
         default_blocks = [build_dynamic_city_block(cm, None) for cm in cities_metrics if cm]
-        default_msg = f"{header}\n\n" + "\n\n──────────────\n\n".join(default_blocks)
+        default_msg = f"{header}\n\n" + "\n──────────────\n".join(default_blocks)
 
     # Получаем всех подписчиков и открытые позиции
     subscribers = await asyncio.to_thread(get_all_subscribers)
@@ -2649,7 +2569,7 @@ async def send_consolidated_digest(
                         else:
                             user_blocks.append(build_dynamic_city_block(extra_cm, pos))
 
-            custom_msg = f"{header}\n\n{pos_summary_block}" + "\n\n──────────────\n\n".join(user_blocks)
+            custom_msg = f"{header}\n\n{pos_summary_block}" + "\n──────────────\n".join(user_blocks)
             await _safe_send_digest(bot, uid, custom_msg, express_scan_keyboard)
 
 

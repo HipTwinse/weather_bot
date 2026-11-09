@@ -26,14 +26,17 @@ logger = logging.getLogger("ClobTrader")
 POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
 
-# Поддержка выделенного прокси для обхода геоблокировок Polymarket (Ирландия / Нидерланды / Испания)
+# Поддержка выделенного прокси для обхода геоблокировок Polymarket (Испания / Мадрид)
+DEFAULT_CLOB_PROXY = "socks5://ukaylydq:qatbdzk3txyb@64.137.96.74:6641"
 _PROXY_SETUP_DONE = False
 
 
 def ensure_clob_proxy():
     """Гарантирует подключение прокси перед любым обращением к Polymarket CLOB."""
     global _PROXY_SETUP_DONE
-    raw_proxy = os.getenv("POLYMARKET_PROXY", "").strip() or os.getenv("CLOB_PROXY", "").strip()
+    if _PROXY_SETUP_DONE:
+        return
+    raw_proxy = os.getenv("POLYMARKET_PROXY", "").strip() or os.getenv("CLOB_PROXY", "").strip() or DEFAULT_CLOB_PROXY
     if not raw_proxy:
         return
     proxy_url = ""
