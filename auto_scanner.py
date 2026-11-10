@@ -937,7 +937,7 @@ def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[
             if t_num is None:
                 continue
             diff = abs(t_num - target_val)
-            if t_num == target_strike:
+            if t_num == target_strike or abs(t_num - target_strike) <= 0.5:
                 favorite_candidate = item
                 best_diff = 0.0
             elif diff < best_diff and diff <= 0.7 and favorite_candidate is None:
@@ -1089,7 +1089,7 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
                 if t_num is None:
                     continue
                 diff = abs(t_num - target_val)
-                if t_num == target_strike:
+                if t_num == target_strike or abs(t_num - target_strike) <= 0.5:
                     fav_candidate = item
                     best_diff = 0.0
                 elif diff < best_diff and diff <= 0.7 and fav_candidate is None:
@@ -1778,7 +1778,8 @@ async def check_and_execute_auto_buy(
 
             matched_item = None
             for item in orderbook:
-                if item.get("temp") == target_strike:
+                t_val = item.get("temp")
+                if t_val is not None and (t_val == target_strike or abs(t_val - target_strike) <= 0.6):
                     matched_item = item
                     break
 
@@ -2287,7 +2288,10 @@ async def generate_midday_standby_briefing(
         target_strike = get_strike_for_temp(target_val)
         strike_str = f"{target_strike}°C"
 
-        matched_item = next((item for item in orderbook if item.get("temp") == target_strike), None)
+        matched_item = next(
+            (item for item in orderbook if item.get("temp") is not None and (item["temp"] == target_strike or abs(item["temp"] - target_strike) <= 0.6)),
+            None
+        )
         price_cents = float(matched_item.get("price_cents", 0.0)) if matched_item else 0.0
         price_str = f"{price_cents:.0f} центов" if price_cents > 0 else "нет в стакане"
 

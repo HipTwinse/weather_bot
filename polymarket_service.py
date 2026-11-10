@@ -172,9 +172,38 @@ async def find_city_weather_event(icao: str, target_date: Optional[str] = None) 
     return None
 
 
+def parse_us_temp_c(title: str) -> Optional[float]:
+    """
+    Конвертирует страйк в градусах Фаренгейта (°F) американских маркетов Polymarket
+    в эквивалентное значение в градусах Цельсия (°C).
+    Примеры:
+    '62-63°F' -> 16.9°C
+    '51°F or below' -> 10.6°C
+    '70°F or higher' -> 21.1°C
+    """
+    m_range = re.search(r"(\d+)\s*[-–—]\s*(\d+)\s*°?F", title, re.IGNORECASE)
+    if m_range:
+        low_f, high_f = float(m_range.group(1)), float(m_range.group(2))
+        mid_f = (low_f + high_f) / 2.0
+        return round((mid_f - 32.0) * 5.0 / 9.0, 1)
+
+    m_below = re.search(r"(\d+)\s*°?F\s+or\s+below", title, re.IGNORECASE)
+    if m_below:
+        val_f = float(m_below.group(1))
+        return round((val_f - 32.0) * 5.0 / 9.0, 1)
+
+    m_higher = re.search(r"(\d+)\s*°?F\s+or\s+(?:higher|above)", title, re.IGNORECASE)
+    if m_higher:
+        val_f = float(m_higher.group(1))
+        return round((val_f - 32.0) * 5.0 / 9.0, 1)
+
+    return None
+
+
 def parse_markets_orderbook(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Разбирает массив рынков/исходов из события Polymarket в структурированный стакан.
+    Корректно поддерживает европейские рынки (°C) и американские (°F).
     """
     parsed = []
     for item in markets:
@@ -187,7 +216,14 @@ def parse_markets_orderbook(markets: List[Dict[str, Any]]) -> List[Dict[str, Any
         except Exception:
             yes_price = 0.0
 
-        temp_val = extract_temp_value(title)
+        raw_temp_val = extract_temp_value(title)
+        is_fahrenheit = bool(re.search(r"°?F\b", title, re.IGNORECASE))
+        if is_fahrenheit:
+            c_val = parse_us_temp_c(title)
+            temp_val = c_val if c_val is not None else raw_temp_val
+        else:
+            temp_val = raw_temp_val
+
         price_cents = round(yes_price * 100, 1)
 
         clob_ids_raw = item.get("clobTokenIds")
@@ -203,6 +239,8 @@ def parse_markets_orderbook(markets: List[Dict[str, Any]]) -> List[Dict[str, Any
         parsed.append({
             "title": title,
             "temp": temp_val,
+            "raw_temp": raw_temp_val,
+            "is_fahrenheit": is_fahrenheit,
             "yes_price": yes_price,
             "price_cents": price_cents,
             "market_id": item.get("id"),
@@ -217,14 +255,22 @@ def parse_markets_orderbook(markets: List[Dict[str, Any]]) -> List[Dict[str, Any
 def get_current_outcome_price(orderbook: List[Dict[str, Any]], target_outcome_str: str) -> Optional[float]:
     """
     Ищет текущую цену в стакане для заданного пользователем исхода.
+    Сначала ищет по точному совпадению названия, затем по температуре (°C и °F).
     """
+    clean_target = target_outcome_str.strip().lower()
+    for item in orderbook:
+        if item.get("title", "").strip().lower() == clean_target:
+            return item["price_cents"]
+
     target_num = extract_temp_value(target_outcome_str)
     if target_num is None:
         return None
 
     for item in orderbook:
-        if item["temp"] is not None and abs(item["temp"] - target_num) < 0.3:
-            return item["price_cents"]
+        for t_key in ("temp", "raw_temp"):
+            val = item.get(t_key)
+            if val is not None and abs(val - target_num) < 0.6:
+                return item["price_cents"]
 
     return None
 
@@ -232,14 +278,22 @@ def get_current_outcome_price(orderbook: List[Dict[str, Any]], target_outcome_st
 def get_outcome_token_id(orderbook: List[Dict[str, Any]], target_outcome_str: str) -> Optional[str]:
     """
     Ищет token_id в разобранном стакане для заданного исхода.
+    Сначала ищет по точному совпадению названия, затем по температуре (°C и °F).
     """
+    clean_target = target_outcome_str.strip().lower()
+    for item in orderbook:
+        if item.get("title", "").strip().lower() == clean_target:
+            return item.get("token_id")
+
     target_num = extract_temp_value(target_outcome_str)
     if target_num is None:
         return None
 
     for item in orderbook:
-        if item.get("temp") is not None and abs(item["temp"] - target_num) < 0.3:
-            return item.get("token_id")
+        for t_key in ("temp", "raw_temp"):
+            val = item.get(t_key)
+            if val is not None and abs(val - target_num) < 0.6:
+                return item.get("token_id")
 
     return None
 
