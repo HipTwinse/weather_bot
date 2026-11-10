@@ -65,7 +65,7 @@ def init_db() -> None:
                 wallet_address TEXT NOT NULL,
                 proxy_address TEXT DEFAULT '',
                 signature_type INTEGER DEFAULT 1,
-                trading_mode TEXT DEFAULT 'PAPER',
+                trading_mode TEXT DEFAULT 'REAL',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -77,7 +77,7 @@ def init_db() -> None:
         if "signature_type" not in wallet_cols:
             cursor.execute("ALTER TABLE user_wallets ADD COLUMN signature_type INTEGER DEFAULT 1")
         if "trading_mode" not in wallet_cols:
-            cursor.execute("ALTER TABLE user_wallets ADD COLUMN trading_mode TEXT DEFAULT 'PAPER'")
+            cursor.execute("ALTER TABLE user_wallets ADD COLUMN trading_mode TEXT DEFAULT 'REAL'")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bot_state (
@@ -150,6 +150,7 @@ def init_db() -> None:
 
                 wallet_key = getattr(config, "WALLET_PRIVATE_KEY", None)
                 wallet_addr = getattr(config, "WALLET_ADDRESS", None)
+                admin_mode = get_bot_state(f"trading_mode_{admin_id}") or os.getenv("DEFAULT_TRADING_MODE", "REAL").strip().upper()
                 if wallet_key:
                     try:
                         from clob_trader import validate_private_key, resolve_polymarket_proxy
@@ -159,23 +160,24 @@ def init_db() -> None:
                             proxy = resolve_polymarket_proxy(use_addr) or use_addr
                             sig = 1 if (proxy and proxy.lower() != use_addr.lower()) else 0
                             cursor.execute("""
-                                INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, updated_at)
-                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, trading_mode, updated_at)
+                                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                                 ON CONFLICT(user_id) DO UPDATE SET
                                     private_key = excluded.private_key,
                                     wallet_address = excluded.wallet_address,
                                     proxy_address = excluded.proxy_address,
                                     signature_type = excluded.signature_type,
+                                    trading_mode = excluded.trading_mode,
                                     updated_at = CURRENT_TIMESTAMP
-                            """, (int(admin_id), wallet_key, use_addr, proxy, sig))
+                            """, (int(admin_id), wallet_key, use_addr, proxy, sig, admin_mode))
                     except Exception:
                         pass
                 elif wallet_addr:
                     cursor.execute("""
-                        INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, updated_at)
-                        VALUES (?, '', ?, '', 1, CURRENT_TIMESTAMP)
+                        INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, trading_mode, updated_at)
+                        VALUES (?, '', ?, '', 1, ?, CURRENT_TIMESTAMP)
                         ON CONFLICT(user_id) DO NOTHING
-                    """, (int(admin_id), str(wallet_addr).strip()))
+                    """, (int(admin_id), str(wallet_addr).strip(), admin_mode))
                 conn.commit()
         except Exception:
             pass
@@ -485,7 +487,7 @@ def get_trading_mode(user_id: int) -> str:
         except Exception:
             pass
     state = get_bot_state(f"trading_mode_{user_id}")
-    return state.upper() if state else "PAPER"
+    return state.upper() if state else "REAL"
 
 
 def set_trading_mode(user_id: int, mode: str) -> None:

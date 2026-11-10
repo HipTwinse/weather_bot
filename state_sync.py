@@ -185,7 +185,7 @@ def import_state_payload(b64_str: str) -> int:
                         trading_mode = excluded.trading_mode
                 """, (
                     uid, w.get("wallet_address", ""), w.get("proxy_address", ""),
-                    w.get("signature_type", 1), w.get("trading_mode", "PAPER")
+                    w.get("signature_type", 1), w.get("trading_mode", "REAL")
                 ))
 
         for s in subscribers:
