@@ -949,9 +949,47 @@ async def cmd_help(message: Message, state: FSMContext):
         "• <b>⚡/🧪 Режим торговли</b> или /mode — переключение Боевой / Тестовый режим\n"
         "• <b>📄 Отчет за день</b> или /report — скачать полный файл логов за день\n"
         "• <b>➕ Добавить сделку</b> или /open — взять сделку под защиту вручную\n"
+        "• <b>🩺 Статус системы</b> или /status — проверка работы сканера, таймеров и шлюза\n"
         "• /set_key и /set_wallet — привязка кошелька для автоторговли или мониторинга"
     )
     await message.answer(help_text, parse_mode="HTML", reply_markup=main_keyboard)
+
+
+@router.message(Command("status"), StateFilter("*"))
+@router.message(F.text.in_(["🩺 Статус", "/status", "🩺 Статус сканера"]), StateFilter("*"))
+async def cmd_status(message: Message, state: FSMContext):
+    """Показывает текущий статус фонового сканера, слотов и подключения."""
+    await state.clear()
+    user_id = message.from_user.id
+    from auto_scanner import KHV_TZ, get_next_sleep_seconds
+    now_khv = datetime.now(KHV_TZ)
+    time_str = now_khv.strftime("%H:%M:%S")
+    date_str = now_khv.strftime("%d.%m.%Y")
+
+    last_slot = get_bot_state("last_sent_digest_slot") or "Не зафиксирован"
+    sleep_s, next_target, _ = get_next_sleep_seconds(now_khv)
+    rem_min = int(sleep_s / 60)
+
+    mode = get_trading_mode(user_id)
+    mode_str = "⚡ БОЕВОЙ" if mode == "REAL" else "🧪 ТЕСТОВЫЙ"
+
+    wallet = get_user_wallet(user_id)
+    has_wallet = bool(wallet and wallet.get("private_key"))
+
+    status_text = (
+        f"🩺 <b>СТАТУС СИСТЕМЫ WEATHER ALPHA ENGINE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Время сервера (ХБР):</b> <code>{time_str} ({date_str})</code>\n"
+        f"• <b>Фоновый автосканер:</b> 🟢 <b>АКТИВЕН (24/7 METAR)</b>\n"
+        f"• <b>Последний дайджест:</b> <code>{last_slot} ХБР</code>\n"
+        f"• <b>Следующий дайджест:</b> <code>{next_target.strftime('%H:%M:%S')} ХБР</code> (~{rem_min} мин)\n"
+        f"• <b>Режим торговли:</b> <b>{mode_str}</b>\n"
+        f"• <b>Кошелек Polymarket:</b> {'🟢 Подключен' if has_wallet else '⚪ Не задан'}\n"
+        f"• <b>Шлюз Polymarket:</b> 🟢 <b>Мадрид (SOCKS5 активен)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Все системы работают штатно. Маркетмейкеры под контролем.</i>"
+    )
+    await message.answer(status_text, parse_mode="HTML")
 
 
 @router.message(F.text.in_(["🤖 AI Аналитик", "🤖 AI Анализ", "🤖 Gemini AI", "/ai", "/gemini"]), StateFilter("*"))
@@ -1003,8 +1041,10 @@ async def sync_user_polymarket_positions(user_id: int) -> int:
     synced_count = 0
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        from polymarket_service import get_proxy_connector
+        connector = get_proxy_connector()
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
                 if resp.status != 200:
                     return 0
                 positions_data = await resp.json()

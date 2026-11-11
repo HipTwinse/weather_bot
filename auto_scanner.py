@@ -1192,6 +1192,10 @@ async def _safe_send_digest(
         )
         send_success = True
     except Exception as html_err:
+        err_msg = str(html_err).lower()
+        if any(term in err_msg for term in ["chat not found", "bot was blocked", "user is deactivated"]):
+            logger.warning(f"⚠️ Чат {chat_id} недоступен в Telegram ({html_err}), пропускаем отправку.")
+            return False
         logger.warning(
             f"⚠️ Ошибка отправки HTML-дайджеста в чат {chat_id}: {html_err}. "
             "Переключаемся на аварийную Plain-Text отправку..."
@@ -2497,15 +2501,18 @@ async def send_consolidated_digest(
     active_positions = await asyncio.to_thread(get_all_active_positions)
     admin_id = getattr(config, "ADMIN_CHAT_ID", None)
 
-    recipients = set(subscribers)
+    recipients = {uid for uid in subscribers if isinstance(uid, int) and uid > 100000}
     if admin_id:
         try:
-            recipients.add(int(admin_id))
+            adm_int = int(admin_id)
+            if adm_int > 100000:
+                recipients.add(adm_int)
         except (ValueError, TypeError):
             pass
     for p in active_positions:
-        if p.get("user_id"):
-            recipients.add(p["user_id"])
+        p_uid = p.get("user_id")
+        if isinstance(p_uid, int) and p_uid > 100000:
+            recipients.add(p_uid)
 
     briefing_text_1900: Optional[str] = None
     if now_khv.hour == 19 and now_khv.minute in (2, 3):
@@ -2515,66 +2522,73 @@ async def send_consolidated_digest(
             logger.error(f"Не удалось подготовить брифинг ожидания на 19:00 ХБР: {e_br}")
 
     for uid in recipients:
-        user_pos_list = [p for p in active_positions if p.get("user_id") == uid]
-        if not user_pos_list:
-            msg_to_send = briefing_text_1900 if briefing_text_1900 else default_msg
-            await _safe_send_digest(bot, uid, msg_to_send, express_scan_keyboard)
-        else:
-            wallet = await asyncio.to_thread(get_user_wallet, uid)
-            has_pk = bool(wallet and wallet.get("private_key"))
-            auto_icon = "🟢 АКТИВНА" if has_pk else "⚠️ РУЧНОЙ ВЫХОД"
+        try:
+            user_pos_list = [p for p in active_positions if p.get("user_id") == uid]
+            if not user_pos_list:
+                msg_to_send = briefing_text_1900 if briefing_text_1900 else default_msg
+                await _safe_send_digest(bot, uid, msg_to_send, express_scan_keyboard)
+            else:
+                wallet = await asyncio.to_thread(get_user_wallet, uid)
+                has_pk = bool(wallet and wallet.get("private_key"))
+                auto_icon = "🟢 АКТИВНА" if has_pk else "⚠️ РУЧНОЙ ВЫХОД"
 
-            pos_summary_lines = ["💼 <b>ВАШИ ОТКРЫТЫЕ ПОЗИЦИИ НА КОНТРОЛЕ:</b>"]
-            for pos in user_pos_list:
-                p_icao = pos["icao"].strip().upper()
-                p_city = ALL_RADAR_CITIES_MAP.get(p_icao) or TARGET_CITIES.get(p_icao, f"Локация {p_icao}")
-                p_out = pos["outcomes"]
-                p_entry = float(pos.get("entry_price") or 0.0)
+                pos_summary_lines = ["💼 <b>ВАШИ ОТКРЫТЫЕ ПОЗИЦИИ НА КОНТРОЛЕ:</b>"]
+                for pos in user_pos_list:
+                    p_icao = pos["icao"].strip().upper()
+                    p_city = ALL_RADAR_CITIES_MAP.get(p_icao) or TARGET_CITIES.get(p_icao, f"Локация {p_icao}")
+                    p_out = pos["outcomes"]
+                    p_entry = float(pos.get("entry_price") or 0.0)
 
-                cm_match = next((c for c in cities_metrics if c["icao"].strip().upper() == p_icao), None)
-                p_cur = None
-                if cm_match:
-                    p_cur = get_current_outcome_price(cm_match.get("orderbook", []), p_out)
-                if p_cur is None:
-                    p_cur = p_entry if p_entry > 0 else 0.0
+                    cm_match = next((c for c in cities_metrics if c["icao"].strip().upper() == p_icao), None)
+                    p_cur = None
+                    if cm_match:
+                        p_cur = get_current_outcome_price(cm_match.get("orderbook", []), p_out)
+                    if p_cur is None:
+                        p_cur = p_entry if p_entry > 0 else 0.0
 
-                pnl_v = round(((p_cur - p_entry) / p_entry) * 100, 1) if p_entry > 0 else 0.0
-                pnl_s = f"{'+' if pnl_v >= 0 else ''}{pnl_v:.0f}%"
+                    pnl_v = round(((p_cur - p_entry) / p_entry) * 100, 1) if p_entry > 0 else 0.0
+                    pnl_s = f"{'+' if pnl_v >= 0 else ''}{pnl_v:.0f}%"
 
-                pos_summary_lines.append(
-                    f"• <b>{p_city}</b>: <code>{p_out}</code> "
-                    f"(вход: <code>{p_entry:.0f}¢</code> | сейчас: <code>{p_cur:.0f}¢</code> | PnL: <b>{pnl_s}</b>) | "
-                    f"🛡️ Автопродажа: <b>{auto_icon}</b>"
-                )
-            pos_summary_block = "\n".join(pos_summary_lines) + "\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                    pos_summary_lines.append(
+                        f"• <b>{p_city}</b>: <code>{p_out}</code> "
+                        f"(вход: <code>{p_entry:.0f}¢</code> | сейчас: <code>{p_cur:.0f}¢</code> | PnL: <b>{pnl_s}</b>) | "
+                        f"🛡️ Автопродажа: <b>{auto_icon}</b>"
+                    )
+                pos_summary_block = "\n".join(pos_summary_lines) + "\n━━━━━━━━━━━━━━━━━━━━\n\n"
 
-            # Формируем блоки городов с учетом сделок
-            user_blocks = []
-            for cm in cities_metrics:
-                pos = next((p for p in user_pos_list if p["icao"].strip().upper() == cm["icao"].strip().upper()), None)
-                if pos:
-                    await check_and_execute_auto_sell(bot, cm, pos)
-                if is_morning_base:
-                    user_blocks.append(build_morning_city_block(cm, pos))
-                else:
-                    user_blocks.append(build_dynamic_city_block(cm, pos))
+                # Формируем блоки городов с учетом сделок
+                user_blocks = []
+                for cm in cities_metrics:
+                    pos = next((p for p in user_pos_list if p["icao"].strip().upper() == cm["icao"].strip().upper()), None)
+                    if pos:
+                        await check_and_execute_auto_sell(bot, cm, pos)
+                    if is_morning_base:
+                        user_blocks.append(build_morning_city_block(cm, pos))
+                    else:
+                        user_blocks.append(build_dynamic_city_block(cm, pos))
 
-            # Если у пользователя есть позиции в городах вне TARGET_CITIES (например, LFPG, KJFK, RKSI):
-            processed_icaos = {cm["icao"].strip().upper() for cm in cities_metrics}
-            for pos in user_pos_list:
-                p_icao = pos["icao"].strip().upper()
-                if p_icao not in processed_icaos:
-                    processed_icaos.add(p_icao)
-                    extra_cm = await collect_city_metrics(p_icao)
-                    if extra_cm:
-                        await check_and_execute_auto_sell(bot, extra_cm, pos)
-                        if is_morning_base:
-                            user_blocks.append(build_morning_city_block(extra_cm, pos))
-                        else:
-                            user_blocks.append(build_dynamic_city_block(extra_cm, pos))
+                # Если у пользователя есть позиции в городах вне TARGET_CITIES (например, LFPG, KJFK, RKSI):
+                processed_icaos = {cm["icao"].strip().upper() for cm in cities_metrics}
+                for pos in user_pos_list:
+                    p_icao = pos["icao"].strip().upper()
+                    if p_icao not in processed_icaos:
+                        processed_icaos.add(p_icao)
+                        try:
+                            extra_cm = await asyncio.wait_for(collect_city_metrics(p_icao), timeout=15.0)
+                        except Exception as extra_err:
+                            logger.warning(f"Не удалось получить extra_cm для {p_icao}: {extra_err}")
+                            extra_cm = None
+                        if extra_cm:
+                            await check_and_execute_auto_sell(bot, extra_cm, pos)
+                            if is_morning_base:
+                                user_blocks.append(build_morning_city_block(extra_cm, pos))
+                            else:
+                                user_blocks.append(build_dynamic_city_block(extra_cm, pos))
 
-            custom_msg = f"{header}\n\n{pos_summary_block}" + "\n──────────────\n".join(user_blocks)
-            await _safe_send_digest(bot, uid, custom_msg, express_scan_keyboard)
+                custom_msg = f"{header}\n\n{pos_summary_block}" + "\n──────────────\n".join(user_blocks)
+                await _safe_send_digest(bot, uid, custom_msg, express_scan_keyboard)
+        except Exception as u_err:
+            logger.error(f"❌ Ошибка отправки дайджеста пользователю {uid}: {u_err}", exc_info=True)
 
 
 async def run_auto_scanner(bot: Bot) -> None:
@@ -2623,53 +2637,69 @@ async def run_auto_scanner(bot: Bot) -> None:
                 # Последовательный сбор метрик с интервалом 0.25 сек (защита от Open-Meteo 429)
                 cities_metrics = []
                 for icao in TARGET_CITIES.keys():
-                    cm = await collect_city_metrics(icao)
-                    cities_metrics.append(cm)
+                    cm = None
                     try:
-                        from database import record_city_dynamics
-                        cm_dt = cm.get("local_dt")
-                        if cm_dt and cm.get("temp_c") is not None:
-                            record_city_dynamics(
-                                target_date=today_khv_str,
-                                time_str=cm_dt.strftime("%H:%M LT"),
-                                icao=icao,
-                                temp_c=cm.get("temp_c"),
-                                rate_str=cm.get("rate_str", ""),
-                                rate_val=cm.get("rate_val", 0.0),
-                                peak_str=cm.get("peak_str", ""),
-                                raw_metar=cm.get("raw_metar", ""),
-                            )
-                    except Exception as dyn_err:
-                        logger.debug(f"Не удалось записать срез {icao} в city_daily_dynamics: {dyn_err}")
+                        cm = await asyncio.wait_for(collect_city_metrics(icao), timeout=25.0)
+                    except asyncio.TimeoutError:
+                        logger.error(f"⏱️ Таймаут (25 сек) при сборе метрик для {icao}, продолжаем дальше...")
+                    except Exception as city_err:
+                        logger.error(f"⚠️ Ошибка при сборе метрик для {icao}: {city_err}")
 
-                    try:
-                        from gemini_analyzer import daily_tracker
-                        cm_dt = cm.get("local_dt")
-                        if cm_dt:
-                            cm_date = cm_dt.strftime("%Y-%m-%d")
-                            daily_tracker.record(
-                                0,
-                                icao,
-                                cm_date,
-                                {
-                                    "timestamp": time.time(),
-                                    "time_str": cm_dt.strftime("%H:%M LT"),
-                                    "target_date": cm_date,
-                                    "temp_c": cm.get("temp_c"),
-                                    "raw_metar": cm.get("raw_metar", ""),
-                                    "rate_str": cm.get("rate_str", "Н/Д"),
-                                    "rate_val": cm.get("rate_val", 0.0),
-                                    "rem_hours_str": cm.get("rem_hours_str", "Н/Д"),
-                                    "orderbook": cm.get("orderbook", []),
-                                    "user_position": None,
+                    if cm:
+                        cities_metrics.append(cm)
+                        try:
+                            from database import record_city_dynamics
+                            cm_dt = cm.get("local_dt")
+                            if cm_dt and cm.get("temp_c") is not None:
+                                record_city_dynamics(
+                                    target_date=today_khv_str,
+                                    time_str=cm_dt.strftime("%H:%M LT"),
+                                    icao=icao,
+                                    temp_c=cm.get("temp_c"),
+                                    rate_str=cm.get("rate_str", ""),
+                                    rate_val=cm.get("rate_val", 0.0),
+                                    peak_str=cm.get("peak_str", ""),
+                                    raw_metar=cm.get("raw_metar", ""),
+                                )
+                        except Exception as dyn_err:
+                            logger.debug(f"Не удалось записать срез {icao} в city_daily_dynamics: {dyn_err}")
+
+                        try:
+                            from gemini_analyzer import daily_tracker
+                            cm_dt = cm.get("local_dt")
+                            if cm_dt:
+                                cm_date = cm_dt.strftime("%Y-%m-%d")
+                                daily_tracker.record(
+                                    0,
+                                    icao,
+                                    cm_date,
+                                    {
+                                        "timestamp": time.time(),
+                                        "time_str": cm_dt.strftime("%H:%M LT"),
+                                        "target_date": cm_date,
+                                        "temp_c": cm.get("temp_c"),
+                                        "raw_metar": cm.get("raw_metar", ""),
+                                        "rate_str": cm.get("rate_str", "Н/Д"),
+                                        "rate_val": cm.get("rate_val", 0.0),
+                                        "rem_hours_str": cm.get("rem_hours_str", "Н/Д"),
+                                        "orderbook": cm.get("orderbook", []),
+                                        "user_position": None,
                                     },
-                            )
-                    except Exception as trk_err:
-                        logger.debug(f"Не удалось зафиксировать срез в daily_tracker: {trk_err}")
+                                )
+                        except Exception as trk_err:
+                            logger.debug(f"Не удалось зафиксировать срез в daily_tracker: {trk_err}")
                     await asyncio.sleep(0.25)
 
-                # Отправка дайджеста
-                await send_consolidated_digest(bot, cities_metrics, is_morning_base, now_khv)
+                # Отправка дайджеста с защитой по таймауту
+                try:
+                    await asyncio.wait_for(
+                        send_consolidated_digest(bot, cities_metrics, is_morning_base, now_khv),
+                        timeout=60.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"⏱️ Таймаут (60 сек) при отправке дайджеста ({current_checkpoint_slot} ХБР).")
+                except Exception as digest_err:
+                    logger.error(f"⚠️ Ошибка отправки дайджеста ({current_checkpoint_slot} ХБР): {digest_err}", exc_info=True)
 
                 # Защита от повторной отправки в этом же слоте + фиксация в хранилище
                 _LAST_SENT_SLOT = current_checkpoint_slot
@@ -2677,7 +2707,7 @@ async def run_auto_scanner(bot: Bot) -> None:
                     set_bot_state("last_sent_digest_slot", current_checkpoint_slot)
                 except Exception:
                     pass
-                logger.info(f"✅ Дайджест {current_checkpoint_slot} ХБР успешно разослан.")
+                logger.info(f"✅ Цикл дайджеста {current_checkpoint_slot} ХБР завершен.")
 
                 # 3. Если это завершающий вечерний цикл дня (23:37 ХБР) — формируем и рассылаем дневной отчет
                 if now_khv.hour == 23 and now_khv.minute >= 37 and _LAST_AUDIT_REPORT_DATE != today_khv_str:
@@ -2703,5 +2733,7 @@ async def run_auto_scanner(bot: Bot) -> None:
             break
         except Exception as loop_err:
             logger.error(f"⚠️ Сбой в основном цикле автосканера: {loop_err}", exc_info=True)
+            if current_checkpoint_slot:
+                _LAST_SENT_SLOT = current_checkpoint_slot
             await asyncio.sleep(15)
 

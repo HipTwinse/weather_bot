@@ -58,6 +58,7 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="report", description="📄 Скачать аудиторский отчет за день"),
         BotCommand(command="sync", description="🔄 Синхронизировать сделки с Polymarket"),
         BotCommand(command="open", description="➕ Добавить сделку на автопилот"),
+        BotCommand(command="status", description="🩺 Статус системы и сканера 24/7"),
         BotCommand(command="help", description="📖 Справка по всем командам и кнопкам"),
     ]
     try:
@@ -113,6 +114,29 @@ async def render_keepalive_loop() -> None:
         await asyncio.sleep(240)  # 4 минуты
 
 
+async def auto_scanner_supervisor(bot: Bot) -> None:
+    """
+    Неубиваемый супервизор фонового сканера.
+    Непрерывно следит за состоянием задачи автосканера.
+    Если задача завершилась (сбой сети, непредвиденная ошибка, таймаут) —
+    немедленно перезапускает её с логированием причины.
+    """
+    logger.info("🛡️ Супервизор фонового автосканера запущен.")
+    while True:
+        try:
+            task = asyncio.create_task(run_auto_scanner(bot))
+            await task
+        except asyncio.CancelledError:
+            logger.info("🛑 Супервизор автосканера штатно остановлен.")
+            break
+        except Exception as e:
+            logger.error(
+                f"💥 Фоновый автосканер непредвиденно завершил работу: {e}. Перезапуск через 5 сек...",
+                exc_info=True,
+            )
+            await asyncio.sleep(5)
+
+
 async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -> None:
     """Запускает опрос Telegram API и фоновый сканер с защитой от разрыва сети."""
     for attempt in range(1, max_retries + 1):
@@ -134,8 +158,8 @@ async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -
             except Exception as e_safe:
                 logger.warning(f"Ошибка инициализации облачного сейфа: {e_safe}")
 
-            # Запуск автосканера и Keep-Alive пингера Render
-            scanner_task = asyncio.create_task(run_auto_scanner(bot))
+            # Запуск неубиваемого супервизора автосканера и Keep-Alive пингера Render
+            scanner_task = asyncio.create_task(auto_scanner_supervisor(bot))
             keepalive_task = asyncio.create_task(render_keepalive_loop())
 
             logger.info("🚀 УСПЕШНО! Weather Alpha Engine v8.0 запущен и слушает команды.")

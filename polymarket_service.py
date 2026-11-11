@@ -50,6 +50,53 @@ CITY_POLYMARKET_SLUGS = {
 _MARKET_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
 MARKET_CACHE_TTL = 300.0  # 5 минут
 
+# Глобальный пакетный кэш всех активных погодных маркетов: (timestamp, events_list)
+_GLOBAL_WEATHER_EVENTS_CACHE: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
+
+
+def get_proxy_connector() -> Optional[Any]:
+    """Возвращает aiohttp connector с SOCKS5-прокси Мадрида (защита от гео-блокировок)."""
+    import config
+    proxy_url = getattr(config, "PROXY_URL", None) or "socks5://ukaylydq:qatbdzk3txyb@64.137.96.74:6641"
+    try:
+        from aiohttp_socks import ProxyConnector
+        return ProxyConnector.from_url(proxy_url)
+    except Exception as e:
+        logger.debug(f"Не удалось инициализировать ProxyConnector: {e}")
+        return None
+
+
+async def get_all_active_weather_events(max_age_seconds: float = 90.0) -> List[Dict[str, Any]]:
+    """
+    Пакетно загружает все активные погодные контракты Polymarket с глобальным кэшированием (90 сек).
+    Позволяет всем городам находить стаканы котировок мгновенно за 1 общий запрос без 429 лимитов.
+    """
+    global _GLOBAL_WEATHER_EVENTS_CACHE
+    now = datetime.now(timezone.utc).timestamp()
+    ts, cached_list = _GLOBAL_WEATHER_EVENTS_CACHE
+    if cached_list and (now - ts < max_age_seconds):
+        return cached_list
+
+    url = f"{POLYMARKET_GAMMA_API}?tag_slug=weather&limit=100&active=true&closed=false"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    # 1. Сначала пробуем через мадридский прокси, при сетевом сбое — напрямую
+    for use_proxy in (True, False):
+        connector = get_proxy_connector() if use_proxy else None
+        try:
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=6.0)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, list) and len(data) > 0:
+                            _GLOBAL_WEATHER_EVENTS_CACHE = (now, data)
+                            logger.debug(f"Успешно загружено {len(data)} погодных маркетов Polymarket (proxy={use_proxy}).")
+                            return data
+        except Exception as e:
+            logger.debug(f"Опрос каталога Polymarket tag_slug=weather (proxy={use_proxy}) не удался: {e}")
+
+    return cached_list or []
+
 
 def extract_temp_value(text: str) -> Optional[float]:
     """Извлекает числовое значение температуры из названия исхода (например: '23°C', '82F')."""
@@ -66,9 +113,10 @@ async def fetch_event_by_id_or_slug(param_type: str, param_val: str) -> Optional
     """Запрашивает конкретное событие по ID или Slug."""
     url = f"{POLYMARKET_GAMMA_API}?{param_type}={param_val}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    connector = get_proxy_connector()
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
                 if resp.status != 200:
                     return None
@@ -86,8 +134,9 @@ async def fetch_event_by_id_or_slug(param_type: str, param_val: str) -> Optional
 async def find_city_weather_event(icao: str, target_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Ищет активный погодный маркет Polymarket по ICAO коду города и дате:
-    1. Точный опрос по предсказанному слагу (highest-temperature-in-{city}-on-{month}-{day}-{year}).
-    2. Поиск по названию и ключевым словам среди всех актуальных погодных маркетов (tag_slug=weather).
+    1. Проверка локального кэша города.
+    2. Мгновенный поиск в пакетном каталоге tag_slug=weather (без спама сетевыми запросами).
+    3. Точечный опрос по 1-2 сгенерированным слагам только в случае отсутствия в общем списке.
     """
     now = datetime.now(timezone.utc).timestamp()
     cache_key = (icao, target_date or "")
@@ -95,11 +144,6 @@ async def find_city_weather_event(icao: str, target_date: Optional[str] = None) 
         ts, cached_event = _MARKET_CACHE[cache_key]
         if now - ts < MARKET_CACHE_TTL:
             return cached_event
-
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-    # 1. Построение списка возможных слагов на основе даты
-    slug_names = CITY_POLYMARKET_SLUGS.get(icao, [icao.lower()])
 
     dates_to_check: List[datetime] = []
     if target_date:
@@ -112,22 +156,58 @@ async def find_city_weather_event(icao: str, target_date: Optional[str] = None) 
         dt_now = datetime.now(timezone.utc)
         dates_to_check = [dt_now, dt_now + timedelta(days=1)]
 
-    candidate_slugs: List[str] = []
-    for d in dates_to_check:
-        month = d.strftime("%B").lower()
-        day = str(d.day)
-        year = str(d.year)
-        for c in slug_names:
-            candidate_slugs.append(f"highest-temperature-in-{c}-on-{month}-{day}-{year}")
-            candidate_slugs.append(f"highest-temperature-in-{c}-on-{month}-{day}")
-
+    # 1. Поиск в пакетном каталоге актуальных погодных событий (быстро: 0-1 мс)
     try:
-        async with aiohttp.ClientSession() as session:
-            # Стратегия 1: Прямой поиск по сгенерированному слагу (быстро: 50-100 мс)
+        all_weather_events = await get_all_active_weather_events()
+        if all_weather_events:
+            keywords = CITY_SEARCH_KEYWORDS.get(icao, [icao.lower()])
+            
+            # Приоритет 1: Совпадение по городу и дате (строго температурные маркеты)
+            for event in all_weather_events:
+                title = (event.get("title") or "").lower()
+                slug = (event.get("slug") or "").lower()
+                if "temperature" not in title and "temperature" not in slug and "temp" not in slug:
+                    continue
+                full_text = f"{title} {slug}"
+                if any(kw in full_text for kw in keywords):
+                    if any(str(d.day) in title and d.strftime("%B").lower() in title for d in dates_to_check):
+                        if event.get("markets"):
+                            _MARKET_CACHE[cache_key] = (now, event)
+                            return event
+
+            # Приоритет 2: Ближайший температурный контракт города
+            for event in all_weather_events:
+                title = (event.get("title") or "").lower()
+                slug = (event.get("slug") or "").lower()
+                if "temperature" not in title and "temperature" not in slug and "temp" not in slug:
+                    continue
+                full_text = f"{title} {slug}"
+                if any(kw in full_text for kw in keywords):
+                    if event.get("markets"):
+                        _MARKET_CACHE[cache_key] = (now, event)
+                        return event
+    except Exception as e_cat:
+        logger.debug(f"Поиск в каталоге для {icao} завершился с предупреждением: {e_cat}")
+
+    # 2. Точечный fallback по наиболее вероятным слагам (максимум 2 запроса с таймаутом 2.5 сек)
+    slug_names = CITY_POLYMARKET_SLUGS.get(icao, [icao.lower()])
+    primary_date = dates_to_check[0] if dates_to_check else datetime.now(timezone.utc)
+    month = primary_date.strftime("%B").lower()
+    day = str(primary_date.day)
+    year = str(primary_date.year)
+    candidate_slugs = [
+        f"highest-temperature-in-{slug_names[0]}-on-{month}-{day}-{year}",
+        f"highest-temperature-in-{slug_names[0]}-on-{month}-{day}",
+    ]
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    connector = get_proxy_connector()
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
             for slug in candidate_slugs:
                 url = f"{POLYMARKET_GAMMA_API}?slug={slug}"
                 try:
-                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             if isinstance(data, list) and len(data) > 0:
@@ -137,37 +217,8 @@ async def find_city_weather_event(icao: str, target_date: Optional[str] = None) 
                                     return ev
                 except Exception:
                     continue
-
-            # Стратегия 2: Поиск по названию среди актуальных погодных рынков (tag_slug=weather)
-            weather_url = f"{POLYMARKET_GAMMA_API}?tag_slug=weather&limit=150&active=true&closed=false"
-            try:
-                async with session.get(weather_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if isinstance(data, list):
-                            keywords = CITY_SEARCH_KEYWORDS.get(icao, [icao.lower()])
-                            # Приоритет 1: Совпадение по городу и дате
-                            for event in data:
-                                title = (event.get("title") or "").lower()
-                                slug = (event.get("slug") or "").lower()
-                                full_text = f"{title} {slug}"
-
-                                if any(kw in full_text for kw in keywords):
-                                    if any(str(d.day) in title and d.strftime("%B").lower() in title for d in dates_to_check):
-                                        _MARKET_CACHE[cache_key] = (now, event)
-                                        return event
-
-                            # Приоритет 2: Ближайший температурный контракт города
-                            for event in data:
-                                title = (event.get("title") or "").lower()
-                                if any(kw in title for kw in keywords) and "highest temperature" in title:
-                                    _MARKET_CACHE[cache_key] = (now, event)
-                                    return event
-            except Exception as e:
-                logger.warning(f"Ошибка поиска по tag_slug=weather: {e}")
-
     except Exception as e:
-        logger.warning(f"Сбой поиска маркета для {icao}: {e}")
+        logger.debug(f"Точечный опрос слагов Polymarket для {icao}: {e}")
 
     return None
 

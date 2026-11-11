@@ -842,7 +842,7 @@ def get_all_subscribers() -> List[int]:
     """Возвращает список user_id всех активных подписчиков на дайджест."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM bot_subscribers WHERE is_active = 1")
+        cursor.execute("SELECT user_id FROM bot_subscribers WHERE is_active = 1 AND user_id > 100000")
         return [row[0] for row in cursor.fetchall()]
 
 
