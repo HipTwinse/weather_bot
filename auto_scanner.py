@@ -1809,7 +1809,7 @@ async def check_and_execute_auto_buy(
         for st_icao in STANDBY_AUTO_BUY_CITIES.keys():
             if st_icao not in existing_icaos:
                 try:
-                    st_cm = await collect_city_metrics(st_icao)
+                    st_cm = await asyncio.wait_for(collect_city_metrics(st_icao), timeout=15.0)
                     if st_cm and st_cm.get("orderbook"):
                         all_metrics.append(st_cm)
                 except Exception as e_st:
@@ -2067,17 +2067,20 @@ async def check_and_execute_auto_buy(
 
             if (mode == "REAL" and is_top_pick and has_pk) or (mode == "PAPER" and idx == 0 and cand["conf_score"] >= 75.0):
                 try:
-                    is_ai_approved, ai_reason = await validate_candidate_ai(
-                        icao=cand["icao"],
-                        city_name=cand["city_name"],
-                        target_outcomes=cand["outcomes"],
-                        price_cents=cand["price_cents"],
-                        models=cand.get("models", {}),
-                        raw_metar=cand.get("raw_metar", ""),
-                        rate_str=cand.get("rate_str", "Н/Д"),
-                        rem_hours_str=cand.get("rem_hours_str", "Н/Д"),
-                        conf_score=cand["conf_score"],
-                        conf_reasons=cand["conf_reasons"],
+                    is_ai_approved, ai_reason = await asyncio.wait_for(
+                        validate_candidate_ai(
+                            icao=cand["icao"],
+                            city_name=cand["city_name"],
+                            target_outcomes=cand["outcomes"],
+                            price_cents=cand["price_cents"],
+                            models=cand.get("models", {}),
+                            raw_metar=cand.get("raw_metar", ""),
+                            rate_str=cand.get("rate_str", "Н/Д"),
+                            rem_hours_str=cand.get("rem_hours_str", "Н/Д"),
+                            conf_score=cand["conf_score"],
+                            conf_reasons=cand["conf_reasons"],
+                        ),
+                        timeout=15.0,
                     )
                 except Exception as e_ai:
                     logger.warning(f"Ошибка AI-валидации: {e_ai}")
@@ -2605,8 +2608,8 @@ async def send_consolidated_digest(
     cities_metrics: List[Dict[str, Any]],
     is_morning_base: bool,
     now_khv: datetime,
-) -> None:
-    """Собирает все города в единый пост с персональным блоком открытых позиций для каждого трейдера."""
+) -> bool:
+    """Собирает все города в единый пост с персональным блоком открытых позиций для каждого трейдера. Возвращает True, если отправлено хотя бы одному получателю."""
     today_khv_str = now_khv.strftime("%d.%m.%Y")
     time_khv_str = now_khv.strftime("%H:%M")
 
@@ -2678,12 +2681,15 @@ async def send_consolidated_digest(
         except Exception as e_br:
             logger.error(f"Не удалось подготовить брифинг ожидания на 19:00 ХБР: {e_br}")
 
+    sent_count = 0
     for uid in recipients:
         try:
             user_pos_list = [p for p in active_positions if p.get("user_id") == uid]
             if not user_pos_list:
                 msg_to_send = briefing_text_1900 if briefing_text_1900 else default_msg
-                await _safe_send_digest(bot, uid, msg_to_send, express_scan_keyboard)
+                ok = await _safe_send_digest(bot, uid, msg_to_send, express_scan_keyboard)
+                if ok:
+                    sent_count += 1
             else:
                 wallet = await asyncio.to_thread(get_user_wallet, uid)
                 has_pk = bool(wallet and wallet.get("private_key"))
@@ -2743,9 +2749,13 @@ async def send_consolidated_digest(
                                 user_blocks.append(build_dynamic_city_block(extra_cm, pos))
 
                 custom_msg = f"{header}\n\n{pos_summary_block}" + "\n──────────────\n".join(user_blocks)
-                await _safe_send_digest(bot, uid, custom_msg, express_scan_keyboard)
+                ok = await _safe_send_digest(bot, uid, custom_msg, express_scan_keyboard)
+                if ok:
+                    sent_count += 1
         except Exception as u_err:
             logger.error(f"❌ Ошибка отправки дайджеста пользователю {uid}: {u_err}", exc_info=True)
+
+    return sent_count > 0
 
 
 async def run_auto_scanner(bot: Bot) -> None:
@@ -2861,24 +2871,31 @@ async def run_auto_scanner(bot: Bot) -> None:
                             logger.debug(f"Не удалось зафиксировать срез в daily_tracker: {trk_err}")
                     await asyncio.sleep(0.25)
 
-                # Отправка дайджеста с защитой по таймауту
+                # Отправка дайджеста с расширенной защитой по таймауту (120 сек)
+                digest_sent = False
                 try:
-                    await asyncio.wait_for(
+                    digest_sent = await asyncio.wait_for(
                         send_consolidated_digest(bot, cities_metrics, is_morning_base, now_khv),
-                        timeout=60.0,
+                        timeout=120.0,
                     )
                 except asyncio.TimeoutError:
-                    logger.error(f"⏱️ Таймаут (60 сек) при отправке дайджеста ({current_checkpoint_slot} ХБР).")
+                    logger.error(f"⏱️ Таймаут (120 сек) при отправке дайджеста ({current_checkpoint_slot} ХБР).")
                 except Exception as digest_err:
                     logger.error(f"⚠️ Ошибка отправки дайджеста ({current_checkpoint_slot} ХБР): {digest_err}", exc_info=True)
 
-                # Защита от повторной отправки в этом же слоте + фиксация в хранилище
-                _LAST_SENT_SLOT = current_checkpoint_slot
-                try:
-                    set_bot_state("last_sent_digest_slot", current_checkpoint_slot)
-                except Exception:
-                    pass
-                logger.info(f"✅ Цикл дайджеста {current_checkpoint_slot} ХБР завершен.")
+                if digest_sent:
+                    # Защита от повторной отправки в этом же слоте + фиксация в хранилище
+                    _LAST_SENT_SLOT = current_checkpoint_slot
+                    try:
+                        set_bot_state("last_sent_digest_slot", current_checkpoint_slot)
+                    except Exception:
+                        pass
+                    logger.info(f"✅ Цикл дайджеста {current_checkpoint_slot} ХБР успешно доставлен.")
+                else:
+                    logger.warning(
+                        f"⚠️ Дайджест {current_checkpoint_slot} ХБР не был доставлен получателям. "
+                        "Слот не блокируется для повтора в следующем проходе."
+                    )
 
                 # 3. Итоговый отчет по Европейской и Азиатской сессиям (00:00 - 00:07 ХБР)
                 if now_khv.hour == 0 and _LAST_EUROPEAN_REPORT_DATE != today_khv_str:

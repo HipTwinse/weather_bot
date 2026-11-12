@@ -39,6 +39,8 @@ logger = logging.getLogger("WeatherBotMain")
 
 # Память суточных рекордов температурного максимума: ключ 'ICAO_YYYY-MM-DD' -> max_temp_float
 daily_max_records: Dict[str, float] = {}
+_START_TIME = 0.0
+_SUPERVISOR_RESTARTS = 0
 
 
 async def setup_bot_commands(bot: Bot) -> None:
@@ -72,13 +74,47 @@ async def run_health_check_server() -> None:
     """
     Запускает HTTP Health-Check сервер на порту 10000.
     Критически важен для удержания бесплатного контейнера Render от засыпания.
+    Предоставляет расширенный JSON-статус на /status и /diag для удаленного мониторинга.
     """
     async def handle_ping(request: web.Request) -> web.Response:
         return web.Response(text="OK: Weather Alpha Bot v8.0 is running 24/7", status=200)
 
+    async def handle_status(request: web.Request) -> web.Response:
+        import time as _t
+        from database import get_bot_state, get_all_subscribers, get_all_active_positions
+        from auto_scanner import KHV_TZ, get_next_sleep_seconds
+        now_khv = datetime.now(KHV_TZ)
+        sleep_secs, next_target, _ = get_next_sleep_seconds(now_khv)
+        uptime = int(_t.time() - _START_TIME) if _START_TIME > 0 else 0
+        try:
+            subs = len(get_all_subscribers())
+        except Exception:
+            subs = 0
+        try:
+            open_pos = len(get_all_active_positions())
+        except Exception:
+            open_pos = 0
+        diag = {
+            "status": "online",
+            "uptime_seconds": uptime,
+            "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
+            "khv_time": now_khv.strftime("%Y-%m-%d %H:%M:%S"),
+            "last_digest_slot": get_bot_state("last_sent_digest_slot") or "none",
+            "last_eu_report": get_bot_state("last_eu_report_date") or "none",
+            "last_us_report": get_bot_state("last_us_report_date") or "none",
+            "next_digest_target": next_target.strftime("%H:%M:%S"),
+            "sleep_remaining_seconds": round(sleep_secs, 1),
+            "subscribers_count": subs,
+            "open_positions": open_pos,
+            "supervisor_restarts": _SUPERVISOR_RESTARTS,
+        }
+        return web.json_response(diag)
+
     app = web.Application()
-    for path in ["/", "/healthz", "/health", "/ping", "/cron", "/status"]:
+    for path in ["/", "/healthz", "/health", "/ping", "/cron"]:
         app.router.add_route("*", path, handle_ping)
+    app.router.add_get("/status", handle_status)
+    app.router.add_get("/diag", handle_status)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -90,28 +126,29 @@ async def run_health_check_server() -> None:
 
 async def render_keepalive_loop() -> None:
     """
-    Периодически пингует внешний URL сервиса на Render каждые 4 минуты (240 сек).
+    Периодически пингует внешний URL сервиса на Render каждые 3 минуты (180 сек).
     Предотвращает засыпание бесплатного инстанса Render (15-минутный таймаут) даже при одиночном пропуске сети.
+    Автоматически использует гарантированный fallback-URL сервиса.
     """
-    external_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_URL")
-    if not external_url and os.getenv("RENDER_EXTERNAL_HOSTNAME"):
-        external_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
-    if not external_url:
-        logger.info("ℹ️ RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME не задан (Keep-Alive активен только на Render).")
-        return
+    external_url = (
+        os.getenv("RENDER_EXTERNAL_URL")
+        or os.getenv("RENDER_URL")
+        or (f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}" if os.getenv("RENDER_EXTERNAL_HOSTNAME") else None)
+        or "https://weather-bot-3xim.onrender.com"
+    )
 
     health_url = f"{external_url.rstrip('/')}/healthz"
-    logger.info(f"🔄 Запущен Keep-Alive пингер для Render: {health_url} (интервал 4 мин).")
+    logger.info(f"🔄 Запущен Keep-Alive пингер для Render: {health_url} (интервал 3 мин).")
 
-    await asyncio.sleep(60)
+    await asyncio.sleep(30)
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(health_url, timeout=15) as resp:
+                async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     logger.debug(f"🏓 Self-Ping Render Keep-Alive: HTTP {resp.status}")
         except Exception as e:
             logger.warning(f"⚠️ Ошибка Self-Ping Keep-Alive: {e}")
-        await asyncio.sleep(240)  # 4 минуты
+        await asyncio.sleep(180)  # 3 минуты
 
 
 async def auto_scanner_supervisor(bot: Bot) -> None:
@@ -121,6 +158,7 @@ async def auto_scanner_supervisor(bot: Bot) -> None:
     Если задача завершилась (сбой сети, непредвиденная ошибка, таймаут) —
     немедленно перезапускает её с логированием причины.
     """
+    global _SUPERVISOR_RESTARTS
     logger.info("🛡️ Супервизор фонового автосканера запущен.")
     while True:
         try:
@@ -130,6 +168,7 @@ async def auto_scanner_supervisor(bot: Bot) -> None:
             logger.info("🛑 Супервизор автосканера штатно остановлен.")
             break
         except Exception as e:
+            _SUPERVISOR_RESTARTS += 1
             logger.error(
                 f"💥 Фоновый автосканер непредвиденно завершил работу: {e}. Перезапуск через 5 сек...",
                 exc_info=True,
@@ -137,13 +176,15 @@ async def auto_scanner_supervisor(bot: Bot) -> None:
             await asyncio.sleep(5)
 
 
-async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -> None:
-    """Запускает опрос Telegram API и фоновый сканер с защитой от разрыва сети."""
-    for attempt in range(1, max_retries + 1):
+async def start_bot_with_retry(bot: Bot, dp: Dispatcher) -> None:
+    """Запускает опрос Telegram API и фоновый сканер с бесконечной защитой от сбоев сети."""
+    attempt = 0
+    while True:
+        attempt += 1
         scanner_task = None
         keepalive_task = None
         try:
-            logger.info(f"🔄 Подключение к Telegram API ({attempt}/{max_retries})...")
+            logger.info(f"🔄 Подключение к Telegram API (попытка {attempt})...")
             await bot.delete_webhook(drop_pending_updates=True)
             await setup_bot_commands(bot)
 
@@ -164,18 +205,17 @@ async def start_bot_with_retry(bot: Bot, dp: Dispatcher, max_retries: int = 5) -
 
             logger.info("🚀 УСПЕШНО! Weather Alpha Engine v8.0 запущен и слушает команды.")
             await dp.start_polling(bot)
-            break
+            logger.warning("⚠️ dp.start_polling завершился, перезапуск сессии...")
         except Exception as error:
-            logger.warning(f"⚠️ Сбой связи с Telegram API: {error}")
-            if attempt < max_retries:
-                await asyncio.sleep(3.0)
-            else:
-                logger.error("❌ Превышен лимит попыток подключения к Telegram.", exc_info=True)
+            logger.warning(f"⚠️ Сбой связи с Telegram API (попытка {attempt}): {error}")
         finally:
             if scanner_task:
                 scanner_task.cancel()
             if keepalive_task:
                 keepalive_task.cancel()
+
+        backoff = min(30.0, 3.0 * (1.3 ** min(attempt, 8)))
+        await asyncio.sleep(backoff)
 
 
 async def main() -> None:
@@ -185,6 +225,9 @@ async def main() -> None:
         return
 
     # 1. Инициализация базы данных SQLite
+    global _START_TIME
+    import time as _t
+    _START_TIME = _t.time()
     init_db()
     logger.info("🗄️ База данных SQLite (positions.db) инициализирована.")
 
