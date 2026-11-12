@@ -852,7 +852,7 @@ async def process_ai_city_callback(callback: CallbackQuery, state: FSMContext = 
             scenario_code = "G" if prev_snapshot else ("B" if pos_info else "A")
             ai_verdict = await asyncio.wait_for(
                 analyze_city_weather_ai(city_pack, scenario=scenario_code),
-                timeout=28.0
+                timeout=8.0
             )
             if ai_verdict:
                 if prev_snapshot and "ОБНОВЛЕНИЕ АНАЛИЗА" not in ai_verdict and "ОБНОВЛЕНИЕ" not in ai_verdict[:120]:
@@ -1589,7 +1589,7 @@ async def cmd_force_digest(message: Message, state: FSMContext):
 
         from auto_scanner import check_and_execute_auto_buy
         try:
-            await check_and_execute_auto_buy(message.bot, cities_metrics)
+            asyncio.create_task(check_and_execute_auto_buy(message.bot, cities_metrics))
         except Exception as e_buy:
             logger.error(f"Ошибка вызова автопокупки в cmd_force_digest: {e_buy}", exc_info=True)
 

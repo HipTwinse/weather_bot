@@ -503,14 +503,12 @@ def get_gemini_status() -> Dict[str, Any]:
     текущую активную/приоритетную модель и цепочку отказоустойчивости.
     """
     configured = is_gemini_configured()
-    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-3.5-flash-lite")
+    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-2.5-flash")
     cascade = [
-        "gemini-3.5-flash-lite",
-        "gemini-flash-lite-latest",
-        "gemini-3.1-flash-lite",
-        "gemini-3.6-flash",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
         "gemini-flash-latest",
-        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite",
     ]
     models_to_try = list(dict.fromkeys([preferred_model] + cascade))
     active_model = _LAST_SUCCESSFUL_MODEL or preferred_model
@@ -576,14 +574,12 @@ async def ask_gemini_model(
         logger.warning("GEMINI_API_KEY не задан в конфигурации.")
         return None
 
-    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-3.5-flash-lite")
+    preferred_model = getattr(config, "GEMINI_MODEL", "gemini-2.5-flash")
     default_cascade = [
-        "gemini-3.5-flash-lite",
-        "gemini-flash-lite-latest",
-        "gemini-3.1-flash-lite",
-        "gemini-3.6-flash",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
         "gemini-flash-latest",
-        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite",
     ]
     # Убираем дубликаты, сохраняя приоритет
     models_to_try = list(dict.fromkeys([preferred_model] + default_cascade))
@@ -614,7 +610,7 @@ async def ask_gemini_model(
         for model_name in models_to_try:
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
             try:
-                async with session.post(endpoint, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=9.0)) as resp:
+                async with session.post(endpoint, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=4.5)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         candidates = data.get("candidates", [])

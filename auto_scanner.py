@@ -1085,10 +1085,10 @@ def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[
     target_strike = get_strike_for_temp(target_val)
 
     # Проверка стакана на Sniper Momentum и Анти-Скип
-    favorite_candidate = None
+    favorite_candidate = city_data.get("favorite_candidate")
     best_diff = 999.0
     is_overheated = False
-    if orderbook:
+    if orderbook and not favorite_candidate:
         for item in orderbook:
             t_num = item.get("temp")
             if t_num is None:
@@ -1126,7 +1126,9 @@ def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[
         )
     elif favorite_candidate and 20.0 <= favorite_candidate["price_cents"] <= 55.0 and cand_conf >= 70.0:
         fav_title = html.escape(str(favorite_candidate["title"]))
-        status_line = f"🟢 <b>СИГНАЛ:</b> <code>{fav_title}</code> по <b>{favorite_candidate['price_cents']:.0f}¢</b> (надежность: <b>{cand_conf:.0f}/100</b>)"
+        local_hour_val = local_dt.hour + local_dt.minute / 60.0
+        entry_hint = "Сразу по рынку / в упор к Best Ask" if local_hour_val >= 9.5 else "Утренняя лимитка в спред"
+        status_line = f"🟢 <b>СИГНАЛ:</b> <code>{fav_title}</code> по <b>{favorite_candidate['price_cents']:.0f}¢</b> ({entry_hint} | надежность: <b>{cand_conf:.0f}/100</b>)"
     else:
         status_line = "🟡 <b>ОЖИДАНИЕ:</b> Радар на контроле (старт инсоляции)"
 
@@ -1217,12 +1219,14 @@ def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[
         elif (local_time_val >= heating_cutoff or "Окно закрыто" in rem_hours) and (target_temp and temp_c and temp_c < target_temp):
             verdict = f"⏱️ <b>ТАЙМ-СТОП</b> — Окно закрыто, цель не взята, сброс в рынок"
         elif is_blocking_rain_and_clouds(raw_metar) and (target_temp is None or temp_c is None or (target_temp - temp_c) >= 1.5):
-            verdict = f"🛑 <b>ИНВАЛИДАЦИЯ</b> — Осадки / низкий Stratus гасят прогрев"
+            verdict = f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — Осадки / низкий Stratus гасят прогрев"
+        elif local_time_val < 12.5 and rate_val < 0.4 and local_dt.hour >= 9:
+            verdict = f"🟡 <b>ДЕРЖАТЬ ПОЗИЦИЮ (УТРЕННЯЯ ПАУЗА)</b> — Прогрев отстает, но солнечный полдень впереди (12:30–14:00 LT). Критической блокировки нет"
         elif 12.5 <= local_time_val <= heating_cutoff and (rate_val < 0.4 and has_real_low_cloud(raw_metar) and (target_temp and temp_c and (target_temp - temp_c) >= 1.5)):
-            verdict = f"🛑 <b>ИНВАЛИДАЦИЯ</b> — Темп затух под низкой облачностью"
+            verdict = f"🛑 <b>ЭКСТРЕННЫЙ ВЫХОД (ИНВАЛИДАЦИЯ)</b> — Темп затух под низкой облачностью"
         elif entry_price > 0 and (entry_price - cur_price) >= 8.0 and local_time_val >= 10.5:
             drop_cents = entry_price - cur_price
-            verdict = f"⚠️ <b>ПАДЕНИЕ СТАКАНА (-{drop_cents:.0f}¢)</b> — Рынок прайсит радар, готовься к выходу"
+            verdict = f"⚠️ <b>ТРЕВОГА (ПАДЕНИЕ СТАКАНА: -{drop_cents:.0f}¢)</b> — Рынок прайсит радар (adverse selection), готовься к выходу"
         else:
             verdict = f"🟢 <b>ДЕРЖАТЬ ПОЗИЦИЮ</b> — Темп в норме, инсоляция работает по плану"
 
@@ -2630,14 +2634,15 @@ async def send_consolidated_digest(
     except Exception as e_scan_log:
         logger.debug(f"Не удалось зафиксировать SCAN в daily_actions_log: {e_scan_log}")
 
-    # Автоматически синхронизируем сделки с Polymarket перед отправкой дайджеста
-    await sync_all_subscribers_polymarket_positions()
-
-    # Автоматический отбор надежных исходов и совершение покупок (реальных или бумажных)
+    # Экспресс-синхронизация открытых позиций с лимитом 3 сек
     try:
-        await check_and_execute_auto_buy(bot, cities_metrics, include_standby=True)
-    except Exception as e_buy:
-        logger.error(f"Ошибка в блоке автопокупки: {e_buy}", exc_info=True)
+        await asyncio.wait_for(sync_all_subscribers_polymarket_positions(), timeout=3.0)
+    except Exception as e_sync:
+        logger.debug(f"Синхронизация Polymarket будет продолжена в фоне: {e_sync}")
+        asyncio.create_task(sync_all_subscribers_polymarket_positions())
+
+    # Фоновый запуск автопокупки (не блокирует моментальную доставку дайджеста подписчикам)
+    asyncio.create_task(check_and_execute_auto_buy(bot, cities_metrics, include_standby=True))
 
     if is_morning_base:
         header = (
