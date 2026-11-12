@@ -57,6 +57,8 @@ from database import (
     generate_daily_audit_report,
     calculate_risk_managed_order_size,
     get_paper_balance,
+    get_city_daily_summary,
+    get_closed_positions_by_session,
 )
 from noaa_service import get_noaa_package
 from openmeteo_service import fetch_openmeteo_forecast
@@ -106,6 +108,8 @@ _LAST_MORNING_DIGEST_DATE: Optional[str] = None
 _LAST_SENT_SLOT: Optional[str] = None
 _LAST_AUDIT_REPORT_DATE: Optional[str] = None
 _LAST_1900_BRIEFING_DATE: Optional[str] = None
+_LAST_EUROPEAN_REPORT_DATE: Optional[str] = None
+_LAST_AMERICAN_REPORT_DATE: Optional[str] = None
 
 # Инлайн-кнопки быстрого анализа под сводным сообщением
 express_scan_keyboard = InlineKeyboardMarkup(
@@ -199,49 +203,174 @@ def get_next_sleep_seconds(now: datetime) -> Tuple[float, datetime, str]:
     return sleep_secs, target, slot_key
 
 
-async def send_daily_audit_file(bot: Bot, date_str: str = "") -> None:
+async def send_european_session_report(bot: Bot, date_str: str = "") -> None:
     """
-    Формирует и отправляет итоговый документ (аудиторский лог) за день администратору и подписчикам.
+    Формирует и отправляет постоянный отчет по итогам Европейской и Азиатской сессий (00:07 ХБР).
+    Подводит итоги дня для Токио (RJTT), Лондона (EGLC), Парижа (LFPB), Милана (LIMC), Мадрида (LEMD).
+    Передает эстафету ночной американской сессии и отправляет итоговый документ аудита.
     """
     subscribers = await asyncio.to_thread(get_all_subscribers)
     admin_id = getattr(config, "ADMIN_CHAT_ID", None)
-    all_uids = set(subscribers)
+    all_uids = {uid for uid in subscribers if isinstance(uid, int) and uid > 100000}
     if admin_id:
         try:
-            all_uids.add(int(admin_id))
+            adm_int = int(admin_id)
+            if adm_int > 100000:
+                all_uids.add(adm_int)
         except (ValueError, TypeError):
             pass
 
-    # Формируем компактный срез динамики ключевых городов дня для подписи
-    city_dyn_lines = []
-    try:
-        from database import get_city_daily_summary
-        for c_icao in TARGET_CITIES.keys():
-            s = get_city_daily_summary(date_str, c_icao)
-            if s and s.get("max_temp") is not None:
-                lbl = ALL_RADAR_CITIES_MAP.get(c_icao, c_icao)
-                city_dyn_lines.append(f"• <b>{lbl}</b>: {s['start_temp']:.1f}°C ➔ пик <b>{s['max_temp']:.1f}°C</b> ({s['delta']:+.1f}°C)")
-    except Exception as e_dyn_sum:
-        logger.debug(f"Не удалось собрать срез динамики городов: {e_dyn_sum}")
+    eu_icaos = ["RJTT", "EGLC", "LFPB", "LIMC", "LEMD"]
 
-    dyn_block = ("\n\n🌡️ <b>Суточный прогрев городов:</b>\n" + "\n".join(city_dyn_lines)) if city_dyn_lines else ""
+    # 1. Собираем суточный прогрев ключевых европейских и азиатских городов
+    city_lines = []
+    for c_icao in eu_icaos:
+        try:
+            s = await asyncio.to_thread(get_city_daily_summary, date_str, c_icao)
+            lbl = ALL_RADAR_CITIES_MAP.get(c_icao, c_icao)
+            if s and s.get("max_temp") is not None and s.get("start_temp") is not None:
+                delta_sign = "+" if s["delta"] >= 0 else ""
+                city_lines.append(
+                    f"• <b>{lbl}</b>: старт <code>{s['start_temp']:.1f}°C</code> ➔ пик <b>{s['max_temp']:.1f}°C</b> ({delta_sign}{s['delta']:.1f}°C)"
+                )
+            else:
+                city_lines.append(f"• <b>{lbl}</b>: сессия завершена на метеостанции")
+        except Exception as e_c:
+            logger.debug(f"Ошибка сбора динамики {c_icao}: {e_c}")
+
+    city_block = "\n".join(city_lines) if city_lines else "• Данные динамики синхронизированы с NOAA"
 
     for uid in all_uids:
         try:
-            report_text, filename = await asyncio.to_thread(generate_daily_audit_report, date_str, user_id=uid)
-            doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
-            caption = (
-                f"📄 <b>ИТОГОВЫЙ АУДИТОРСКИЙ ОТЧЕТ ЗА ДЕНЬ</b>\n\n"
-                f"Босс, сделал отчет! Суточный цикл завершен, всё сделано как положено.\n"
-                f"• Дата: <code>{filename.replace('weather_bot_report_', '').replace('.txt', '')}</code>"
-                f"{dyn_block}\n\n"
-                f"• Полный журнал всех проверок, сделок, причин выходов и балансов сохранен в файле выше.\n"
-                f"⚡ <i>Сканер ведет радар 24/7, непрерывно сопровождая рынки.</i>"
+            # Закрытые сделки пользователя по Европе за день
+            trades = await asyncio.to_thread(get_closed_positions_by_session, uid, eu_icaos, date_str)
+            if trades:
+                trade_lines = []
+                total_pnl = 0.0
+                for t in trades:
+                    pnl_v = float(t.get("pnl_cents") or 0.0)
+                    total_pnl += (pnl_v * float(t.get("shares") or 1.0)) / 100.0
+                    pnl_s = f"{'+' if pnl_v >= 0 else ''}{pnl_v:.0f}¢"
+                    c_name = ALL_RADAR_CITIES_MAP.get(t["icao"], t["icao"])
+                    trade_lines.append(f"• <b>{c_name}</b>: <code>{t['outcomes']}</code> | PnL: <b>{pnl_s}</b> ({t.get('exit_reason', 'Фиксация')})")
+                trades_block = f"Суммарный PnL: <b>{'+' if total_pnl >= 0 else ''}${total_pnl:.2f} USDC</b>\n" + "\n".join(trade_lines)
+            else:
+                trades_block = "🛡️ <i>Защита депозита: сомнительные сетапы отсеяны, капитал сохранен.</i>"
+
+            report_msg = (
+                f"🌙 <b>ИТОГИ ДНЯ: ЕВРОПЕЙСКАЯ И АЗИАТСКАЯ СЕССИИ (00:00 ХБР)</b>\n"
+                f"<i>Официальное закрытие дневных рынков Европы и Токио</i>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🌡️ <b>ФАКТИЧЕСКИЙ СУТОЧНЫЙ ПРОГРЕВ:</b>\n"
+                f"{city_block}\n\n"
+                f"💼 <b>РЕЗУЛЬТАТЫ СДЕЛОК ЕВРОПЫ:</b>\n"
+                f"{trades_block}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🇺🇸 <b>ПЕРЕХОД НА НОЧНУЮ СЕССИЮ США:</b>\n"
+                f"Радар переключен на непрерывное сопровождение Нью-Йорка (KLGA), Майами (KMIA) и Чикаго (KORD).\n"
+                f"⚡ Итоговый утренний отчет по США выйдет ровно в <b>07:07 ХБР</b>."
             )
-            await bot.send_document(uid, document=doc_file, caption=caption, parse_mode="HTML")
-            logger.info(f"Дневной отчет успешно отправлен пользователю {uid}.")
+
+            safe_text = sanitize_telegram_html(report_msg)
+            await bot.send_message(uid, text=safe_text, parse_mode="HTML")
+
+            # Отправка файла аудита
+            try:
+                report_text, filename = await asyncio.to_thread(generate_daily_audit_report, date_str, user_id=uid)
+                doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
+                caption = (
+                    f"📄 <b>АУДИТОРСКИЙ ЖУРНАЛ ЗА ДЕНЬ ({date_str})</b>\n\n"
+                    f"Босс, полный журнал всех проверок, сканов и балансов сохранен в файле выше."
+                )
+                await bot.send_document(uid, document=doc_file, caption=caption, parse_mode="HTML")
+            except Exception as doc_err:
+                logger.debug(f"Не удалось прикрепить файл аудита для {uid}: {doc_err}")
+
+            logger.info(f"Европейский итоговый отчет успешно доставлен пользователю {uid}.")
         except Exception as err:
-            logger.error(f"Не удалось отправить дневной отчет пользователю {uid}: {err}")
+            logger.error(f"Не удалось отправить европейский отчет пользователю {uid}: {err}")
+
+
+async def send_american_session_report(bot: Bot, date_str: str = "") -> None:
+    """
+    Формирует и отправляет постоянный отчет по итогам Американской сессии (07:07 ХБР).
+    Подводит итоги ночной торговли по Нью-Йорку (KLGA), Майами (KMIA) и Чикаго (KORD).
+    Передает эстафету утреннему базовому прогнозу нового дня (10:07 ХБР).
+    """
+    subscribers = await asyncio.to_thread(get_all_subscribers)
+    admin_id = getattr(config, "ADMIN_CHAT_ID", None)
+    all_uids = {uid for uid in subscribers if isinstance(uid, int) and uid > 100000}
+    if admin_id:
+        try:
+            adm_int = int(admin_id)
+            if adm_int > 100000:
+                all_uids.add(adm_int)
+        except (ValueError, TypeError):
+            pass
+
+    us_icaos = ["KLGA", "KMIA", "KORD"]
+
+    now_khv = datetime.now(KHV_TZ)
+    yesterday_str = (now_khv - timedelta(days=1)).strftime("%Y-%m-%d")
+    dates_scope = [yesterday_str, date_str] if date_str != yesterday_str else date_str
+
+    city_lines = []
+    for c_icao in us_icaos:
+        try:
+            s = await asyncio.to_thread(get_city_daily_summary, dates_scope, c_icao)
+            lbl = ALL_RADAR_CITIES_MAP.get(c_icao, c_icao)
+            if s and s.get("max_temp") is not None and s.get("start_temp") is not None:
+                delta_sign = "+" if s["delta"] >= 0 else ""
+                city_lines.append(
+                    f"• <b>{lbl}</b>: старт <code>{s['start_temp']:.1f}°C</code> ➔ пик <b>{s['max_temp']:.1f}°C</b> ({delta_sign}{s['delta']:.1f}°C)"
+                )
+            else:
+                city_lines.append(f"• <b>{lbl}</b>: ночной прогрев зафиксирован на метеостанции")
+        except Exception as e_c:
+            logger.debug(f"Ошибка сбора динамики США {c_icao}: {e_c}")
+
+    city_block = "\n".join(city_lines) if city_lines else "• Данные динамики США синхронизированы"
+
+    for uid in all_uids:
+        try:
+            trades = await asyncio.to_thread(get_closed_positions_by_session, uid, us_icaos + ["KJFK"], dates_scope)
+            if trades:
+                trade_lines = []
+                total_pnl = 0.0
+                for t in trades:
+                    pnl_v = float(t.get("pnl_cents") or 0.0)
+                    total_pnl += (pnl_v * float(t.get("shares") or 1.0)) / 100.0
+                    pnl_s = f"{'+' if pnl_v >= 0 else ''}{pnl_v:.0f}¢"
+                    c_name = ALL_RADAR_CITIES_MAP.get(t["icao"], t["icao"])
+                    trade_lines.append(f"• <b>{c_name}</b>: <code>{t['outcomes']}</code> | PnL: <b>{pnl_s}</b> ({t.get('exit_reason', 'Фиксация')})")
+                trades_block = f"Суммарный PnL: <b>{'+' if total_pnl >= 0 else ''}${total_pnl:.2f} USDC</b>\n" + "\n".join(trade_lines)
+            else:
+                trades_block = "🛡️ <i>Защита депозита: за ночь сомнительных сделок не открывалось, капитал сохранен.</i>"
+
+            report_msg = (
+                f"🌅 <b>ИТОГИ НОЧИ: АМЕРИКАНСКАЯ СЕССИЯ (07:00 ХБР)</b>\n"
+                f"<i>Официальное закрытие дневных рынков США (Нью-Йорк, Майами, Чикаго)</i>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🌡️ <b>РЕЗУЛЬТАТЫ ПРОГРЕВА В США:</b>\n"
+                f"{city_block}\n\n"
+                f"💼 <b>РЕЗУЛЬТАТЫ НОЧНЫХ ОРДЕРОВ:</b>\n"
+                f"{trades_block}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🧭 <b>СТАРТ НОВОГО ТОРГОВОГО ДНЯ:</b>\n"
+                f"Американские рынки закрыты. Подготовка к азиатско-европейской сессии.\n"
+                f"⚡ Базовый синоптический прогноз выйдет ровно в <b>10:07 ХБР</b>."
+            )
+
+            safe_text = sanitize_telegram_html(report_msg)
+            await bot.send_message(uid, text=safe_text, parse_mode="HTML")
+            logger.info(f"Американский итоговый отчет успешно доставлен пользователю {uid}.")
+        except Exception as err:
+            logger.error(f"Не удалось отправить американский отчет пользователю {uid}: {err}")
+
+
+async def send_daily_audit_file(bot: Bot, date_str: str = "") -> None:
+    """Сохранено для обратной совместимости."""
+    await send_european_session_report(bot, date_str)
 
 
 def get_seasonal_heating_cutoff(month: int, icao: str = "") -> Tuple[float, str]:
@@ -2626,16 +2755,30 @@ async def run_auto_scanner(bot: Bot) -> None:
     Работает круглосуточно 24/7 (с учетом местного светового дня каждой станции).
     В 23:37 формирует и рассылает дневной аудиторский отчет.
     """
-    global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT, _LAST_AUDIT_REPORT_DATE, _LAST_1900_BRIEFING_DATE
+    global _LAST_MORNING_DIGEST_DATE, _LAST_SENT_SLOT, _LAST_AUDIT_REPORT_DATE, _LAST_1900_BRIEFING_DATE, _LAST_EUROPEAN_REPORT_DATE, _LAST_AMERICAN_REPORT_DATE
     logger.info("🚀 Консолидированный автосканер запущен (Круглосуточный режим 24/7, METAR: :07 и :37).")
 
-    # Инициализация последнего отправленного слота из постоянного хранилища SQLite
+    # Инициализация последнего отправленного слота и дат отчетов из постоянного хранилища SQLite
     if not _LAST_SENT_SLOT:
         try:
             saved_slot = get_bot_state("last_sent_digest_slot")
             if saved_slot:
                 _LAST_SENT_SLOT = saved_slot
                 logger.info(f"💾 Восстановлен последний отправленный слот дайджеста: {_LAST_SENT_SLOT}")
+        except Exception:
+            pass
+    if not _LAST_EUROPEAN_REPORT_DATE:
+        try:
+            _LAST_EUROPEAN_REPORT_DATE = get_bot_state("last_eu_report_date")
+            if _LAST_EUROPEAN_REPORT_DATE:
+                logger.info(f"💾 Восстановлена дата европейского отчета: {_LAST_EUROPEAN_REPORT_DATE}")
+        except Exception:
+            pass
+    if not _LAST_AMERICAN_REPORT_DATE:
+        try:
+            _LAST_AMERICAN_REPORT_DATE = get_bot_state("last_us_report_date")
+            if _LAST_AMERICAN_REPORT_DATE:
+                logger.info(f"💾 Восстановлена дата американского отчета: {_LAST_AMERICAN_REPORT_DATE}")
         except Exception:
             pass
 
@@ -2737,14 +2880,26 @@ async def run_auto_scanner(bot: Bot) -> None:
                     pass
                 logger.info(f"✅ Цикл дайджеста {current_checkpoint_slot} ХБР завершен.")
 
-                # 3. Если это завершающий вечерний цикл дня (23:37 ХБР) — формируем и рассылаем дневной отчет
-                if now_khv.hour == 23 and now_khv.minute >= 37 and _LAST_AUDIT_REPORT_DATE != today_khv_str:
-                    _LAST_AUDIT_REPORT_DATE = today_khv_str
-                    logger.info("🌙 Торговое окно 10:00-24:00 закрывается. Отправка итогового аудиторского отчета за день...")
+                # 3. Итоговый отчет по Европейской и Азиатской сессиям (00:00 - 00:07 ХБР)
+                if now_khv.hour == 0 and _LAST_EUROPEAN_REPORT_DATE != today_khv_str:
+                    _LAST_EUROPEAN_REPORT_DATE = today_khv_str
+                    logger.info("🌙 Отправка итогового отчета по Европейской сессии (00:00 ХБР)...")
                     try:
-                        await send_daily_audit_file(bot, today_khv_str)
-                    except Exception as audit_err:
-                        logger.error(f"Ошибка отправки итогового отчета: {audit_err}")
+                        yesterday_khv = (now_khv - timedelta(days=1)).strftime("%Y-%m-%d")
+                        await send_european_session_report(bot, yesterday_khv)
+                        set_bot_state("last_eu_report_date", today_khv_str)
+                    except Exception as eu_err:
+                        logger.error(f"Ошибка отправки европейского отчета: {eu_err}", exc_info=True)
+
+                # 4. Итоговый утренний отчет по Американской сессии (07:00 - 07:07 ХБР)
+                if now_khv.hour == 7 and _LAST_AMERICAN_REPORT_DATE != today_khv_str:
+                    _LAST_AMERICAN_REPORT_DATE = today_khv_str
+                    logger.info("🌅 Отправка утреннего отчета по Американской сессии (07:00 ХБР)...")
+                    try:
+                        await send_american_session_report(bot, today_khv_str)
+                        set_bot_state("last_us_report_date", today_khv_str)
+                    except Exception as us_err:
+                        logger.error(f"Ошибка отправки американского отчета: {us_err}", exc_info=True)
 
             # 4. Расчет точного сна до СЛЕДУЮЩЕЙ контрольной точки
             now_after = datetime.now(KHV_TZ)

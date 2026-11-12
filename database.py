@@ -1055,12 +1055,22 @@ def record_city_dynamics(
         conn.commit()
 
 
-def get_city_daily_summary(target_date: str, icao: str) -> Dict[str, Any]:
+def get_city_daily_summary(target_date: Any, icao: str) -> Dict[str, Any]:
     """Возвращает суточную динамику города: минимум, максимум, темп и историю точек."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("""
+        if isinstance(target_date, (list, tuple, set)):
+            placeholders = ",".join("?" for _ in target_date)
+            params = list(target_date) + [icao.upper().strip()]
+            cursor.execute(f"""
+                SELECT time_str, temp_c, rate_str, rate_val, peak_str, created_at
+                FROM city_daily_dynamics
+                WHERE target_date IN ({placeholders}) AND icao = ? AND temp_c IS NOT NULL
+                ORDER BY id ASC
+            """, params)
+        else:
+            cursor.execute("""
             SELECT time_str, temp_c, rate_str, rate_val, peak_str, created_at
             FROM city_daily_dynamics
             WHERE target_date = ? AND icao = ? AND temp_c IS NOT NULL
@@ -1089,6 +1099,35 @@ def get_city_daily_summary(target_date: str, icao: str) -> Dict[str, Any]:
         "delta": delta,
         "samples": rows[::max(1, len(rows) // 6)],
     }
+
+
+def get_closed_positions_by_session(user_id: int, icaos: List[str], dates: Any) -> List[Dict[str, Any]]:
+    """Возвращает закрытые сделки по выбранным городам и датам сессии."""
+    dates_list = list(dates) if isinstance(dates, (list, tuple, set)) else [dates]
+    if not icaos or not dates_list:
+        return []
+    placeholders_icao = ",".join("?" for _ in icaos)
+    placeholders_date = ",".join("?" for _ in dates_list)
+    params = [user_id, user_id] + [c.upper().strip() for c in icaos] + dates_list + dates_list
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT id, icao, outcomes, target_date, entry_price, exit_price, exit_reason,
+                   pnl_cents, pnl_percent, shares, COALESCE(is_paper, 0) AS is_paper, status,
+                   closed_at, created_at,
+                   datetime(COALESCE(closed_at, created_at), '+10 hours') AS local_khv_time
+            FROM user_positions
+            WHERE (user_id = ? OR ? = 0)
+              AND icao IN ({placeholders_icao})
+              AND status = 'CLOSED'
+              AND (
+                  date(datetime(COALESCE(closed_at, created_at), '+10 hours')) IN ({placeholders_date})
+                  OR target_date IN ({placeholders_date})
+              )
+            ORDER BY COALESCE(closed_at, created_at) DESC, id DESC
+        """, params)
+        return [dict(r) for r in cur.fetchall()]
 
 
 def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[str, str]:
