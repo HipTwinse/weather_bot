@@ -110,6 +110,7 @@ ALL_RADAR_CITIES = {
     "LIMC": "🇮🇹 Милан (LIMC)",
     "LEMD": "🇪🇸 Мадрид (LEMD)",
     "EDDM": "🇩🇪 Мюнхен (EDDM)",
+    "KLGA": "🇺🇸 Нью-Йорк (KLGA)",
     "KJFK": "🇺🇸 Нью-Йорк (KJFK)",
     "KMIA": "🇺🇸 Майами (KMIA)",
     "KORD": "🇺🇸 Чикаго (KORD)",
@@ -263,6 +264,7 @@ CITY_KEYWORD_MAP = {
     "EDDM": ["munich", "мюнхен", "eddm"],
     "LEMD": ["madrid", "мадрид", "lemd", "barajas"],
     "LIMC": ["milan", "милан", "limc", "malpensa"],
+    "KLGA": ["new york", "нью-йорк", "lga", "laguardia", "nyc", "klga"],
     "KJFK": ["new york", "нью-йорк", "jfk", "kjfk", "nyc"],
     "KMIA": ["miami", "майами", "kmia", "mia"],
     "KORD": ["chicago", "чикаго", "kord", "ord"],
@@ -1983,7 +1985,9 @@ async def cmd_quick_open_position(message: Message, state: FSMContext):
         "милан": "LIMC", "milan": "LIMC", "limc": "LIMC",
         "мадрид": "LEMD", "madrid": "LEMD", "lemd": "LEMD",
         "мюнхен": "EDDM", "munich": "EDDM", "eddm": "EDDM",
-        "нью-йорк": "KJFK", "new-york": "KJFK", "kjfk": "KJFK",
+        "нью-йорк": "KLGA", "new-york": "KLGA", "nyc": "KLGA", "lga": "KLGA", "klga": "KLGA", "kjfk": "KJFK",
+        "майами": "KMIA", "miami": "KMIA", "kmia": "KMIA",
+        "чикаго": "KORD", "chicago": "KORD", "kord": "KORD",
     }
     icao = city_map.get(city_raw, "EGLC")
     strike_val = extract_temp_value(args[1])

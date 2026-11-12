@@ -89,7 +89,7 @@ TARGET_CITIES = {
     "LIMC": "🇮🇹 Милан (LIMC)",
     "LEMD": "🇪🇸 Мадрид (LEMD)",
     "RJTT": "🇯🇵 Токио (RJTT)",
-    "KJFK": "🇺🇸 Нью-Йорк (KJFK)",
+    "KLGA": "🇺🇸 Нью-Йорк (KLGA)",
     "KMIA": "🇺🇸 Майами (KMIA)",
     "KORD": "🇺🇸 Чикаго (KORD)",
 }
@@ -120,7 +120,7 @@ express_scan_keyboard = InlineKeyboardMarkup(
         ],
         [
             InlineKeyboardButton(text="🇯🇵 Токио RJTT", callback_data="express_scan:RJTT"),
-            InlineKeyboardButton(text="🇺🇸 Нью-Йорк KJFK", callback_data="express_scan:KJFK"),
+            InlineKeyboardButton(text="🇺🇸 Нью-Йорк KLGA", callback_data="express_scan:KLGA"),
         ],
         [
             InlineKeyboardButton(text="🇺🇸 Майами KMIA", callback_data="express_scan:KMIA"),
@@ -312,6 +312,33 @@ def get_seasonal_heating_cutoff(month: int, icao: str = "") -> Tuple[float, str]
             return 15.0, f"Осень/Весна ({city_tag})"
         else:
             return 16.0, f"Лето ({city_tag})"
+
+    elif icao_upper in ("KMIA", "MIA"):
+        # Майами: субтропическая инсоляция, прогрев до 15:00-15:30 зимой и 16:30 летом
+        if month in (12, 1, 2):
+            return 15.0, "Зима (Майами)"
+        elif month in (10, 11, 3):
+            return 15.5, "Осень/Весна (Майами)"
+        else:
+            return 16.5, "Лето (Майами)"
+
+    elif icao_upper in ("KORD", "ORD"):
+        # Чикаго: континентальный режим Великих озер, пик 14:30 зимой, 16:00 летом
+        if month in (12, 1, 2):
+            return 14.5, "Зима (Чикаго)"
+        elif month in (10, 11, 3):
+            return 15.0, "Осень/Весна (Чикаго)"
+        else:
+            return 16.0, "Лето (Чикаго)"
+
+    elif icao_upper in ("KLGA", "KJFK", "NYC", "LGA", "JFK"):
+        # Нью-Йорк: умеренно-морской прогрев, пик 14:30 зимой, 16:00 летом
+        if month in (12, 1, 2):
+            return 14.5, "Зима (Нью-Йорк)"
+        elif month in (10, 11, 3):
+            return 15.0, "Осень/Весна (Нью-Йорк)"
+        else:
+            return 16.0, "Лето (Нью-Йорк)"
 
     # Базовый дефолтный профиль (Париж и общие европейские координаты)
     if month in (12, 1, 2):
@@ -578,6 +605,7 @@ ALL_RADAR_CITIES_MAP = {
     "LIMC": "🇮🇹 Милан (LIMC)",
     "LEMD": "🇪🇸 Мадрид (LEMD)",
     "EDDM": "🇩🇪 Мюнхен (EDDM)",
+    "KLGA": "🇺🇸 Нью-Йорк (KLGA)",
     "KJFK": "🇺🇸 Нью-Йорк (KJFK)",
     "KMIA": "🇺🇸 Майами (KMIA)",
     "KORD": "🇺🇸 Чикаго (KORD)",
@@ -1720,7 +1748,7 @@ async def check_and_execute_auto_buy(
                 )
                 continue
 
-            if local_time_val >= (heating_cutoff - 1.0) or "Окно закрыто" in rem_hours_str:
+            if local_time_val >= (heating_cutoff - 0.5) or "Окно закрыто" in rem_hours_str:
                 await asyncio.to_thread(
                     record_daily_action,
                     uid, "SKIP", icao, "", 0.0,
@@ -1783,7 +1811,7 @@ async def check_and_execute_auto_buy(
             matched_item = None
             for item in orderbook:
                 t_val = item.get("temp")
-                if t_val is not None and (t_val == target_strike or abs(t_val - target_strike) <= 0.6):
+                if t_val is not None and (t_val == target_strike or abs(t_val - target_strike) <= 0.8):
                     matched_item = item
                     break
 

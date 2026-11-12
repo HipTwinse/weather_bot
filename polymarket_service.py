@@ -22,7 +22,8 @@ CITY_SEARCH_KEYWORDS = {
     "LIMC": ["milan", "милан", "limc", "malpensa"],
     "LEMD": ["madrid", "мадрид", "lemd", "barajas"],
     "EDDM": ["munich", "мюнхен", "eddm"],
-    "KJFK": ["new york", "нью-йорк", "jfk", "kjfk", "nyc"],
+    "KJFK": ["new york", "нью-йорк", "jfk", "lga", "laguardia", "nyc", "kjfk"],
+    "KLGA": ["new york", "нью-йорк", "jfk", "lga", "laguardia", "nyc", "klga"],
     "KMIA": ["miami", "майами", "kmia", "mia"],
     "KORD": ["chicago", "чикаго", "kord", "ord"],
     "RKSI": ["seoul", "сеул", "incheon", "rksi"],
@@ -38,6 +39,7 @@ CITY_POLYMARKET_SLUGS = {
     "LEMD": ["madrid"],
     "EDDM": ["munich"],
     "KJFK": ["nyc", "new-york"],
+    "KLGA": ["nyc", "new-york"],
     "KMIA": ["miami"],
     "KORD": ["chicago"],
     "RKSI": ["seoul", "incheon"],
@@ -68,7 +70,8 @@ def get_proxy_connector() -> Optional[Any]:
 
 async def get_all_active_weather_events(max_age_seconds: float = 90.0) -> List[Dict[str, Any]]:
     """
-    Пакетно загружает все активные погодные контракты Polymarket с глобальным кэшированием (90 сек).
+    Пакетно загружает все активные погодные контракты Polymarket со всеми страницами (пагинация)
+    и глобальным кэшированием (90 сек).
     Позволяет всем городам находить стаканы котировок мгновенно за 1 общий запрос без 429 лимитов.
     """
     global _GLOBAL_WEATHER_EVENTS_CACHE
@@ -77,21 +80,34 @@ async def get_all_active_weather_events(max_age_seconds: float = 90.0) -> List[D
     if cached_list and (now - ts < max_age_seconds):
         return cached_list
 
-    url = f"{POLYMARKET_GAMMA_API}?tag_slug=weather&limit=100&active=true&closed=false"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
     # 1. Сначала пробуем через мадридский прокси, при сетевом сбое — напрямую
     for use_proxy in (True, False):
         connector = get_proxy_connector() if use_proxy else None
         try:
+            all_events: List[Dict[str, Any]] = []
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=6.0)) as resp:
-                    if resp.status == 200:
+                offset = 0
+                while True:
+                    url = f"{POLYMARKET_GAMMA_API}?tag_slug=weather&limit=100&active=true&closed=false&offset={offset}"
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                        if resp.status != 200:
+                            break
                         data = await resp.json()
-                        if isinstance(data, list) and len(data) > 0:
-                            _GLOBAL_WEATHER_EVENTS_CACHE = (now, data)
-                            logger.debug(f"Успешно загружено {len(data)} погодных маркетов Polymarket (proxy={use_proxy}).")
-                            return data
+                        if not data or not isinstance(data, list):
+                            break
+                        all_events.extend(data)
+                        if len(data) < 100:
+                            break
+                        offset += 100
+                        if offset >= 500:  # Защитный лимит
+                            break
+
+            if all_events:
+                _GLOBAL_WEATHER_EVENTS_CACHE = (now, all_events)
+                logger.debug(f"Успешно загружено {len(all_events)} погодных маркетов Polymarket (proxy={use_proxy}).")
+                return all_events
         except Exception as e:
             logger.debug(f"Опрос каталога Polymarket tag_slug=weather (proxy={use_proxy}) не удался: {e}")
 
@@ -135,8 +151,9 @@ async def find_city_weather_event(icao: str, target_date: Optional[str] = None) 
     """
     Ищет активный погодный маркет Polymarket по ICAO коду города и дате:
     1. Проверка локального кэша города.
-    2. Мгновенный поиск в пакетном каталоге tag_slug=weather (без спама сетевыми запросами).
-    3. Точечный опрос по 1-2 сгенерированным слагам только в случае отсутствия в общем списке.
+    2. Мгновенный поиск в полном пакетном каталоге tag_slug=weather (со всеми страницами).
+       Строго отбирает дневные максимумы (Highest temperature) и игнорирует ночные минимумы (Lowest).
+    3. Точечный fallback по наиболее вероятным слагам при отсутствии в каталоге.
     """
     now = datetime.now(timezone.utc).timestamp()
     cache_key = (icao, target_date or "")
@@ -161,26 +178,43 @@ async def find_city_weather_event(icao: str, target_date: Optional[str] = None) 
         all_weather_events = await get_all_active_weather_events()
         if all_weather_events:
             keywords = CITY_SEARCH_KEYWORDS.get(icao, [icao.lower()])
-            
-            # Приоритет 1: Совпадение по городу и дате (строго температурные маркеты)
-            for event in all_weather_events:
-                title = (event.get("title") or "").lower()
-                slug = (event.get("slug") or "").lower()
-                if "temperature" not in title and "temperature" not in slug and "temp" not in slug:
+            if icao in ("KLGA", "KJFK"):
+                keywords = list(set(keywords + ["nyc", "new york", "нью-йорк", "laguardia"]))
+
+            # Фильтруем события: строго дневные пики T_max (Highest temperature), игнорируем ночные минимумы (Lowest)
+            highest_events = []
+            for ev in all_weather_events:
+                t = (ev.get("title") or "").lower()
+                s = (ev.get("slug") or "").lower()
+                if "lowest" in t or "lowest" in s:
                     continue
-                full_text = f"{title} {slug}"
-                if any(kw in full_text for kw in keywords):
-                    if any(str(d.day) in title and d.strftime("%B").lower() in title for d in dates_to_check):
-                        if event.get("markets"):
+                if "highest" in t or "highest" in s or "high" in s:
+                    highest_events.append(ev)
+
+            # Приоритет 1: Строгое совпадение по городу и целевой дате
+            for target_dt in dates_to_check:
+                t_day = str(target_dt.day)
+                t_month = target_dt.strftime("%B").lower()
+                t_month_short = target_dt.strftime("%b").lower()
+                date_slug_pat = f"on-{t_month}-{t_day}"
+
+                for event in highest_events:
+                    title = (event.get("title") or "").lower()
+                    slug = (event.get("slug") or "").lower()
+                    full_text = f"{title} {slug}"
+                    if any(kw in full_text for kw in keywords):
+                        is_date_match = (
+                            date_slug_pat in slug
+                            or (t_day in title and (t_month in title or t_month_short in title))
+                        )
+                        if is_date_match and event.get("markets"):
                             _MARKET_CACHE[cache_key] = (now, event)
                             return event
 
-            # Приоритет 2: Ближайший температурный контракт города
-            for event in all_weather_events:
+            # Приоритет 2: Ближайший контракт дневного максимума для этого города
+            for event in highest_events:
                 title = (event.get("title") or "").lower()
                 slug = (event.get("slug") or "").lower()
-                if "temperature" not in title and "temperature" not in slug and "temp" not in slug:
-                    continue
                 full_text = f"{title} {slug}"
                 if any(kw in full_text for kw in keywords):
                     if event.get("markets"):
