@@ -11,9 +11,11 @@
 """
 
 import asyncio
+from datetime import datetime
 import logging
 import os
 import sys
+import time
 from typing import Dict
 
 import aiohttp
@@ -80,35 +82,37 @@ async def run_health_check_server() -> None:
         return web.Response(text="OK: Weather Alpha Bot v8.0 is running 24/7", status=200)
 
     async def handle_status(request: web.Request) -> web.Response:
-        import time as _t
-        from database import get_bot_state, get_all_subscribers, get_all_active_positions
-        from auto_scanner import KHV_TZ, get_next_sleep_seconds
-        now_khv = datetime.now(KHV_TZ)
-        sleep_secs, next_target, _ = get_next_sleep_seconds(now_khv)
-        uptime = int(_t.time() - _START_TIME) if _START_TIME > 0 else 0
         try:
-            subs = len(get_all_subscribers())
-        except Exception:
-            subs = 0
-        try:
-            open_pos = len(get_all_active_positions())
-        except Exception:
-            open_pos = 0
-        diag = {
-            "status": "online",
-            "uptime_seconds": uptime,
-            "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
-            "khv_time": now_khv.strftime("%Y-%m-%d %H:%M:%S"),
-            "last_digest_slot": get_bot_state("last_sent_digest_slot") or "none",
-            "last_eu_report": get_bot_state("last_eu_report_date") or "none",
-            "last_us_report": get_bot_state("last_us_report_date") or "none",
-            "next_digest_target": next_target.strftime("%H:%M:%S"),
-            "sleep_remaining_seconds": round(sleep_secs, 1),
-            "subscribers_count": subs,
-            "open_positions": open_pos,
-            "supervisor_restarts": _SUPERVISOR_RESTARTS,
-        }
-        return web.json_response(diag)
+            from database import get_bot_state, get_all_subscribers, get_all_active_positions
+            from auto_scanner import KHV_TZ, get_next_sleep_seconds
+            now_khv = datetime.now(KHV_TZ)
+            sleep_secs, next_target, _ = get_next_sleep_seconds(now_khv)
+            uptime = int(time.time() - _START_TIME) if _START_TIME > 0 else 0
+            try:
+                subs = len(get_all_subscribers())
+            except Exception:
+                subs = 0
+            try:
+                open_pos = len(get_all_active_positions())
+            except Exception:
+                open_pos = 0
+            diag = {
+                "status": "online",
+                "uptime_seconds": uptime,
+                "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
+                "khv_time": now_khv.strftime("%Y-%m-%d %H:%M:%S"),
+                "last_digest_slot": get_bot_state("last_sent_digest_slot") or "none",
+                "last_eu_report": get_bot_state("last_eu_report_date") or "none",
+                "last_us_report": get_bot_state("last_us_report_date") or "none",
+                "next_digest_target": next_target.strftime("%H:%M:%S"),
+                "sleep_remaining_seconds": round(sleep_secs, 1),
+                "subscribers_count": subs,
+                "open_positions": open_pos,
+                "supervisor_restarts": _SUPERVISOR_RESTARTS,
+            }
+            return web.json_response(diag)
+        except Exception as e:
+            return web.json_response({"status": "error", "error": str(e)}, status=200)
 
     app = web.Application()
     for path in ["/", "/healthz", "/health", "/ping", "/cron"]:
