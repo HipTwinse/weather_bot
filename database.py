@@ -1191,12 +1191,20 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
     Формирует полный структурированный отчет обо всех действиях робота за день (дата по Хабаровску YYYY-MM-DD).
     Возвращает (текст_отчета, имя_файла).
     """
-    from datetime import datetime
+    from datetime import datetime, timedelta
     import zoneinfo
 
     khv_tz = zoneinfo.ZoneInfo("Asia/Vladivostok")
     if not date_str:
         date_str = datetime.now(khv_tz).strftime("%Y-%m-%d")
+
+    try:
+        cur_date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        cur_date_obj = datetime.now(khv_tz).date()
+        date_str = cur_date_obj.strftime("%Y-%m-%d")
+
+    yesterday_str = (cur_date_obj - timedelta(days=1)).strftime("%Y-%m-%d")
 
     actions = get_daily_actions(date_str, user_id=user_id if user_id else None)
     stats = get_trading_stats(user_id) if user_id else {"real": {}, "paper": {}, "recent": []}
@@ -1216,7 +1224,7 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
     skips_count = sum(1 for a in actions if a["action_type"] == "SKIP")
     errors = [a for a in actions if a["action_type"] == "ERROR"]
 
-    # Извлекаем все закрытые сделки дня напрямую из базы данных
+    # Извлекаем все закрытые сделки дня напрямую из базы данных (Европа, США, Азия)
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -1231,10 +1239,35 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
               AND (
                   date(datetime(COALESCE(closed_at, created_at), '+10 hours')) = ?
                   OR target_date = ?
+                  OR (
+                      icao IN ('KLGA', 'KMIA', 'KORD', 'KJFK')
+                      AND (
+                          target_date IN (?, ?)
+                          OR date(datetime(COALESCE(closed_at, created_at), '+10 hours')) IN (?, ?)
+                      )
+                  )
               )
             ORDER BY COALESCE(closed_at, created_at) DESC, id DESC
-        """, (user_id, user_id, date_str, date_str))
+        """, (user_id, user_id, date_str, date_str, date_str, yesterday_str, date_str, yesterday_str))
         today_trades = [dict(r) for r in cur.fetchall()]
+
+    eu_icaos = {"EGLC", "LFPB", "LIMC", "LEMD"}
+    us_icaos = {"KLGA", "KMIA", "KORD", "KJFK"}
+    asia_icaos = {"RJTT", "RKSI", "LTAC"}
+
+    eu_trades = [t for t in today_trades if t.get("icao") in eu_icaos]
+    us_trades = [t for t in today_trades if t.get("icao") in us_icaos]
+    asia_trades = [t for t in today_trades if t.get("icao") in asia_icaos]
+
+    def _calc_subset_pnl(trades_list):
+        pnl = sum((float(t.get("pnl_cents") or 0.0) * float(t.get("shares") or 1.0)) / 100.0 for t in trades_list)
+        wins = sum(1 for t in trades_list if float(t.get("pnl_cents") or 0.0) > 0)
+        losses = sum(1 for t in trades_list if float(t.get("pnl_cents") or 0.0) < 0)
+        return pnl, wins, losses
+
+    eu_pnl, eu_wins, eu_losses = _calc_subset_pnl(eu_trades)
+    us_pnl, us_wins, us_losses = _calc_subset_pnl(us_trades)
+    asia_pnl, asia_wins, asia_losses = _calc_subset_pnl(asia_trades)
 
     today_pnl_usd = sum((float(t.get("pnl_cents") or 0.0) * float(t.get("shares") or 1.0)) / 100.0 for t in today_trades)
     today_wins = sum(1 for t in today_trades if float(t.get("pnl_cents") or 0.0) > 0)
@@ -1255,16 +1288,23 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
         f" Дата (Хабаровск UTC+10): {date_str}",
         f" Торговый режим: {mode_label}",
         f" Торговый сейф/кошелек: {wallet_str}",
-        f" Торговый режим работы: Круглосуточный радар 24/7",
+        f" Торговый режим работы: Круглосуточный радар 24/7 (Европа + США + Азия)",
         "=" * 80,
         "",
-        "📊 1. СВОДНЫЕ РЕЗУЛЬТАТЫ ДНЯ:",
+        "📊 1. СВОДНЫЕ РЕЗУЛЬТАТЫ СУТОК:",
         f" • Всего циклов сканирования: {scans_count}",
         f" • Куплено реальных контрактов: {len(buys_real)}",
         f" • Оформлено бумажных тестов: {len(buys_paper)}",
         f" • Закрыто реальных сделок: {len(sells_real)}",
         f" • Закрыто бумажных тестов: {len(sells_paper)}",
-        f" • Дневной PnL (закрытые сегодня): {sign_today}${today_pnl_usd:.2f} USDC (Побед: {today_wins} | Потерь: {today_losses})",
+        f" • Дневной PnL (закрытые за 24ч): {sign_today}${today_pnl_usd:.2f} USDC (Побед: {today_wins} | Потерь: {today_losses})",
+        f"   ├─ 🇪🇺 Европейский рынок (EGLC, LFPB, LIMC, LEMD): {'+' if eu_pnl >= 0 else ''}${eu_pnl:.2f} USDC (Сделок: {len(eu_trades)}, Побед: {eu_wins}, Потерь: {eu_losses})",
+        f"   ├─ 🇺🇸 Американский рынок (KLGA, KMIA, KORD, KJFK): {'+' if us_pnl >= 0 else ''}${us_pnl:.2f} USDC (Сделок: {len(us_trades)}, Побед: {us_wins}, Потерь: {us_losses})",
+    ]
+    if asia_trades:
+        lines.append(f"   └─ 🇯🇵 Азиатский рынок (RJTT, RKSI, LTAC): {'+' if asia_pnl >= 0 else ''}${asia_pnl:.2f} USDC (Сделок: {len(asia_trades)}, Побед: {asia_wins}, Потерь: {asia_losses})")
+
+    lines.extend([
         f" • Дневная доходность: {daily_roi_sign}{daily_roi_pct:.1f}% от базового депозита (${p_bal['initial_deposit']:.2f})",
         f" • Отклонено кандидатов (фильтры/скип): {skips_count}",
         f" • Ошибок биржи/отказов: {len(errors)}",
@@ -1282,7 +1322,7 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
         "=" * 80,
         "🌡️ 3. СУТОЧНАЯ ДИНАМИКА ТЕМПЕРАТУР ПО ГОРОДАМ:",
         "=" * 80,
-    ]
+    ])
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -1383,6 +1423,36 @@ def generate_daily_audit_report(date_str: str = "", user_id: int = 0) -> Tuple[s
                 lines.append(f"\n[{time_label} ХБР] ⚠️ ОШИБКА БИРЖИ:")
                 lines.append(f"   Локация: {icao} | Исход: {outcomes}")
                 lines.append(f"   Описание: {det.get('error', 'Неизвестная ошибка')}")
+
+    lines.extend([
+        "",
+        "=" * 80,
+        "💼 5. РЕЕСТР ЗАКРЫТЫХ СДЕЛОК ЗА 24 ЧАСА (ЕВРОПА, США, АЗИЯ):",
+        "=" * 80,
+    ])
+    if not today_trades:
+        lines.append(" За данный период закрытых сделок не зафиксировано (защита капитала отсеяла сомнительные входы).")
+    else:
+        for reg_title, r_trades in [
+            ("🇪🇺 ЕВРОПЕЙСКИЙ РЫНОК (Лондон, Париж, Милан, Мадрид)", eu_trades),
+            ("🇺🇸 АМЕРИКАНСКИЙ РЫНОК (Нью-Йорк, Майами, Чикаго)", us_trades),
+            ("🇯🇵 АЗИАТСКИЙ РЫНОК (Токио, Сеул, Анкара)", asia_trades),
+        ]:
+            if r_trades:
+                lines.append(f"\n--- {reg_title} ({len(r_trades)} сделок) ---")
+                for t in r_trades:
+                    pnl_v = float(t.get("pnl_cents") or 0.0)
+                    pnl_usd = (pnl_v * float(t.get("shares") or 1.0)) / 100.0
+                    sign_t = "+" if pnl_v >= 0 else ""
+                    kind = "БУМАГА" if t.get("is_paper") else "РЕАЛ"
+                    time_s = t.get("local_khv_time", "")
+                    reason_s = t.get("exit_reason") or "Фиксация"
+                    lines.append(
+                        f" • [{time_s}] {t.get('icao')} | Исход: {t.get('outcomes')} | "
+                        f"Вход: {t.get('entry_price', 0):.0f}¢ ➔ Выход: {t.get('exit_price', 0):.0f}¢ | "
+                        f"PnL: {sign_t}{pnl_v:.0f}¢ ({sign_t}${pnl_usd:.2f}) | "
+                        f"Режим: {kind} | {reason_s}"
+                    )
 
     lines.append("\n" + "=" * 80)
     lines.append(f" Конец отчета. Сформировано автоматически Weather Alpha Engine в {datetime.now(khv_tz).strftime('%H:%M:%S')} ХБР.")

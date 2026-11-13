@@ -96,6 +96,7 @@ from auto_scanner import (
     _get_city_physics_note,
     build_dynamic_city_block,
     collect_city_metrics,
+    send_daily_audit_report_to_user,
 )
 
 logger = logging.getLogger(__name__)
@@ -1529,16 +1530,20 @@ async def process_back_to_positions(callback: CallbackQuery):
 
 @router.callback_query(F.data == "download_day_report")
 async def process_download_day_report(callback: CallbackQuery):
-    await callback.answer("Босс, формирую аудиторский отчет...")
+    await callback.answer("Босс, формирую единый аудиторский отчет...")
     user_id = callback.from_user.id
-    report_text, filename = generate_daily_audit_report("", user_id=user_id)
-    doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
-    caption = (
-        f"📄 <b>Босс, сделал отчет!</b>\n\n"
-        f"• Файл: <code>{filename}</code>\n"
-        f"• Все ходы записаны, цифры подшиты до цента. Толпа на бирже может только завидовать."
-    )
-    await callback.message.answer_document(document=doc_file, caption=caption, parse_mode="HTML")
+    try:
+        await send_daily_audit_report_to_user(callback.bot, user_id)
+    except Exception as err:
+        logger.error(f"Ошибка формирования отчета по кнопке: {err}", exc_info=True)
+        report_text, filename = generate_daily_audit_report("", user_id=user_id)
+        doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
+        caption = (
+            f"📄 <b>Босс, сделал отчет!</b>\n\n"
+            f"• Файл: <code>{filename}</code>\n"
+            f"• Все ходы записаны, цифры подшиты до цента. Толпа на бирже может только завидовать."
+        )
+        await callback.message.answer_document(document=doc_file, caption=caption, parse_mode="HTML")
 
 
 @router.message(F.text == "📄 Отчет за день", StateFilter("*"))
@@ -1547,14 +1552,19 @@ async def process_download_day_report(callback: CallbackQuery):
 async def cmd_download_day_report(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    report_text, filename = generate_daily_audit_report("", user_id=user_id)
-    doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
-    caption = (
-        f"📄 <b>Босс, сделал отчет!</b>\n\n"
-        f"• Файл: <code>{filename}</code>\n"
-        f"• Все ходы записаны, цифры подшиты до цента. Толпа на бирже может только завидовать."
-    )
-    await message.answer_document(document=doc_file, caption=caption, parse_mode="HTML")
+    await message.answer("📊 <i>Босс, поднимаю архивы и свожу цифры за 24 часа...</i>", parse_mode="HTML")
+    try:
+        await send_daily_audit_report_to_user(message.bot, user_id)
+    except Exception as err:
+        logger.error(f"Ошибка формирования отчета по команде: {err}", exc_info=True)
+        report_text, filename = generate_daily_audit_report("", user_id=user_id)
+        doc_file = BufferedInputFile(report_text.encode("utf-8"), filename=filename)
+        caption = (
+            f"📄 <b>Босс, сделал отчет!</b>\n\n"
+            f"• Файл: <code>{filename}</code>\n"
+            f"• Все ходы записаны, цифры подшиты до цента. Толпа на бирже может только завидовать."
+        )
+        await message.answer_document(document=doc_file, caption=caption, parse_mode="HTML")
 
 
 @router.message(F.text == "🔄 Свежий дайджест", StateFilter("*"))
