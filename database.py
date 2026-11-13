@@ -64,7 +64,7 @@ def init_db() -> None:
                 private_key TEXT NOT NULL,
                 wallet_address TEXT NOT NULL,
                 proxy_address TEXT DEFAULT '',
-                signature_type INTEGER DEFAULT 1,
+                signature_type INTEGER DEFAULT 3,
                 trading_mode TEXT DEFAULT 'REAL',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -75,7 +75,7 @@ def init_db() -> None:
         if "proxy_address" not in wallet_cols:
             cursor.execute("ALTER TABLE user_wallets ADD COLUMN proxy_address TEXT DEFAULT ''")
         if "signature_type" not in wallet_cols:
-            cursor.execute("ALTER TABLE user_wallets ADD COLUMN signature_type INTEGER DEFAULT 1")
+            cursor.execute("ALTER TABLE user_wallets ADD COLUMN signature_type INTEGER DEFAULT 3")
         if "trading_mode" not in wallet_cols:
             cursor.execute("ALTER TABLE user_wallets ADD COLUMN trading_mode TEXT DEFAULT 'REAL'")
 
@@ -306,7 +306,7 @@ def _ensure_wallet_columns(cursor: sqlite3.Cursor) -> None:
             if "proxy_address" not in cols:
                 cursor.execute("ALTER TABLE user_wallets ADD COLUMN proxy_address TEXT DEFAULT ''")
             if "signature_type" not in cols:
-                cursor.execute("ALTER TABLE user_wallets ADD COLUMN signature_type INTEGER DEFAULT 1")
+                cursor.execute("ALTER TABLE user_wallets ADD COLUMN signature_type INTEGER DEFAULT 3")
     except Exception:
         pass
 
@@ -316,7 +316,7 @@ def save_user_wallet(
     private_key: str,
     wallet_address: str,
     proxy_address: str = "",
-    signature_type: int = 1,
+    signature_type: int = 3,
 ) -> None:
     """Сохраняет приватный ключ, адрес подписанта и адрес торгового прокси Polymarket."""
     with sqlite3.connect(DB_PATH) as conn:
@@ -348,7 +348,7 @@ def get_user_wallet(user_id: int) -> Optional[Dict[str, Any]]:
         cursor.execute("""
             SELECT user_id, private_key, wallet_address,
                    COALESCE(proxy_address, '') AS proxy_address,
-                   COALESCE(signature_type, 1) AS signature_type
+                   COALESCE(signature_type, 3) AS signature_type
             FROM user_wallets WHERE user_id = ?
         """, (user_id,))
         row = cursor.fetchone()
@@ -363,12 +363,12 @@ def get_user_wallet(user_id: int) -> Optional[Dict[str, Any]]:
                     proxy_addr = (config.WALLET_ADDRESS or "").strip() or resolve_polymarket_proxy(eoa_addr) or ""
                     cursor.execute("""
                         INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, updated_at)
-                        VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                        VALUES (?, ?, ?, ?, 3, CURRENT_TIMESTAMP)
                         ON CONFLICT(user_id) DO UPDATE SET
                             private_key = excluded.private_key,
                             wallet_address = excluded.wallet_address,
                             proxy_address = excluded.proxy_address,
-                            signature_type = 1,
+                            signature_type = 3,
                             updated_at = CURRENT_TIMESTAMP
                     """, (user_id, clean_pk, eoa_addr, proxy_addr))
                     conn.commit()
@@ -377,7 +377,7 @@ def get_user_wallet(user_id: int) -> Optional[Dict[str, Any]]:
                         "private_key": clean_pk,
                         "wallet_address": eoa_addr,
                         "proxy_address": proxy_addr,
-                        "signature_type": 1,
+                        "signature_type": 3,
                     }
                 except Exception as e_w_create:
                     logger.warning(f"Ошибка автосоздания кошелька админа из .env: {e_w_create}")
@@ -400,7 +400,7 @@ def get_user_wallet(user_id: int) -> Optional[Dict[str, Any]]:
                     res["proxy_address"] = proxy_addr
                 cursor.execute("""
                     UPDATE user_wallets
-                    SET private_key = ?, wallet_address = ?, proxy_address = ?, signature_type = 1, updated_at = CURRENT_TIMESTAMP
+                    SET private_key = ?, wallet_address = ?, proxy_address = ?, signature_type = 3, updated_at = CURRENT_TIMESTAMP
                     WHERE user_id = ?
                 """, (clean_pk, res["wallet_address"], res["proxy_address"], user_id))
                 conn.commit()
@@ -414,10 +414,10 @@ def get_user_wallet(user_id: int) -> Optional[Dict[str, Any]]:
                 proxy = resolve_polymarket_proxy(res["wallet_address"])
                 if proxy:
                     res["proxy_address"] = proxy
-                    res["signature_type"] = 1
+                    res["signature_type"] = 3
                     cursor.execute("""
                         UPDATE user_wallets
-                        SET proxy_address = ?, signature_type = 1
+                        SET proxy_address = ?, signature_type = 3
                         WHERE user_id = ?
                     """, (proxy, user_id))
                     conn.commit()

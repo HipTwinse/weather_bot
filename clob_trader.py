@@ -316,7 +316,7 @@ def get_wallet_collateral_balance(
     if raw_key:
         try:
             key = clean_private_key(raw_key)
-            sig_type = 1 if (proxy_address and proxy_address.lower() != wallet_address.lower()) else 0
+            sig_type = 3 if (proxy_address and proxy_address.lower() != wallet_address.lower()) else 0
             client = ClobClient(
                 host=POLYMARKET_CLOB_HOST,
                 key=key,
@@ -367,7 +367,7 @@ def get_token_balance(
     # 3. Fallback на CLOB API
     try:
         key = clean_private_key(raw_key)
-        sig_type = 1 if (proxy_address and wallet_address and proxy_address.lower() != wallet_address.lower()) else 0
+        sig_type = 3 if (proxy_address and wallet_address and proxy_address.lower() != wallet_address.lower()) else 0
         client = ClobClient(
             host=POLYMARKET_CLOB_HOST,
             key=key,
@@ -393,14 +393,14 @@ def execute_market_sell(
     shares: float,
     worst_price: float = 0.01,
     proxy_address: str = "",
-    signature_type: int = 1,
+    signature_type: int = 3,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Выполняет продажу указанного объема контрактов по рынку (Market-Taker) по протоколу CLOB V2.
-    Учитывает архитектуру Polymarket Proxy/Safe:
+    Учитывает архитектуру Polymarket Proxy/Deposit Wallet:
     - maker: proxy_address (где хранятся токены)
     - signer: EOA address из приватного ключа
-    - signatureType: 1 (Polymarket Proxy)
+    - signatureType: 3 (Polymarket Deposit Wallet Flow / POLY_1271)
     """
     ensure_clob_proxy()
     if not token_id:
@@ -417,9 +417,9 @@ def execute_market_sell(
         if not proxy_address:
             proxy_address = resolve_polymarket_proxy(signer_addr) or ""
 
-        sig_type = signature_type
         if proxy_address and proxy_address.lower() != signer_addr.lower():
-            sig_type = 1
+            # На Polymarket для прокси/депозитных кошельков требуется signature_type = 3 (POLY_1271 - deposit wallet flow)
+            sig_type = signature_type if signature_type in (2, 3) else 3
             funder_addr = proxy_address
         else:
             sig_type = 0
@@ -493,13 +493,14 @@ def execute_market_buy(
     amount_usd: float = 1.08,
     max_price: float = 0.50,
     proxy_address: str = "",
-    signature_type: int = 1,
+    signature_type: int = 3,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Выполняет покупку исхода на Polymarket CLOB V2.
     Учитывает:
     - Минимальный размер ордера на Polymarket ($1.00 - $1.05), по умолчанию $1.08.
     - Ограничение максимальной цены входа (max_price), чтобы не покупать перегретые токены.
+    - signatureType: 3 (Polymarket Deposit Wallet Flow / POLY_1271)
     - Возвращает (успех, order_id_или_ошибка, детали).
     """
     ensure_clob_proxy()
@@ -517,9 +518,9 @@ def execute_market_buy(
         if not proxy_address:
             proxy_address = resolve_polymarket_proxy(signer_addr) or ""
 
-        sig_type = signature_type
         if proxy_address and proxy_address.lower() != signer_addr.lower():
-            sig_type = 1
+            # На Polymarket для прокси/депозитных кошельков требуется signature_type = 3 (POLY_1271 - deposit wallet flow)
+            sig_type = signature_type if signature_type in (2, 3) else 3
             funder_addr = proxy_address
         else:
             sig_type = 0

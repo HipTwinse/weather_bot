@@ -1616,7 +1616,7 @@ async def check_and_execute_auto_sell(
         return None
 
     proxy_addr = wallet.get("proxy_address") or ""
-    sig_type = int(wallet.get("signature_type") or 1)
+    sig_type = int(wallet.get("signature_type") or 3)
 
     # Определяем доступный объем контрактов
     shares = await asyncio.to_thread(
@@ -2011,7 +2011,7 @@ async def check_and_execute_auto_buy(
 
         has_pk = bool(wallet and wallet.get("private_key"))
         proxy_addr = wallet.get("proxy_address") if wallet else ""
-        sig_type = int(wallet.get("signature_type") or 1) if wallet else 1
+        sig_type = int(wallet.get("signature_type") or 3) if wallet else 3
 
         # Расчет базового баланса и лимитов риска в зависимости от режима торговли
         if mode == "REAL":

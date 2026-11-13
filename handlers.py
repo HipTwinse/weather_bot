@@ -2257,7 +2257,7 @@ async def process_del_pos_callback(callback: CallbackQuery):
         token_id = pos_item.get("token_id")
         shares = float(pos_item.get("shares") or 0.0)
         proxy_addr = wallet.get("proxy_address") or ""
-        sig_type = int(wallet.get("signature_type") or 1)
+        sig_type = int(wallet.get("signature_type") or 3)
         if token_id:
             try:
                 token_balance = await asyncio.to_thread(
