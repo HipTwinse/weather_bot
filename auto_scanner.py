@@ -1349,7 +1349,7 @@ async def _safe_send_digest(
             text=safe_text,
             parse_mode="HTML",
             reply_markup=reply_markup,
-            disable_notification=True,
+            disable_notification=False,
         )
         send_success = True
     except Exception as html_err:
@@ -1369,7 +1369,7 @@ async def _safe_send_digest(
                 text=plain_text,
                 parse_mode=None,
                 reply_markup=reply_markup,
-                disable_notification=True,
+                disable_notification=False,
             )
             logger.info(f"✅ Дайджест успешно доставлен в чат {chat_id} через Plain-Text fallback.")
             send_success = True
@@ -2011,13 +2011,14 @@ async def check_and_execute_auto_buy(
 
         # Расчет базового баланса и лимитов риска в зависимости от режима торговли
         if mode == "REAL":
-            real_cash = 0.0
-            if has_pk:
-                real_cash = await asyncio.to_thread(
-                    get_wallet_collateral_balance,
-                    wallet["private_key"],
-                    proxy_address=proxy_addr,
-                )
+            pk_val = wallet.get("private_key", "") if wallet else ""
+            wallet_addr = wallet.get("wallet_address", "") if wallet else ""
+            real_cash = await asyncio.to_thread(
+                get_wallet_collateral_balance,
+                raw_key=pk_val,
+                wallet_address=wallet_addr,
+                proxy_address=proxy_addr,
+            )
             open_real_positions = [p for p in existing_positions if not p.get("is_paper") and p.get("status") == "OPEN"]
             open_real_allocated = sum((float(p.get("entry_price") or 0.0) * float(p.get("shares") or 1.0)) / 100.0 for p in open_real_positions)
             effective_balance = max(real_cash + open_real_allocated, real_cash)
@@ -2820,61 +2821,63 @@ async def run_auto_scanner(bot: Bot) -> None:
                 else:
                     logger.info(f"🔄 Сбор планового METAR-обновления ({current_checkpoint_slot} ХБР)...")
 
-                # Последовательный сбор метрик с интервалом 0.25 сек (защита от Open-Meteo 429)
-                cities_metrics = []
-                for icao in TARGET_CITIES.keys():
-                    cm = None
+                # Параллельный сбор метрик городов с защитой по таймауту (3-5 сек на все 8 городов)
+                async def fetch_city_safe(c_icao: str) -> Optional[Dict[str, Any]]:
                     try:
-                        cm = await asyncio.wait_for(collect_city_metrics(icao), timeout=25.0)
+                        return await asyncio.wait_for(collect_city_metrics(c_icao), timeout=15.0)
                     except asyncio.TimeoutError:
-                        logger.error(f"⏱️ Таймаут (25 сек) при сборе метрик для {icao}, продолжаем дальше...")
-                    except Exception as city_err:
-                        logger.error(f"⚠️ Ошибка при сборе метрик для {icao}: {city_err}")
+                        logger.error(f"⏱️ Таймаут (15 сек) при сборе метрик для {c_icao}")
+                        return None
+                    except Exception as c_err:
+                        logger.error(f"⚠️ Ошибка при сборе метрик для {c_icao}: {c_err}")
+                        return None
 
-                    if cm:
-                        cities_metrics.append(cm)
-                        try:
-                            from database import record_city_dynamics
-                            cm_dt = cm.get("local_dt")
-                            if cm_dt and cm.get("temp_c") is not None:
-                                record_city_dynamics(
-                                    target_date=today_khv_str,
-                                    time_str=cm_dt.strftime("%H:%M LT"),
-                                    icao=icao,
-                                    temp_c=cm.get("temp_c"),
-                                    rate_str=cm.get("rate_str", ""),
-                                    rate_val=cm.get("rate_val", 0.0),
-                                    peak_str=cm.get("peak_str", ""),
-                                    raw_metar=cm.get("raw_metar", ""),
-                                )
-                        except Exception as dyn_err:
-                            logger.debug(f"Не удалось записать срез {icao} в city_daily_dynamics: {dyn_err}")
+                fetch_results = await asyncio.gather(*(fetch_city_safe(c_icao) for c_icao in TARGET_CITIES.keys()))
+                cities_metrics = [cm for cm in fetch_results if cm]
 
-                        try:
-                            from gemini_analyzer import daily_tracker
-                            cm_dt = cm.get("local_dt")
-                            if cm_dt:
-                                cm_date = cm_dt.strftime("%Y-%m-%d")
-                                daily_tracker.record(
-                                    0,
-                                    icao,
-                                    cm_date,
-                                    {
-                                        "timestamp": time.time(),
-                                        "time_str": cm_dt.strftime("%H:%M LT"),
-                                        "target_date": cm_date,
-                                        "temp_c": cm.get("temp_c"),
-                                        "raw_metar": cm.get("raw_metar", ""),
-                                        "rate_str": cm.get("rate_str", "Н/Д"),
-                                        "rate_val": cm.get("rate_val", 0.0),
-                                        "rem_hours_str": cm.get("rem_hours_str", "Н/Д"),
-                                        "orderbook": cm.get("orderbook", []),
-                                        "user_position": None,
-                                    },
-                                )
-                        except Exception as trk_err:
-                            logger.debug(f"Не удалось зафиксировать срез в daily_tracker: {trk_err}")
-                    await asyncio.sleep(0.25)
+                for cm in cities_metrics:
+                    cm_icao = cm.get("icao", "")
+                    try:
+                        from database import record_city_dynamics
+                        cm_dt = cm.get("local_dt")
+                        if cm_dt and cm.get("temp_c") is not None:
+                            record_city_dynamics(
+                                target_date=today_khv_str,
+                                time_str=cm_dt.strftime("%H:%M LT"),
+                                icao=cm_icao,
+                                temp_c=cm.get("temp_c"),
+                                rate_str=cm.get("rate_str", ""),
+                                rate_val=cm.get("rate_val", 0.0),
+                                peak_str=cm.get("peak_str", ""),
+                                raw_metar=cm.get("raw_metar", ""),
+                            )
+                    except Exception as dyn_err:
+                        logger.debug(f"Не удалось записать срез {cm_icao} в city_daily_dynamics: {dyn_err}")
+
+                    try:
+                        from gemini_analyzer import daily_tracker
+                        cm_dt = cm.get("local_dt")
+                        if cm_dt:
+                            cm_date = cm_dt.strftime("%Y-%m-%d")
+                            daily_tracker.record(
+                                0,
+                                cm_icao,
+                                cm_date,
+                                {
+                                    "timestamp": time.time(),
+                                    "time_str": cm_dt.strftime("%H:%M LT"),
+                                    "target_date": cm_date,
+                                    "temp_c": cm.get("temp_c"),
+                                    "raw_metar": cm.get("raw_metar", ""),
+                                    "rate_str": cm.get("rate_str", "Н/Д"),
+                                    "rate_val": cm.get("rate_val", 0.0),
+                                    "rem_hours_str": cm.get("rem_hours_str", "Н/Д"),
+                                    "orderbook": cm.get("orderbook", []),
+                                    "user_position": None,
+                                },
+                            )
+                    except Exception as trk_err:
+                        logger.debug(f"Не удалось зафиксировать срез в daily_tracker: {trk_err}")
 
                 # Отправка дайджеста с расширенной защитой по таймауту (120 сек)
                 digest_sent = False
@@ -2923,15 +2926,18 @@ async def run_auto_scanner(bot: Bot) -> None:
                     except Exception as us_err:
                         logger.error(f"Ошибка отправки американского отчета: {us_err}", exc_info=True)
 
-            # 4. Расчет точного сна до СЛЕДУЮЩЕЙ контрольной точки
-            now_after = datetime.now(KHV_TZ)
-            sleep_secs, next_target, next_slot_str = get_next_sleep_seconds(now_after)
-
-            logger.info(
-                f"⏳ Следующий плановый дайджест в {next_target.strftime('%H:%M:%S')} ХБР "
-                f"(сон: {int(sleep_secs)} сек / {sleep_secs/60:.1f} мин)."
-            )
-            await asyncio.sleep(sleep_secs)
+            # 4. Расчет точного сна: если дайджест успешно доставлен — спим до следующего слота, иначе быстрый повтор через 15 сек
+            if not current_checkpoint_slot or current_checkpoint_slot == _LAST_SENT_SLOT:
+                now_after = datetime.now(KHV_TZ)
+                sleep_secs, next_target, next_slot_str = get_next_sleep_seconds(now_after)
+                logger.info(
+                    f"⏳ Следующий плановый дайджест в {next_target.strftime('%H:%M:%S')} ХБР "
+                    f"(сон: {int(sleep_secs)} сек / {sleep_secs/60:.1f} мин)."
+                )
+                await asyncio.sleep(sleep_secs)
+            else:
+                logger.warning(f"⚠️ Дайджест {current_checkpoint_slot} ХБР требует повторной попытки. Пауза 15 сек...")
+                await asyncio.sleep(15)
 
         except asyncio.CancelledError:
             logger.info("🛑 Автосканер остановлен.")

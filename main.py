@@ -96,6 +96,25 @@ async def run_health_check_server() -> None:
                 open_pos = len(get_all_active_positions())
             except Exception:
                 open_pos = 0
+            admin_id = getattr(config, "ADMIN_CHAT_ID", None)
+            w_info = {"admin_id": admin_id, "has_pk": False, "eoa": "", "proxy": "", "balance": 0.0}
+            if admin_id:
+                try:
+                    from database import get_user_wallet
+                    from clob_trader import get_wallet_collateral_balance
+                    w = get_user_wallet(int(admin_id))
+                    if w:
+                        w_info["has_pk"] = bool(w.get("private_key"))
+                        w_info["eoa"] = w.get("wallet_address", "")
+                        w_info["proxy"] = w.get("proxy_address", "")
+                        w_info["balance"] = get_wallet_collateral_balance(
+                            raw_key=w.get("private_key", ""),
+                            wallet_address=w.get("wallet_address", ""),
+                            proxy_address=w.get("proxy_address", ""),
+                        )
+                except Exception as e_w:
+                    w_info["error"] = str(e_w)
+
             diag = {
                 "status": "online",
                 "uptime_seconds": uptime,
@@ -109,6 +128,7 @@ async def run_health_check_server() -> None:
                 "subscribers_count": subs,
                 "open_positions": open_pos,
                 "supervisor_restarts": _SUPERVISOR_RESTARTS,
+                "wallet": w_info,
             }
             return web.json_response(diag)
         except Exception as e:

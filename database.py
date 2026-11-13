@@ -336,7 +336,11 @@ def save_user_wallet(
 
 
 def get_user_wallet(user_id: int) -> Optional[Dict[str, Any]]:
-    """Получает сохраненный кошелек пользователя с автоматическим определением proxyWallet при необходимости."""
+    """Получает сохраненный кошелек пользователя с автоматическим восстановлением приватного ключа администратора из окружения."""
+    import config
+    admin_id = getattr(config, "ADMIN_CHAT_ID", None)
+    is_admin = bool(admin_id and int(user_id) == int(admin_id))
+
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -348,9 +352,61 @@ def get_user_wallet(user_id: int) -> Optional[Dict[str, Any]]:
             FROM user_wallets WHERE user_id = ?
         """, (user_id,))
         row = cursor.fetchone()
+
         if not row:
+            if is_admin and config.WALLET_PRIVATE_KEY:
+                try:
+                    from eth_account import Account
+                    from clob_trader import clean_private_key, resolve_polymarket_proxy
+                    clean_pk = clean_private_key(config.WALLET_PRIVATE_KEY)
+                    eoa_addr = Account.from_key(clean_pk).address
+                    proxy_addr = (config.WALLET_ADDRESS or "").strip() or resolve_polymarket_proxy(eoa_addr) or ""
+                    cursor.execute("""
+                        INSERT INTO user_wallets (user_id, private_key, wallet_address, proxy_address, signature_type, updated_at)
+                        VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            private_key = excluded.private_key,
+                            wallet_address = excluded.wallet_address,
+                            proxy_address = excluded.proxy_address,
+                            signature_type = 1,
+                            updated_at = CURRENT_TIMESTAMP
+                    """, (user_id, clean_pk, eoa_addr, proxy_addr))
+                    conn.commit()
+                    return {
+                        "user_id": user_id,
+                        "private_key": clean_pk,
+                        "wallet_address": eoa_addr,
+                        "proxy_address": proxy_addr,
+                        "signature_type": 1,
+                    }
+                except Exception as e_w_create:
+                    logger.warning(f"Ошибка автосоздания кошелька админа из .env: {e_w_create}")
             return None
+
         res = dict(row)
+
+        # Если приватный ключ пустой (после десериализации сейфа), но в .env задан WALLET_PRIVATE_KEY:
+        if is_admin and not res.get("private_key") and config.WALLET_PRIVATE_KEY:
+            try:
+                from eth_account import Account
+                from clob_trader import clean_private_key, resolve_polymarket_proxy
+                clean_pk = clean_private_key(config.WALLET_PRIVATE_KEY)
+                eoa_addr = Account.from_key(clean_pk).address
+                proxy_addr = res.get("proxy_address") or (config.WALLET_ADDRESS or "").strip() or resolve_polymarket_proxy(eoa_addr) or ""
+                res["private_key"] = clean_pk
+                if not res.get("wallet_address"):
+                    res["wallet_address"] = eoa_addr
+                if not res.get("proxy_address"):
+                    res["proxy_address"] = proxy_addr
+                cursor.execute("""
+                    UPDATE user_wallets
+                    SET private_key = ?, wallet_address = ?, proxy_address = ?, signature_type = 1, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                """, (clean_pk, res["wallet_address"], res["proxy_address"], user_id))
+                conn.commit()
+            except Exception as e_w_heal:
+                logger.warning(f"Ошибка восстановления приватного ключа админа: {e_w_heal}")
+
         # Если proxy_address еще не заполнен, динамически разрешаем его через Gamma API
         if not res.get("proxy_address") and res.get("wallet_address"):
             try:
