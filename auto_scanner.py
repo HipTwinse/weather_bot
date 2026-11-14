@@ -1817,7 +1817,7 @@ async def check_and_execute_auto_buy(
         for st_icao in STANDBY_AUTO_BUY_CITIES.keys():
             if st_icao not in existing_icaos:
                 try:
-                    st_cm = await asyncio.wait_for(collect_city_metrics(st_icao), timeout=15.0)
+                    st_cm = await asyncio.wait_for(collect_city_metrics(st_icao), timeout=25.0)
                     if st_cm and st_cm.get("orderbook"):
                         all_metrics.append(st_cm)
                 except Exception as e_st:
@@ -2767,7 +2767,7 @@ async def send_consolidated_digest(
                     if p_icao not in processed_icaos:
                         processed_icaos.add(p_icao)
                         try:
-                            extra_cm = await asyncio.wait_for(collect_city_metrics(p_icao), timeout=15.0)
+                            extra_cm = await asyncio.wait_for(collect_city_metrics(p_icao), timeout=25.0)
                         except Exception as extra_err:
                             logger.warning(f"Не удалось получить extra_cm для {p_icao}: {extra_err}")
                             extra_cm = None
@@ -2846,12 +2846,12 @@ async def run_auto_scanner(bot: Bot) -> None:
                 else:
                     logger.info(f"🔄 Сбор планового METAR-обновления ({current_checkpoint_slot} ХБР)...")
 
-                # Параллельный сбор метрик городов с защитой по таймауту (3-5 сек на все 8 городов)
+                # Параллельный сбор метрик городов с защитой по таймауту (25 сек на все города)
                 async def fetch_city_safe(c_icao: str) -> Optional[Dict[str, Any]]:
                     try:
-                        return await asyncio.wait_for(collect_city_metrics(c_icao), timeout=15.0)
+                        return await asyncio.wait_for(collect_city_metrics(c_icao), timeout=25.0)
                     except asyncio.TimeoutError:
-                        logger.error(f"⏱️ Таймаут (15 сек) при сборе метрик для {c_icao}")
+                        logger.error(f"⏱️ Таймаут (25 сек) при сборе метрик для {c_icao}")
                         return None
                     except Exception as c_err:
                         logger.error(f"⚠️ Ошибка при сборе метрик для {c_icao}: {c_err}")

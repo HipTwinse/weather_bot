@@ -148,9 +148,9 @@ def _parse_retry_after(retry_after_header: str | None) -> float | None:
         return None
 
 
-def _http_get_with_retry(url: str, params: dict, retries: int = 3, timeout: int = 12) -> requests.Response | None:
+def _http_get_with_retry(url: str, params: dict, retries: int = 1, timeout: int = 8) -> requests.Response | None:
     """
-    Безопасный HTTP-запрос с обработкой Retry-After и экспоненциальной задержкой.
+    Безопасный HTTP-запрос с обработкой Retry-After и быстрой отдачей.
     """
     retryable_statuses = {500, 502, 503, 504}
     backoff_delay = 1.0

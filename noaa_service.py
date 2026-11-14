@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 
 NOAA_METAR_URL = "https://aviationweather.gov/api/data/metar"
 NOAA_TAF_URL = "https://aviationweather.gov/api/data/taf"
-REQUEST_TIMEOUT = 10  # Жесткий таймаут на один запрос
-MAX_RETRIES = 2       # Количество повторных попыток при сбоях (всего 3 попытки)
-RETRY_DELAY = 1.0     # Пауза в секундах между попытками
+REQUEST_TIMEOUT = 6  # Оптимизированный таймаут для быстрого ответа
+MAX_RETRIES = 1      # 1 повторная попытка при сбоях (всего 2 попытки)
+RETRY_DELAY = 0.5    # Пауза 500мс между попытками
 
 
 def _format_utc_timestamp(timestamp_val: Optional[Any]) -> Optional[str]:
