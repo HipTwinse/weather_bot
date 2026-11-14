@@ -32,12 +32,33 @@ from database import init_db
 from handlers import router
 from middlewares import ThrottlingMiddleware
 
+from collections import deque
+
+class MemoryLogHandler(logging.Handler):
+    """Кольцевой буфер последних логов для удаленной диагностики и эндпоинта /logs."""
+    def __init__(self, capacity: int = 250):
+        super().__init__()
+        self.buffer = deque(maxlen=capacity)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self.buffer.append(msg)
+        except Exception:
+            pass
+
+_MEM_LOG_HANDLER = MemoryLogHandler(250)
+_MEM_LOG_HANDLER.setFormatter(logging.Formatter("%(asctime)s - [%(levelname)s] - %(name)s - %(message)s"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[logging.StreamHandler(sys.stdout), _MEM_LOG_HANDLER],
 )
 logger = logging.getLogger("WeatherBotMain")
+
+# Глобальная ссылка на инстанс бота для HTTP-эндпоинтов
+_GLOBAL_BOT: Optional[Bot] = None
 
 # Память суточных рекордов температурного максимума: ключ 'ICAO_YYYY-MM-DD' -> max_temp_float
 daily_max_records: Dict[str, float] = {}
@@ -79,12 +100,12 @@ async def run_health_check_server() -> None:
     Предоставляет расширенный JSON-статус на /status и /diag для удаленного мониторинга.
     """
     async def handle_ping(request: web.Request) -> web.Response:
-        return web.Response(text="OK: Weather Alpha Bot v8.0 is running 24/7", status=200)
+        return web.Response(text="OK: Weather Alpha Bot v8.2 is running 24/7", status=200)
 
     async def handle_status(request: web.Request) -> web.Response:
         try:
             from database import get_bot_state, get_all_subscribers, get_all_active_positions
-            from auto_scanner import KHV_TZ, get_next_sleep_seconds
+            from auto_scanner import KHV_TZ, get_next_sleep_seconds, get_current_digest_slot
             now_khv = datetime.now(KHV_TZ)
             sleep_secs, next_target, _ = get_next_sleep_seconds(now_khv)
             uptime = int(time.time() - _START_TIME) if _START_TIME > 0 else 0
@@ -117,9 +138,11 @@ async def run_health_check_server() -> None:
 
             diag = {
                 "status": "online",
+                "version": "v8.2-rocksolid",
                 "uptime_seconds": uptime,
                 "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
                 "khv_time": now_khv.strftime("%Y-%m-%d %H:%M:%S"),
+                "current_time_slot": get_current_digest_slot(now_khv),
                 "last_digest_slot": get_bot_state("last_sent_digest_slot") or "none",
                 "last_eu_report": get_bot_state("last_eu_report_date") or "none",
                 "last_us_report": get_bot_state("last_us_report_date") or "none",
@@ -129,16 +152,45 @@ async def run_health_check_server() -> None:
                 "open_positions": open_pos,
                 "supervisor_restarts": _SUPERVISOR_RESTARTS,
                 "wallet": w_info,
+                "recent_logs": list(_MEM_LOG_HANDLER.buffer)[-35:],
             }
             return web.json_response(diag)
         except Exception as e:
             return web.json_response({"status": "error", "error": str(e)}, status=200)
+
+    async def handle_logs_plain(request: web.Request) -> web.Response:
+        """Эндпоинт /logs для мгновенного просмотра последних логов в браузере."""
+        log_lines = list(_MEM_LOG_HANDLER.buffer)
+        body = "\n".join(log_lines) if log_lines else "Логи пока пусты."
+        return web.Response(text=body, content_type="text/plain", charset="utf-8")
+
+    async def handle_trigger_scan(request: web.Request) -> web.Response:
+        """Эндпоинт /trigger_scan для ручного запуска и проверки доставки дайджеста."""
+        if not _GLOBAL_BOT:
+            return web.json_response({"status": "error", "message": "Бот еще не инициализирован"}, status=503)
+        try:
+            from auto_scanner import TARGET_CITIES, collect_city_metrics, send_consolidated_digest, KHV_TZ
+            now_khv = datetime.now(KHV_TZ)
+            fetch_results = await asyncio.gather(*(collect_city_metrics(c) for c in TARGET_CITIES.keys()))
+            cities_metrics = [cm for cm in fetch_results if cm]
+            sent = await send_consolidated_digest(_GLOBAL_BOT, cities_metrics, False, now_khv)
+            return web.json_response({
+                "status": "ok",
+                "digest_sent": sent,
+                "cities_collected": len(cities_metrics),
+                "khv_time": now_khv.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        except Exception as err:
+            logger.error(f"Ошибка при вызове /trigger_scan: {err}", exc_info=True)
+            return web.json_response({"status": "error", "error": str(err)}, status=500)
 
     app = web.Application()
     for path in ["/", "/healthz", "/health", "/ping", "/cron"]:
         app.router.add_route("*", path, handle_ping)
     app.router.add_get("/status", handle_status)
     app.router.add_get("/diag", handle_status)
+    app.router.add_get("/logs", handle_logs_plain)
+    app.router.add_get("/trigger_scan", handle_trigger_scan)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -150,9 +202,8 @@ async def run_health_check_server() -> None:
 
 async def render_keepalive_loop() -> None:
     """
-    Периодически пингует внешний URL сервиса на Render каждые 3 минуты (180 сек).
-    Предотвращает засыпание бесплатного инстанса Render (15-минутный таймаут) даже при одиночном пропуске сети.
-    Автоматически использует гарантированный fallback-URL сервиса.
+    Периодически пингует внешний URL сервиса на Render каждые 2 минуты (120 сек).
+    Предотвращает засыпание бесплатного инстанса Render (15-минутный таймаут).
     """
     external_url = (
         os.getenv("RENDER_EXTERNAL_URL")
@@ -162,17 +213,29 @@ async def render_keepalive_loop() -> None:
     )
 
     health_url = f"{external_url.rstrip('/')}/healthz"
-    logger.info(f"🔄 Запущен Keep-Alive пингер для Render: {health_url} (интервал 3 мин).")
+    local_url = "http://127.0.0.1:10000/healthz"
+    logger.info(f"🔄 Запущен Keep-Alive пингер для Render: {health_url} (интервал 2 мин).")
 
-    await asyncio.sleep(30)
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    logger.debug(f"🏓 Self-Ping Render Keep-Alive: HTTP {resp.status}")
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка Self-Ping Keep-Alive: {e}")
-        await asyncio.sleep(180)  # 3 минуты
+    await asyncio.sleep(20)
+    headers = {"User-Agent": "RenderKeepAlive/2.0 (24/7 Sentinel)"}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        while True:
+            # 1. Пинг внешнего URL (для edge router Render)
+            try:
+                async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    logger.info(f"🏓 Self-Ping Render Keep-Alive: HTTP {resp.status}")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка внешнего Self-Ping: {e}")
+
+            # 2. Пинг локального сервера
+            try:
+                async with session.get(local_url, timeout=aiohttp.ClientTimeout(total=5)) as resp_local:
+                    if resp_local.status != 200:
+                        logger.warning(f"⚠️ Локальный healthz вернул HTTP {resp_local.status}")
+            except Exception:
+                pass
+
+            await asyncio.sleep(120)  # 2 минуты
 
 
 async def auto_scanner_supervisor(bot: Bot) -> None:
@@ -265,6 +328,8 @@ async def main() -> None:
         session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    global _GLOBAL_BOT
+    _GLOBAL_BOT = bot
     dp = Dispatcher()
 
     # 4. Регистрация Rate Limiter и маршрутов

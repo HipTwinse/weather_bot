@@ -404,7 +404,7 @@ def test_polymarket_proxy_resolution_and_balance():
     loaded = get_user_wallet(test_uid)
     assert loaded is not None
     assert loaded["proxy_address"].lower() == proxy.lower()
-    assert loaded["signature_type"] == 1
+    assert loaded["signature_type"] == 3
     delete_user_wallet(test_uid)
 
 

@@ -1069,15 +1069,15 @@ _get_priority_target = get_priority_target
 
 def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[Dict[str, Any]] = None) -> str:
     """Формирует блок города для утреннего базового прогноза (10:02 ХБР)."""
-    icao = city_data["icao"]
-    city_name = city_data["city_name"]
-    local_dt = city_data["local_dt"]
-    temp_c = city_data["temp_c"]
-    models = city_data["models_max"]
-    peak_str = city_data["peak_str"]
+    icao = city_data.get("icao", "UNKNOWN")
+    city_name = city_data.get("city_name", icao)
+    local_dt = city_data.get("local_dt") or datetime.now()
+    temp_c = city_data.get("temp_c")
+    models = city_data.get("models_max", {})
+    peak_str = city_data.get("peak_str", f"{temp_c or 20.0}°C")
     avg_peak = city_data.get("avg_peak", 20.0)
-    physics_note = city_data["physics_note"]
-    raw_metar = city_data["raw_metar"]
+    physics_note = city_data.get("physics_note", "")
+    raw_metar = city_data.get("raw_metar", "")
     orderbook = city_data.get("orderbook", [])
 
     ecmwf_s = f"{models.get('ecmwf_hres', 'Н/Д')}°C"
@@ -1160,18 +1160,18 @@ def build_morning_city_block(city_data: Dict[str, Any], user_position: Optional[
 
 def build_dynamic_city_block(city_data: Dict[str, Any], user_position: Optional[Dict[str, Any]]) -> str:
     """Формирует компактный блок города для регулярного обновления динамики (:07 и :37)."""
-    icao = city_data["icao"]
-    city_name = city_data["city_name"]
-    local_dt = city_data["local_dt"]
-    temp_c = city_data["temp_c"]
+    icao = city_data.get("icao", "UNKNOWN")
+    city_name = city_data.get("city_name", icao)
+    local_dt = city_data.get("local_dt") or datetime.now()
+    temp_c = city_data.get("temp_c")
     models = city_data.get("models_max", {})
-    rate_str = city_data["rate_str"]
-    rate_val = city_data["rate_val"]
-    rem_hours = city_data["rem_hours_str"]
-    peak_str = city_data["peak_str"]
+    rate_str = city_data.get("rate_str", "0.0°C/ч")
+    rate_val = float(city_data.get("rate_val", 0.0) or 0.0)
+    rem_hours = city_data.get("rem_hours_str", "Н/Д")
+    peak_str = city_data.get("peak_str", f"{temp_c or 20.0}°C")
     avg_peak = city_data.get("avg_peak", 20.0)
-    raw_metar = city_data["raw_metar"]
-    orderbook = city_data["orderbook"]
+    raw_metar = city_data.get("raw_metar", "")
+    orderbook = city_data.get("orderbook", [])
 
     local_hour = local_dt.hour
     local_min = local_dt.minute
@@ -2655,7 +2655,14 @@ async def send_consolidated_digest(
             f"<i>Региональный синоптический срез моделей (Время ХБР: {time_khv_str})</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
-        body_blocks = [build_morning_city_block(cm) for cm in cities_metrics if cm]
+        body_blocks = []
+        for cm in cities_metrics:
+            if not cm:
+                continue
+            try:
+                body_blocks.append(build_morning_city_block(cm))
+            except Exception as e_b:
+                logger.warning(f"Ошибка формирования утреннего блока {cm.get('icao')}: {e_b}")
         default_msg = f"{header}\n\n" + "\n──────────────\n".join(body_blocks)
     else:
         header = (
@@ -2663,7 +2670,14 @@ async def send_consolidated_digest(
             f"<i>Контроль темпа прогрева и статус открытых позиций</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
-        default_blocks = [build_dynamic_city_block(cm, None) for cm in cities_metrics if cm]
+        default_blocks = []
+        for cm in cities_metrics:
+            if not cm:
+                continue
+            try:
+                default_blocks.append(build_dynamic_city_block(cm, None))
+            except Exception as e_b:
+                logger.warning(f"Ошибка формирования динамического блока {cm.get('icao')}: {e_b}")
         default_msg = f"{header}\n\n" + "\n──────────────\n".join(default_blocks)
 
     # Получаем всех подписчиков и открытые позиции
@@ -2734,11 +2748,17 @@ async def send_consolidated_digest(
                 for cm in cities_metrics:
                     pos = next((p for p in user_pos_list if p["icao"].strip().upper() == cm["icao"].strip().upper()), None)
                     if pos:
-                        await check_and_execute_auto_sell(bot, cm, pos)
-                    if is_morning_base:
-                        user_blocks.append(build_morning_city_block(cm, pos))
-                    else:
-                        user_blocks.append(build_dynamic_city_block(cm, pos))
+                        try:
+                            await check_and_execute_auto_sell(bot, cm, pos)
+                        except Exception as e_sell:
+                            logger.error(f"Ошибка проверки автопродажи {cm.get('icao')}: {e_sell}")
+                    try:
+                        if is_morning_base:
+                            user_blocks.append(build_morning_city_block(cm, pos))
+                        else:
+                            user_blocks.append(build_dynamic_city_block(cm, pos))
+                    except Exception as e_ub:
+                        logger.warning(f"Ошибка формирования пользовательского блока {cm.get('icao')}: {e_ub}")
 
                 # Если у пользователя есть позиции в городах вне TARGET_CITIES (например, LFPG, KJFK, RKSI):
                 processed_icaos = {cm["icao"].strip().upper() for cm in cities_metrics}
@@ -2805,6 +2825,7 @@ async def run_auto_scanner(bot: Bot) -> None:
     # Запускаем непрерывный высокочастотный мониторинг позиций (каждые 15 сек при наличии сделок)
     asyncio.create_task(run_position_monitor(bot))
 
+    slot_retry_count = 0
     while True:
         try:
             now_khv = datetime.now(KHV_TZ)
@@ -2897,6 +2918,7 @@ async def run_auto_scanner(bot: Bot) -> None:
 
                 if digest_sent:
                     # Защита от повторной отправки в этом же слоте + фиксация в хранилище
+                    slot_retry_count = 0
                     _LAST_SENT_SLOT = current_checkpoint_slot
                     try:
                         set_bot_state("last_sent_digest_slot", current_checkpoint_slot)
@@ -2904,10 +2926,21 @@ async def run_auto_scanner(bot: Bot) -> None:
                         pass
                     logger.info(f"✅ Цикл дайджеста {current_checkpoint_slot} ХБР успешно доставлен.")
                 else:
+                    slot_retry_count += 1
                     logger.warning(
-                        f"⚠️ Дайджест {current_checkpoint_slot} ХБР не был доставлен получателям. "
-                        "Слот не блокируется для повтора в следующем проходе."
+                        f"⚠️ Дайджест {current_checkpoint_slot} ХБР не был доставлен (попытка {slot_retry_count}/4)."
                     )
+                    if slot_retry_count >= 4:
+                        logger.error(
+                            f"❌ Дайджест {current_checkpoint_slot} ХБР пропущен после {slot_retry_count} неудачных попыток. "
+                            "Фиксируем слот для перехода к следующему циклу."
+                        )
+                        _LAST_SENT_SLOT = current_checkpoint_slot
+                        try:
+                            set_bot_state("last_sent_digest_slot", current_checkpoint_slot)
+                        except Exception:
+                            pass
+                        slot_retry_count = 0
 
                 # 3. Единый суточный аудиторский отчет за 24 часа (Европа + США + Азия) в 23:37 ХБР
                 if now_khv.hour == 23 and _LAST_AUDIT_REPORT_DATE != today_khv_str:
