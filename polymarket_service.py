@@ -57,9 +57,11 @@ _GLOBAL_WEATHER_EVENTS_CACHE: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
 
 
 def get_proxy_connector() -> Optional[Any]:
-    """Возвращает aiohttp connector с SOCKS5-прокси Мадрида (защита от гео-блокировок)."""
+    """Возвращает aiohttp connector с прокси только если PROXY_URL явно настроен."""
     import config
-    proxy_url = getattr(config, "PROXY_URL", None) or "socks5://ukaylydq:qatbdzk3txyb@64.137.96.74:6641"
+    proxy_url = getattr(config, "PROXY_URL", None)
+    if not proxy_url:
+        return None
     try:
         from aiohttp_socks import ProxyConnector
         return ProxyConnector.from_url(proxy_url)
@@ -82,9 +84,11 @@ async def get_all_active_weather_events(max_age_seconds: float = 90.0) -> List[D
 
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # 1. Сначала пробуем через мадридский прокси, при сетевом сбое — напрямую
-    for use_proxy in (True, False):
+    # 1. Сначала пробуем прямое скоростное подключение (0.7с), при блокировке — через прокси
+    for use_proxy in (False, True):
         connector = get_proxy_connector() if use_proxy else None
+        if use_proxy and not connector:
+            continue
         try:
             all_events: List[Dict[str, Any]] = []
             async with aiohttp.ClientSession(connector=connector) as session:
