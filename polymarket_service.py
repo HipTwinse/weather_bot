@@ -54,6 +54,7 @@ MARKET_CACHE_TTL = 300.0  # 5 минут
 
 # Глобальный пакетный кэш всех активных погодных маркетов: (timestamp, events_list)
 _GLOBAL_WEATHER_EVENTS_CACHE: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
+_EVENTS_FETCH_LOCK: Optional[asyncio.Lock] = None
 
 
 def get_proxy_connector() -> Optional[Any]:
@@ -73,49 +74,59 @@ def get_proxy_connector() -> Optional[Any]:
 async def get_all_active_weather_events(max_age_seconds: float = 90.0) -> List[Dict[str, Any]]:
     """
     Пакетно загружает все активные погодные контракты Polymarket со всеми страницами (пагинация)
-    и глобальным кэшированием (90 сек).
+    и глобальным кэшированием (90 сек) с защитой от одновременных параллельных вызовов (Lock).
     Позволяет всем городам находить стаканы котировок мгновенно за 1 общий запрос без 429 лимитов.
     """
-    global _GLOBAL_WEATHER_EVENTS_CACHE
+    global _GLOBAL_WEATHER_EVENTS_CACHE, _EVENTS_FETCH_LOCK
     now = datetime.now(timezone.utc).timestamp()
     ts, cached_list = _GLOBAL_WEATHER_EVENTS_CACHE
     if cached_list and (now - ts < max_age_seconds):
         return cached_list
 
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    if _EVENTS_FETCH_LOCK is None:
+        _EVENTS_FETCH_LOCK = asyncio.Lock()
 
-    # 1. Сначала пробуем прямое скоростное подключение (0.7с), при блокировке — через прокси
-    for use_proxy in (False, True):
-        connector = get_proxy_connector() if use_proxy else None
-        if use_proxy and not connector:
-            continue
-        try:
-            all_events: List[Dict[str, Any]] = []
-            async with aiohttp.ClientSession(connector=connector) as session:
-                offset = 0
-                while True:
-                    url = f"{POLYMARKET_GAMMA_API}?tag_slug=weather&limit=100&active=true&closed=false&offset={offset}"
-                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
-                        if resp.status != 200:
-                            break
-                        data = await resp.json()
-                        if not data or not isinstance(data, list):
-                            break
-                        all_events.extend(data)
-                        if len(data) < 100:
-                            break
-                        offset += 100
-                        if offset >= 500:  # Защитный лимит
-                            break
+    async with _EVENTS_FETCH_LOCK:
+        # Повторная проверка внутри блокировки: если другой поток уже обновил кэш
+        now = datetime.now(timezone.utc).timestamp()
+        ts, cached_list = _GLOBAL_WEATHER_EVENTS_CACHE
+        if cached_list and (now - ts < max_age_seconds):
+            return cached_list
 
-            if all_events:
-                _GLOBAL_WEATHER_EVENTS_CACHE = (now, all_events)
-                logger.debug(f"Успешно загружено {len(all_events)} погодных маркетов Polymarket (proxy={use_proxy}).")
-                return all_events
-        except Exception as e:
-            logger.debug(f"Опрос каталога Polymarket tag_slug=weather (proxy={use_proxy}) не удался: {e}")
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    return cached_list or []
+        # 1. Сначала пробуем прямое скоростное подключение (0.7с), при блокировке — через прокси
+        for use_proxy in (False, True):
+            connector = get_proxy_connector() if use_proxy else None
+            if use_proxy and not connector:
+                continue
+            try:
+                all_events: List[Dict[str, Any]] = []
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    offset = 0
+                    while True:
+                        url = f"{POLYMARKET_GAMMA_API}?tag_slug=weather&limit=100&active=true&closed=false&offset={offset}"
+                        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                            if resp.status != 200:
+                                break
+                            data = await resp.json()
+                            if not data or not isinstance(data, list):
+                                break
+                            all_events.extend(data)
+                            if len(data) < 100:
+                                break
+                            offset += 100
+                            if offset >= 500:  # Защитный лимит
+                                break
+
+                if all_events:
+                    _GLOBAL_WEATHER_EVENTS_CACHE = (now, all_events)
+                    logger.debug(f"Успешно загружено {len(all_events)} погодных маркетов Polymarket (proxy={use_proxy}).")
+                    return all_events
+            except Exception as e:
+                logger.debug(f"Опрос каталога Polymarket tag_slug=weather (proxy={use_proxy}) не удался: {e}")
+
+        return cached_list or []
 
 
 def extract_temp_value(text: str) -> Optional[float]:

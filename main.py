@@ -170,13 +170,18 @@ async def run_health_check_server() -> None:
             return web.json_response({"status": "error", "message": "Бот еще не инициализирован"}, status=503)
         try:
             from auto_scanner import TARGET_CITIES, collect_city_metrics, send_consolidated_digest, KHV_TZ
+            from polymarket_service import get_all_active_weather_events
+            try:
+                await asyncio.wait_for(get_all_active_weather_events(), timeout=5.0)
+            except Exception:
+                pass
             now_khv = datetime.now(KHV_TZ)
             fetch_results = await asyncio.gather(*(collect_city_metrics(c) for c in TARGET_CITIES.keys()))
             cities_metrics = [cm for cm in fetch_results if cm]
-            sent = await send_consolidated_digest(_GLOBAL_BOT, cities_metrics, False, now_khv)
+            asyncio.create_task(send_consolidated_digest(_GLOBAL_BOT, cities_metrics, False, now_khv))
             return web.json_response({
                 "status": "ok",
-                "digest_sent": sent,
+                "digest_dispatched": True,
                 "cities_collected": len(cities_metrics),
                 "khv_time": now_khv.strftime("%Y-%m-%d %H:%M:%S"),
             })
@@ -310,6 +315,14 @@ async def main() -> None:
     if not config.BOT_TOKEN:
         logger.critical("❌ КРИТИЧЕСКАЯ ОШИБКА: BOT_TOKEN не обнаружен в .env!")
         return
+
+    # 0. Настройка расширенного пула потоков для параллельного опроса NOAA и Open-Meteo
+    import concurrent.futures
+    try:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=20, thread_name_prefix="WeatherWorker"))
+    except Exception as e_pool:
+        logger.debug(f"Не удалось переопределить default_executor: {e_pool}")
 
     # 1. Инициализация базы данных SQLite
     global _START_TIME

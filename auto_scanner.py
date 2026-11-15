@@ -749,7 +749,9 @@ ALL_RADAR_CITIES_MAP = {
 }
 
 
-# Кэш метеоданных для защиты NOAA и Open-Meteo от частых опросов: icao -> {"ts": float, "noaa_data": dict, "forecast_data": dict}
+# Раздельные кэши: модели Open-Meteo (45 мин) и NOAA METAR (120 сек)
+_FORECAST_CACHE: Dict[str, Dict[str, Any]] = {}  # icao -> {"ts": float, "data": dict}
+_NOAA_CACHE: Dict[str, Dict[str, Any]] = {}      # icao -> {"ts": float, "data": dict}
 _WEATHER_METRICS_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # Таймер дебаунса для защиты от выбивания стопов маркетмейкером: pos_id -> timestamp_начала_падения
@@ -757,7 +759,7 @@ _POSITION_DROP_TRACKER: Dict[int, float] = {}
 
 
 async def collect_city_metrics(icao: str) -> Dict[str, Any]:
-    """Собирает полный набор метеометрик и моделей по одному городу с кэшированием погоды."""
+    """Собирает полный набор метеометрик и моделей по одному городу с раздельным отказоустойчивым кэшированием."""
     airport = resolve_airport(icao)
     if not airport:
         return {}
@@ -773,26 +775,52 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
     target_date_local = local_dt.strftime("%Y-%m-%d")
     current_ts = time.time()
 
-    # Защитный кэш метеоданных (60 сек): погода меняется 2 раза в час, модели — раз в 6 часов
-    cached_weather = _WEATHER_METRICS_CACHE.get(icao)
-    if cached_weather and (current_ts - cached_weather["ts"] < 60.0):
-        forecast_data = cached_weather["forecast_data"]
-        noaa_data = cached_weather["noaa_data"]
+    # 1. Прогнозные модели Open-Meteo: кэш 45 минут (модели обновляются метеоцентрами раз в 6 часов)
+    cached_f = _FORECAST_CACHE.get(icao)
+    if cached_f and (current_ts - cached_f["ts"] < 2700.0) and cached_f.get("data"):
+        forecast_data = cached_f["data"]
     else:
-        forecast_task = asyncio.to_thread(fetch_openmeteo_forecast, lat, lon, tz_name, target_date_local)
-        noaa_task = asyncio.to_thread(get_noaa_package, icao)
-        forecast_data, noaa_data = await asyncio.gather(forecast_task, noaa_task, return_exceptions=True)
+        try:
+            forecast_data = await asyncio.wait_for(
+                asyncio.to_thread(fetch_openmeteo_forecast, lat, lon, tz_name, target_date_local),
+                timeout=7.0
+            )
+            if isinstance(forecast_data, dict) and forecast_data:
+                _FORECAST_CACHE[icao] = {"ts": current_ts, "data": forecast_data}
+            elif cached_f:
+                forecast_data = cached_f["data"]
+            else:
+                forecast_data = {}
+        except Exception as e_f:
+            logger.debug(f"Open-Meteo для {icao} взят из резерва/кэша: {e_f}")
+            forecast_data = cached_f["data"] if cached_f else {}
 
-        if isinstance(noaa_data, Exception) or not isinstance(noaa_data, dict):
-            noaa_data = {}
-        if isinstance(forecast_data, Exception) or not isinstance(forecast_data, dict):
-            forecast_data = {}
+    # 2. Фактические данные NOAA METAR: кэш 120 секунд (защита от частых параллельных повторов)
+    cached_n = _NOAA_CACHE.get(icao)
+    if cached_n and (current_ts - cached_n["ts"] < 120.0) and cached_n.get("data"):
+        noaa_data = cached_n["data"]
+    else:
+        try:
+            noaa_data = await asyncio.wait_for(
+                asyncio.to_thread(get_noaa_package, icao),
+                timeout=7.0
+            )
+            if isinstance(noaa_data, dict) and noaa_data:
+                _NOAA_CACHE[icao] = {"ts": current_ts, "data": noaa_data}
+            elif cached_n:
+                noaa_data = cached_n["data"]
+            else:
+                noaa_data = {}
+        except Exception as e_n:
+            logger.debug(f"NOAA METAR для {icao} взят из резерва/кэша: {e_n}")
+            noaa_data = cached_n["data"] if cached_n else {}
 
-        _WEATHER_METRICS_CACHE[icao] = {
-            "ts": current_ts,
-            "forecast_data": forecast_data,
-            "noaa_data": noaa_data,
-        }
+    # Обратная совместимость для кэша _WEATHER_METRICS_CACHE
+    _WEATHER_METRICS_CACHE[icao] = {
+        "ts": current_ts,
+        "forecast_data": forecast_data,
+        "noaa_data": noaa_data,
+    }
 
     metar = noaa_data.get("metar", {})
     temp_c = metar.get("temp_c")
@@ -817,11 +845,14 @@ async def collect_city_metrics(icao: str) -> Dict[str, Any]:
         avg_peak = temp_c or 20.0
         peak_str = f"{avg_peak}°C"
 
-    # Получение текущего стакана Polymarket для сопоставления цен
+    # 3. Получение текущего стакана Polymarket для сопоставления цен (с таймаутом 6.0 сек)
     orderbook = []
     poly_event = None
     try:
-        poly_event = await find_city_weather_event(icao, target_date_local)
+        poly_event = await asyncio.wait_for(
+            find_city_weather_event(icao, target_date_local),
+            timeout=6.0
+        )
         if poly_event:
             orderbook = parse_markets_orderbook(poly_event.get("markets", []))
     except Exception:
@@ -1814,14 +1845,18 @@ async def check_and_execute_auto_buy(
     all_metrics = list(cities_metrics)
     if include_standby:
         existing_icaos = {str(cm.get("icao", "")).strip().upper() for cm in all_metrics if cm}
-        for st_icao in STANDBY_AUTO_BUY_CITIES.keys():
-            if st_icao not in existing_icaos:
+        standby_needed = [s for s in STANDBY_AUTO_BUY_CITIES.keys() if s not in existing_icaos]
+        if standby_needed:
+            async def _safe_standby(s_icao: str):
                 try:
-                    st_cm = await asyncio.wait_for(collect_city_metrics(st_icao), timeout=25.0)
-                    if st_cm and st_cm.get("orderbook"):
-                        all_metrics.append(st_cm)
-                except Exception as e_st:
-                    logger.debug(f"Не удалось опросить резервный город {st_icao} для автопокупки: {e_st}")
+                    return await asyncio.wait_for(collect_city_metrics(s_icao), timeout=12.0)
+                except Exception as e_s:
+                    logger.debug(f"Не удалось опросить резервный город {s_icao}: {e_s}")
+                    return None
+            st_res = await asyncio.gather(*(_safe_standby(s) for s in standby_needed))
+            for st_cm in st_res:
+                if st_cm and st_cm.get("orderbook"):
+                    all_metrics.append(st_cm)
 
     subscribers = await asyncio.to_thread(get_all_subscribers)
     admin_id = getattr(config, "ADMIN_CHAT_ID", None)
@@ -1833,12 +1868,6 @@ async def check_and_execute_auto_buy(
             pass
 
     for uid in all_uids:
-        try:
-            from handlers import sync_user_polymarket_positions
-            await sync_user_polymarket_positions(uid)
-        except Exception as e_sync:
-            logger.debug(f"Синхронизация Polymarket перед автопокупкой: {e_sync}")
-
         wallet = await asyncio.to_thread(get_user_wallet, uid)
         mode = await asyncio.to_thread(get_trading_mode, uid)
         existing_positions = await asyncio.to_thread(get_user_positions, uid)
@@ -2846,13 +2875,47 @@ async def run_auto_scanner(bot: Bot) -> None:
                 else:
                     logger.info(f"🔄 Сбор планового METAR-обновления ({current_checkpoint_slot} ХБР)...")
 
-                # Параллельный сбор метрик городов с защитой по таймауту (25 сек на все города)
+                # Предварительный прогрев общего каталога Polymarket ОДНИМ запросом для всех городов
+                try:
+                    from polymarket_service import get_all_active_weather_events
+                    await asyncio.wait_for(get_all_active_weather_events(), timeout=6.0)
+                except Exception as e_pw:
+                    logger.debug(f"Предварительный прогрев каталога Polymarket: {e_pw}")
+
+                # Параллельный сбор метрик городов с отказоустойчивой защитой
                 async def fetch_city_safe(c_icao: str) -> Optional[Dict[str, Any]]:
                     try:
-                        return await asyncio.wait_for(collect_city_metrics(c_icao), timeout=25.0)
+                        return await asyncio.wait_for(collect_city_metrics(c_icao), timeout=35.0)
                     except asyncio.TimeoutError:
-                        logger.error(f"⏱️ Таймаут (25 сек) при сборе метрик для {c_icao}")
-                        return None
+                        logger.warning(f"⏱️ Таймаут (35 сек) при сборе метрик для {c_icao}, формируем резервную сводку...")
+                        cached_f = _FORECAST_CACHE.get(c_icao, {}).get("data", {})
+                        cached_n = _NOAA_CACHE.get(c_icao, {}).get("data", {})
+                        metar = cached_n.get("metar", {})
+                        temp_c = metar.get("temp_c")
+                        airport = resolve_airport(c_icao) or {}
+                        tz_n = airport.get("timezone", "UTC")
+                        try:
+                            l_tz = zoneinfo.ZoneInfo(tz_n)
+                        except Exception:
+                            l_tz = zoneinfo.ZoneInfo("UTC")
+                        l_dt = datetime.now(l_tz)
+                        city_label = ALL_RADAR_CITIES_MAP.get(c_icao) or TARGET_CITIES.get(c_icao, f"Локация {c_icao}")
+                        return {
+                            "icao": c_icao,
+                            "city_name": city_label,
+                            "local_dt": l_dt,
+                            "temp_c": temp_c if temp_c is not None else 20.0,
+                            "raw_metar": metar.get("raw", ""),
+                            "models_max": {},
+                            "rate_str": "Н/Д",
+                            "rate_val": 0.0,
+                            "rem_hours_str": "Н/Д",
+                            "physics_note": "• Сводка сформирована из резервного кэша",
+                            "peak_str": f"{temp_c:.1f}°C" if temp_c is not None else "Н/Д",
+                            "avg_peak": temp_c if temp_c is not None else 20.0,
+                            "orderbook": [],
+                            "event": None,
+                        }
                     except Exception as c_err:
                         logger.error(f"⚠️ Ошибка при сборе метрик для {c_icao}: {c_err}")
                         return None
