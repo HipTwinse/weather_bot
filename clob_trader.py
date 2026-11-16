@@ -443,42 +443,51 @@ def execute_market_sell(
         safe_worst_price = min(safe_worst_price, 1.0 - tick_size)
         safe_worst_price = round(safe_worst_price, 4)
 
-        # Способ 1: Прямой рыночный ордер V2 (create_and_post_market_order)
+        # Способ 1: Прямой рыночный ордер V2 (с расчетом лучшей цены из стакана)
+        target_sell_price = safe_worst_price
         try:
-            market_args = MarketOrderArgs(
-                token_id=token_id,
-                amount=round(shares, 2),
-                side="SELL",
-                price=safe_worst_price,
-                order_type=OrderType.FOK,
-            )
-            if hasattr(client, "create_and_post_market_order"):
-                resp = client.create_and_post_market_order(market_args, order_type=OrderType.FOK)
-            else:
-                signed_order = client.create_market_order(market_args)
-                resp = client.post_order(signed_order, OrderType.FOK)
-            if isinstance(resp, dict) and (resp.get("success") or (resp.get("orderID") and not resp.get("errorMsg"))):
-                order_id = str(resp.get("orderID", "OK"))
-                return True, order_id, resp
-        except Exception as e1:
-            logger.info(f"MarketOrderArgs V2 не сработал ({e1}), переключаемся на агрессивный OrderArgs V2...")
+            calc_p = client.calculate_market_price(token_id, "SELL", round(shares, 2), OrderType.FOK)
+            if calc_p and calc_p > 0:
+                target_sell_price = max(min(float(calc_p), safe_worst_price), tick_size)
+        except Exception:
+            pass
 
-        # Способ 2: Агрессивный ордер OrderArgs V2 (сначала FAK, затем GTC)
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=safe_worst_price,
-            size=round(shares, 2),
-            side="SELL",
-        )
-        for o_type in (OrderType.FAK, OrderType.GTC):
+        for m_type in (OrderType.FOK, OrderType.FAK):
             try:
-                resp2 = client.create_and_post_order(order_args, order_type=o_type)
-                if isinstance(resp2, dict) and (resp2.get("success") or (resp2.get("orderID") and not resp2.get("errorMsg"))):
-                    order_id = str(resp2.get("orderID", "OK"))
-                    return True, order_id, resp2
-            except Exception as e_sub:
-                logger.info(f"Попытка продажи ({o_type}) завершилась: {e_sub}")
-                last_sub_err = e_sub
+                market_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=round(shares, 2),
+                    side="SELL",
+                    price=target_sell_price,
+                    order_type=m_type,
+                )
+                signed_order = client.create_market_order(market_args)
+                resp = client.post_order(signed_order, m_type)
+                if isinstance(resp, dict) and (resp.get("success") or (resp.get("orderID") and not resp.get("errorMsg"))):
+                    order_id = str(resp.get("orderID", "OK"))
+                    return True, order_id, resp
+            except Exception as e1:
+                logger.info(f"MarketOrder ({m_type}) на продажу не сработал ({e1})...")
+
+        # Способ 2: Агрессивный ордер OrderArgs V2 (только если объем >= 5 долей)
+        if shares >= 5.0:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=safe_worst_price,
+                size=round(shares, 2),
+                side="SELL",
+            )
+            for o_type in (OrderType.FAK, OrderType.GTC):
+                try:
+                    resp2 = client.create_and_post_order(order_args, order_type=o_type)
+                    if isinstance(resp2, dict) and (resp2.get("success") or (resp2.get("orderID") and not resp2.get("errorMsg"))):
+                        order_id = str(resp2.get("orderID", "OK"))
+                        return True, order_id, resp2
+                except Exception as e_sub:
+                    logger.info(f"Попытка продажи ({o_type}) завершилась: {e_sub}")
+                    last_sub_err = e_sub
+        else:
+            return False, f"Объем остатка ({shares:.2f} шт.) ниже лимита биржи (минимум 5 шт.). Продажа микро-остатка доступна через веб-интерфейс Polymarket", {}
 
         return False, f"Биржа отклонила сделку ({locals().get('last_sub_err', 'нет ликвидности')})", {}
 
@@ -548,42 +557,54 @@ def execute_market_buy(
         if shares <= 0:
             return False, f"Некорректный расчет объема: {shares}", {}
 
-        # 1. Попытка рыночного ордера V2 на покупку (Market FOK)
+        # 1. Полноценный рыночный ордер на покупку (Market Order с расчетом лучшей цены из стакана)
+        target_market_price = safe_max_price
         try:
-            market_args = MarketOrderArgs(
-                token_id=token_id,
-                amount=round(amount_usd, 2),
-                side="BUY",
-                price=safe_max_price,
-                order_type=OrderType.FOK,
-            )
-            if hasattr(client, "create_and_post_market_order"):
-                resp = client.create_and_post_market_order(market_args, order_type=OrderType.FOK)
-            else:
-                signed_order = client.create_market_order(market_args)
-                resp = client.post_order(signed_order, OrderType.FOK)
-            if isinstance(resp, dict) and (resp.get("success") or (resp.get("orderID") and not resp.get("errorMsg"))):
-                order_id = str(resp.get("orderID", "OK"))
-                return True, order_id, resp
-        except Exception as e1:
-            logger.info(f"MarketOrderArgs V2 на покупку не сработал ({e1}), переключаемся на OrderArgs V2...")
+            calc_p = client.calculate_market_price(token_id, "BUY", round(amount_usd, 2), OrderType.FOK)
+            if calc_p and calc_p > 0:
+                target_market_price = min(max(float(calc_p), safe_max_price), 0.99)
+        except Exception as e_calc:
+            logger.debug(f"Динамический расчет рыночной цены покупки: {e_calc}")
 
-        # 2. Агрессивный ордер OrderArgs V2 на покупку (FAK / GTC)
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=safe_max_price,
-            size=shares,
-            side="BUY",
-        )
-        for o_type in (OrderType.FAK, OrderType.GTC):
+        # Пробуем рыночное исполнение FOK, затем FAK со скользящим спредом
+        for m_type in (OrderType.FOK, OrderType.FAK):
             try:
-                resp2 = client.create_and_post_order(order_args, order_type=o_type)
-                if isinstance(resp2, dict) and (resp2.get("success") or (resp2.get("orderID") and not resp2.get("errorMsg"))):
-                    order_id = str(resp2.get("orderID", "OK"))
-                    return True, order_id, resp2
-            except Exception as e_sub:
-                logger.info(f"Попытка покупки ({o_type}) завершилась: {e_sub}")
-                last_sub_err = e_sub
+                market_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=round(amount_usd, 2),
+                    side="BUY",
+                    price=target_market_price,
+                    order_type=m_type,
+                )
+                signed_order = client.create_market_order(market_args)
+                resp = client.post_order(signed_order, m_type)
+                if isinstance(resp, dict) and (resp.get("success") or (resp.get("orderID") and not resp.get("errorMsg"))):
+                    order_id = str(resp.get("orderID", "OK"))
+                    return True, order_id, resp
+            except Exception as e_mkt:
+                logger.info(f"MarketOrder ({m_type}) на покупку не сработал: {e_mkt}")
+
+        # 2. Агрессивный лимитный ордер OrderArgs V2 на покупку (FAK / GTC)
+        # ВАЖНО: Биржа Polymarket строго требует минимум 5 контрактов (Size >= 5) для любых лимитных ордеров!
+        if shares >= 5.0:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=safe_max_price,
+                size=shares,
+                side="BUY",
+            )
+            for o_type in (OrderType.FAK, OrderType.GTC):
+                try:
+                    resp2 = client.create_and_post_order(order_args, order_type=o_type)
+                    if isinstance(resp2, dict) and (resp2.get("success") or (resp2.get("orderID") and not resp2.get("errorMsg"))):
+                        order_id = str(resp2.get("orderID", "OK"))
+                        return True, order_id, resp2
+                except Exception as e_sub:
+                    logger.info(f"Попытка покупки ({o_type}) завершилась: {e_sub}")
+                    last_sub_err = e_sub
+        else:
+            min_req_usd = round(5.0 * safe_max_price, 2)
+            return False, f"Объем ордера ({shares:.2f} шт.) ниже биржевого минимума Polymarket (нужно от 5 шт.). Для покупки по цене {safe_max_price*100:.0f}¢ требуется баланс от ${min_req_usd:.2f} USDC", {}
 
         return False, f"Биржа отклонила покупку ({locals().get('last_sub_err', 'нет ликвидности')})", {}
 
